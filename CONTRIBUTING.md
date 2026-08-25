@@ -62,6 +62,14 @@ Do not commit, push, or merge without explicit authorization from the owning
 task. Never commit traces, captures, dumps, credentials, or machine-local
 configuration.
 
+### Branch and worktree naming
+
+Task branches follow `ctx-XXXX/<type>-<short-slug>`: `XXXX` is the owning
+CarryCtx task number, `<type>` is one of `feat|fix|chore|docs`, and
+`<short-slug>` is kebab-case (for example `ctx-0031/feat-isolation-rfc`).
+Worktrees live at `.worktrees/ctx-XXXX-<type>-<short-slug>`, mapping `/` to
+`-`. Use one branch per task; commander housekeeping may use `cmd/<slug>`.
+
 ## Security
 
 Report vulnerabilities privately as described in
