@@ -1,0 +1,14 @@
+# Enforced Git hooks. Tool invocations and version pins live in the justfile.
+commit-msg:
+  commands:
+    commit-check:
+      run: just commit-check {1}
+
+pre-commit:
+  commands:
+    lint:
+      glob: "*.md"
+      run: just lint
+    fmt-check:
+      glob: "*.md"
+      run: just fmt-check
