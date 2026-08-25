@@ -12,17 +12,29 @@ making any change.
 
 ## Development setup
 
-No build toolchain is wired up yet. When toolchain scaffolding lands, quality
-gates will run through the repository `justfile` (formatting, linting,
-Markdown hygiene, and tests) rather than through ad-hoc commands, following
-the Bitty workspace toolchain policy. Until then, keep Markdown changes
-consistent with [.markdownlint-cli2.jsonc](./.markdownlint-cli2.jsonc).
+Install dependencies once with `bun install`. Quality gates run through the
+repository [justfile](./justfile), following the Bitty workspace toolchain
+policy:
+
+```text
+just check                  # formatting check plus Markdown lint (read-only)
+just fmt-check              # Prettier check without writing files
+just lint                   # markdownlint-cli2 over .markdownlint-cli2.jsonc globs
+just commit-check <file>    # validate a commit message against commitlint.config.ts
+```
+
+Git hooks are wired by [lefthook.yml](./lefthook.yml); run `lefthook install`
+once after cloning. Commits are message-linted, and staged Markdown changes
+are linted and format-checked before each commit. Continuous integration runs
+`just check` and actionlint on every push and pull request. Keep Markdown
+changes consistent with [.markdownlint-cli2.jsonc](./.markdownlint-cli2.jsonc).
 
 ## Committing
 
 Commits follow [Conventional Commits](https://www.conventionalcommits.org/).
 Commit messages are validated with commitlint against
-[commitlint.config.ts](./commitlint.config.ts):
+[commitlint.config.ts](./commitlint.config.ts); enforcement requires the Git
+hooks from the development setup above.
 
 ```text
 feat(panel): add trace timeline prototype
