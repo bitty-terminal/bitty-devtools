@@ -32,6 +32,10 @@
 - Link the Issue, CarryCtx task, pull request, evidence, and any cross-repository
   changes. Represent ordering with dependencies rather than chat-only notes.
 - After the first commit, parallel work uses a dedicated worktree and branch.
+- Branches use `ctx-XXXX/<type>-<short-slug>` (`XXXX` is the owning CarryCtx
+  task number; `<type>` is one of `feat|fix|chore|docs`; the slug is
+  kebab-case) with worktrees at `.worktrees/ctx-XXXX-<type>-<short-slug>`;
+  use one branch per task, while commander housekeeping may use `cmd/<slug>`.
 - Before the first commit, normal worktrees and pull requests are unavailable.
   Initialization may use the shared checkout only with explicit, non-overlapping
   scopes and CI-equivalent local checks.
