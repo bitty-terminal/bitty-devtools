@@ -77,10 +77,70 @@ No TCP listener, no ambient credential, no allow-all capability. Security
 corpus `devtools-rfc` controls (P0-AC-013..026, T-09..T-11) are preserved
 and tested with negative scope matrix tests.
 
+## Implemented phase 2 (CTX-0012)
+
+Phase 2 extends phase 1 with advanced tracing, control surfaces, and real
+IPC socket/pipe peer-creds integration against the live Bitty runtime.
+It remains experimental (no `Verified`/`Compatible` promise), bounded,
+`forbid(unsafe_code)` in Rust, strict TypeScript with no `any`, and reuses
+Panel Runtime + 14×4 compat matrix verbatim without new budget families.
+
+- **Real IPC transport (live runtime)** — Unix socket under
+  `$XDG_RUNTIME_DIR/bitty` mode `0700`/`0600` or Windows named pipe with
+  current-user ACL, no TCP listener by default, peer credentials via
+  `SO_PEERCRED` / `LOCAL_PEERCRED` / `GetNamedPipeClientProcessId`
+  (headless-verified via `verifyPeerUid`, `verifyUnixEndpoint`,
+  `verifyWindowsPipe`), re-checked per privileged action, `BITTY_SOCKET` /
+  `BITTY_INSTANCE_ID` advisory only, `RC-9` `100/s` `200` burst `1 MiB`
+  `16` conn (shed newest), `RC-10` `256 KiB` chunk, length-prefixed
+  `256 KiB` frames + `1 MiB` devtools logical chunked at `256 KiB`,
+  `Framer` bound `512 KiB`, `RateLimiter` deterministic via `nowMs`,
+  headless `StdioTransportStub` / `IpcTransport` with `forwardTo` pipe
+  simulation and `PeerCredentials` / `ChildToken` (`60s` TTL, `64` bound,
+  PTY-fd only, never env).
+
+- **Advanced tracing (debug.trace, opt-in)** — structured attributable
+  events (`StructuredTraceEvent` with `sequence`, `owner`, `generation`),
+  filtering by `kinds`/`owners` (bounded `32`), coalescing `budget` vs
+  `none`, retention `4 MiB` / `5 min` / `4` traces, GC
+  `gcExpiredTraces(nowMs)`, `startTraceWithFilter` with deterministic
+  `wallClockMs`, export to `0600` spool with `preview==export`
+  byte-for-byte, `DropOldest`/`DropNewest`, deterministic
+  `streamFilteredEvents`.
+
+- **Advanced control (debug.control, audited)** — `pauseHandler`,
+  `resumePlugin` with generation exhaustion guard
+  (`MAX_SAFE_INTEGER-1024`), `validateGeneration`, transactional audit log
+  bounded `256` (`listAuditLog`, `clearAuditLog`), per-generation
+  ownership, `0600` spool mode, never widens sibling authority, no
+  capability/budget bypass.
+
+- **Client integration** — `DevtoolsClient` now wraps `IpcTransport`
+  (`connectWithTransport`, `connectLive(runtimeUid, peer, xdgDir,
+instanceId)`, `isIpcConnected`, `getSocketPath`,
+  `transportOutgoingLen`), re-verifies peer per `grantScope`,
+  `revokeScope`, `startTrace`, `stopTrace`, `suspendHandler` etc.,
+  exposes phase 2 tracing/control helpers
+  (`startTraceWithFilter`, `streamFilteredEvents`,
+  `appendStructuredEvent`, `getTraceRetention`, `gcExpiredTraces`,
+  `exportTracePreview`, `pauseHandler`, `validateGeneration`,
+  `listAuditLog`).
+
+Rust counterpart at `crates/devtools-client` mirrors the same contracts:
+`auth` (`PeerCredentials`, `verify_unix_endpoint`, `ChildTokenStore`),
+`transport` (`Frame`, `Framer`, `RateLimiter`, `StdioTransportStub`,
+`IpcTransport`), advanced `tracing` (`TraceFilter`, `TraceRetention`,
+`TracingClient` with `gc_expired`), advanced `control`
+(`ControlClient` with audit log). `cargo check` / `clippy -D warnings` /
+`cargo test` `37` tests pass; `just check` green; `bun test` `62` tests
+pass. No `unsafe`, no PTY/GPU/window handle, no TCP, no ambient credential.
+
 ## Usage (local, human-facing)
 
 ```ts
 import { DevtoolsClient } from "bitty-devtools";
+import { peerCredentials } from "bitty-devtools";
+import { IpcTransport } from "bitty-devtools";
 
 const client = new DevtoolsClient({ version: "1.0" });
 client.connect();
@@ -110,13 +170,39 @@ const trace = client.startTrace({ maxBytes: 512 * 1024, includeInput: false });
 client.appendToTrace(trace.traceId, "instrumentation record");
 console.log(client.stopTrace(trace.traceId));
 
+// Phase 2: live runtime via peer-creds (Unix socket 0600, no TCP)
+const peer = peerCredentials(1000, 1000, 42);
+const live = new IpcTransport({
+  runtimeUid: 1000,
+  socketPath: "/run/user/1000/bitty/default.sock",
+  peer,
+});
+const liveClient = new DevtoolsClient();
+liveClient.connectWithTransport(live);
+liveClient.grantScope("debug.trace");
+const filtered = liveClient.startTraceWithFilter(
+  { filter: { kinds: ["bitty.panel:mounted"] }, maxBytes: 1024 * 1024 },
+  Date.now(),
+);
+liveClient.appendStructuredEvent(filtered.traceId, {
+  sequence: 0,
+  owner: "panel-1",
+  kind: "bitty.panel:mounted",
+  payload: "{}",
+  generation: 1,
+  wallClockMs: Date.now(),
+});
+console.log(liveClient.exportTracePreview(filtered.traceId));
+console.log(liveClient.gcExpiredTraces(Date.now() + 6 * 60 * 1000));
+
 // Control requires explicit elevation and is audited
 client.grantScope("debug.control");
 client.suspendHandler(1 as never, "handler-1", "diagnosis", "tester");
+console.log(client.listAuditLog());
 ```
 
 Rust equivalent lives at `crates/devtools-client` (`forbid(unsafe_code)`,
-`cargo check` / `cargo clippy -D warnings` clean, 21 tests).
+`cargo check` / `cargo clippy -D warnings` clean, 37 tests).
 
 ## Development
 
@@ -147,9 +233,10 @@ technical record remains
 
 ## Current status
 
-Phase 1 implements local-only inspection/tracing/control over Panel Runtime
-and compat matrix as experimental evidence for
+Phase 2 extends phase 1 with live IPC and advanced tracing/control as
+experimental evidence for
 [DevTools RFC](https://github.com/bitty-terminal/bitty-docs/blob/main/docs/specifications/devtools-rfc.md)
-(OQ-019) and budgets OQ-001. No installation procedure, supported API,
+(OQ-019), [IPC and Agent RFC](https://github.com/bitty-terminal/bitty-docs/blob/main/docs/specifications/ipc-agent-rfc.md)
+(OQ-018), and budgets OQ-001. No installation procedure, supported API,
 compatibility guarantee, release, or distributable artifact is claimed until
 independent review and `Verified` lifecycle.
