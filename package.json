@@ -2,7 +2,7 @@
   "name": "bitty-devtools",
   "private": true,
   "version": "0.0.1",
-  "description": "Human-facing diagnostics client for local debugging over Panel Runtime and compat matrix (phase 1, local-only).",
+  "description": "Human-facing diagnostics client for local debugging over Panel Runtime and compat matrix (phase 2, live IPC via Unix socket 0600 / Windows pipe with peer-creds, advanced tracing and control).",
   "type": "module",
   "exports": {
     ".": {
