@@ -12,6 +12,17 @@ lint:
 fmt-check:
     bunx --bun prettier@{{prettier_version}} --check . --ignore-unknown
 
+# Rust gates for the diagnostics client (bounded, forbid unsafe).
+cargo-check:
+    cargo fmt --check
+    cargo check --workspace --all-targets --locked
+    cargo clippy --workspace --all-targets --locked -- -D warnings
+    cargo test --workspace --all-targets --locked
+
+# TypeScript type check (strict, no any).
+type-check:
+    bunx --bun tsc -p tsconfig.json --noEmit
+
 # Validate a commit message against commitlint.config.ts.
 # Versions are pinned in package.json / bun.lock; run `bun install` first.
 commit-check message:
@@ -21,3 +32,5 @@ commit-check message:
 check:
     just fmt-check
     just lint
+    just type-check
+    just cargo-check

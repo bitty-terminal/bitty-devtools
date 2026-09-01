@@ -1,0 +1,9 @@
+[workspace]
+members = ["crates/devtools-client"]
+resolver = "2"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }

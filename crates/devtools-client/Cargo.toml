@@ -1,0 +1,14 @@
+[package]
+name = "bitty-devtools-client"
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.85"
+description = "Human-facing diagnostics client over Panel Runtime and compat matrix (phase 1, local debugging)"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/bitty-terminal/bitty-devtools"
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
