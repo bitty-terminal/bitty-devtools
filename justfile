@@ -34,3 +34,11 @@ check:
     just lint
     just type-check
     just cargo-check
+
+# Publish a ctxpack snapshot to the bitty-devtools-workflow mirror (commander
+# merge closeout only; never a git hook). Dry run exports + validates without push.
+workflow-publish *args:
+    bash scripts/publish-ctxpack.sh {{args}}
+
+workflow-publish-dry *args:
+    bash scripts/publish-ctxpack.sh --dry-run {{args}}
