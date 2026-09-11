@@ -212,7 +212,12 @@ export type CtlInvocation = {
   verb: string;
   /** CLI tokens after the program, e.g. `["workspace","list","--format","json"]`. */
   args: readonly string[];
-  /** Whether the invocation requests `BITTY_CTL_ELEVATE` authority. */
+  /**
+   * Whether the invocation requests server-side elevation. The process
+   * dispatcher forwards this as the `BITTY_CTL_ELEVATE` scope allowlist; it is
+   * a pre-grant hint, not a client-side authority flag. The server evaluates
+   * the announced scopes against its own allowlist and remains the authority.
+   */
   elevated: boolean;
 };
 
@@ -311,6 +316,18 @@ export type SpawnSyncFn = (
   },
 ) => CtlResult;
 
+/**
+ * `BITTY_CTL_ELEVATE` scope list announced for elevated invocations.
+ *
+ * The variable is a server-side pre-grant allowlist of comma-separated scope
+ * names (for example `terminal.manage,config.modify`); the server intersects
+ * them with its own allowlist and unknown names grant nothing. A bare `1` is
+ * not a scope and therefore grants nothing, which is why an elevated probe
+ * must announce the scopes it needs. This is observation-only wiring: the
+ * server remains the authority and still fails closed on a missing grant.
+ */
+export const DEFAULT_ELEVATION_SCOPES = "terminal.manage,config.modify";
+
 export type ProcessDispatcherConfig = {
   /** Program to execute; defaults to `bitty`. */
   program?: string;
@@ -322,6 +339,11 @@ export type ProcessDispatcherConfig = {
   timeoutMs?: number;
   /** Extra environment (e.g. `XDG_RUNTIME_DIR`). */
   env?: Record<string, string>;
+  /**
+   * Comma-separated `BITTY_CTL_ELEVATE` scope list announced for elevated
+   * invocations. Defaults to {@link DEFAULT_ELEVATION_SCOPES}.
+   */
+  elevationScopes?: string;
   /** Working directory. */
   cwd?: string;
 };
@@ -408,6 +430,7 @@ export class ProcessCtlDispatcher implements CtlDispatcher {
   private readonly socketPath: string | undefined;
   private readonly timeoutMs: number;
   private readonly env: Record<string, string>;
+  private readonly elevationScopes: string;
   private readonly cwd: string | undefined;
   private readonly spawn: SpawnSyncFn;
 
@@ -420,6 +443,7 @@ export class ProcessCtlDispatcher implements CtlDispatcher {
     this.socketPath = config.socketPath;
     this.timeoutMs = config.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     this.env = config.env ?? {};
+    this.elevationScopes = config.elevationScopes ?? DEFAULT_ELEVATION_SCOPES;
     this.cwd = config.cwd;
     this.spawn = spawn;
   }
@@ -431,7 +455,9 @@ export class ProcessCtlDispatcher implements CtlDispatcher {
     }
     args.push(...invocation.args);
     const env: Record<string, string | undefined> = { ...this.env };
-    env["BITTY_CTL_ELEVATE"] = invocation.elevated ? "1" : undefined;
+    env["BITTY_CTL_ELEVATE"] = invocation.elevated
+      ? this.elevationScopes
+      : undefined;
     return this.spawn(this.program, args, {
       timeoutMs: this.timeoutMs,
       env,

@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   CTL_VERB_MATRIX,
   CampaignError,
+  DEFAULT_ELEVATION_SCOPES,
   EXIT_CONFLICT,
   EXIT_GENERIC,
   EXIT_OK,
@@ -36,6 +37,7 @@ import {
   workspaceNamesFrom,
   type CtlInvocation,
   type CtlResult,
+  type ProcessDispatcherConfig,
   type SocketDirStat,
 } from "../src/campaign.js";
 
@@ -441,19 +443,32 @@ describe("post-D4 coverage hooks are non-blocking", () => {
 });
 
 describe("durable dispatcher seam", () => {
-  test("process dispatcher builds argv and elevation env headlessly", async () => {
-    const calls: Array<{
-      program: string;
-      args: readonly string[];
-      env: Record<string, string | undefined>;
-    }> = [];
+  type RecordedCall = {
+    program: string;
+    args: readonly string[];
+    env: Record<string, string | undefined>;
+  };
+
+  function recordingDispatcher(config: ProcessDispatcherConfig = {}): {
+    dispatcher: ProcessCtlDispatcher;
+    calls: RecordedCall[];
+  } {
+    const calls: RecordedCall[] = [];
     const dispatcher = new ProcessCtlDispatcher(
-      { socketPath: "/run/bitty/default.sock", baseArgs: ["ctl"] },
+      config,
       (program, args, options) => {
         calls.push({ program, args, env: options.env });
         return makeOkResult("core.view.list", { views: [] });
       },
     );
+    return { dispatcher, calls };
+  }
+
+  test("process dispatcher builds argv and elevation env headlessly", async () => {
+    const { dispatcher, calls } = recordingDispatcher({
+      socketPath: "/run/bitty/default.sock",
+      baseArgs: ["ctl"],
+    });
     await dispatcher.dispatch({
       verb: "view.list",
       args: ["view", "list"],
@@ -467,11 +482,43 @@ describe("durable dispatcher seam", () => {
       "view",
       "list",
     ]);
-    expect(calls[0]?.env["BITTY_CTL_ELEVATE"]).toBe("1");
+    expect(calls[0]?.env["BITTY_CTL_ELEVATE"]).toBe(DEFAULT_ELEVATION_SCOPES);
 
     await dispatcher.dispatch({
       verb: "view.list",
       args: ["view", "list"],
+      elevated: false,
+    });
+    expect(calls[1]?.env["BITTY_CTL_ELEVATE"]).toBeUndefined();
+  });
+
+  test("elevation announces a scope list, never a bare client flag", async () => {
+    const { dispatcher, calls } = recordingDispatcher();
+    await dispatcher.dispatch({
+      verb: "terminal.spawn",
+      args: ["terminal", "spawn"],
+      elevated: true,
+    });
+    const announced = calls[0]?.env["BITTY_CTL_ELEVATE"];
+    expect(announced).toBe("terminal.manage,config.modify");
+    expect(announced).not.toBe("1");
+    expect(announced?.split(",")).toContain("terminal.manage");
+  });
+
+  test("elevation scopes are configurable and non-elevated clears them", async () => {
+    const { dispatcher, calls } = recordingDispatcher({
+      elevationScopes: "terminal.manage",
+    });
+    await dispatcher.dispatch({
+      verb: "terminal.spawn",
+      args: ["terminal", "spawn"],
+      elevated: true,
+    });
+    expect(calls[0]?.env["BITTY_CTL_ELEVATE"]).toBe("terminal.manage");
+
+    await dispatcher.dispatch({
+      verb: "terminal.spawn",
+      args: ["terminal", "spawn"],
       elevated: false,
     });
     expect(calls[1]?.env["BITTY_CTL_ELEVATE"]).toBeUndefined();
