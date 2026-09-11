@@ -1138,12 +1138,29 @@ const dirModeOctal = (mode: number): string =>
 
 /** Platform-agnostic parent directory (no node types dependency). */
 export function parentDirOf(path: string): string {
-  const normalized = path.replace(/\\/g, "/").replace(/\/+$/, "");
-  const index = normalized.lastIndexOf("/");
+  // Normalize separators and trim trailing separators without a quantifier
+  // regex (a trailing `/+$` pattern is super-linear on long runs and trips
+  // CodeQL's ReDoS rule).
+  const normalized = path.split("\\").join("/");
+  let end = normalized.length;
+  while (end > 0 && normalized[end - 1] === "/") end -= 1;
+  const trimmed = normalized.slice(0, end);
+  const index = trimmed.lastIndexOf("/");
   if (index < 0) return ".";
   if (index === 0) return "/";
-  const parent = normalized.slice(0, index);
-  return /^[A-Za-z]:$/.test(parent) ? `${parent}/` : parent;
+  const parent = trimmed.slice(0, index);
+  if (
+    parent.length === 2 &&
+    isAsciiLetter(parent.charCodeAt(0)) &&
+    parent[1] === ":"
+  ) {
+    return `${parent}/`;
+  }
+  return parent;
+}
+
+function isAsciiLetter(code: number): boolean {
+  return (code >= 65 && code <= 90) || (code >= 97 && code <= 122);
 }
 
 /**
