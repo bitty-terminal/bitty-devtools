@@ -23,6 +23,9 @@
 ## CarryCtx and delivery
 
 - CarryCtx is the durable project record; the external harness runs agents.
+- Install the `carryctx` CLI globally for local development (recommended):
+  `cargo install carryctx` or `npm i -g carryctx`; the npm package is also
+  declared in `package.json` for discovery.
 - Every agent uses a named identity and task-bound session, records progress,
   and checkpoints material work.
 - The normal lifecycle is GitHub Issue, CarryCtx task and team, dependencies
