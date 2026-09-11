@@ -18,6 +18,7 @@ export * from "./compat-matrix.js";
 export * from "./protocol.js";
 export * from "./auth.js";
 export * from "./transport.js";
+export * from "./campaign.js";
 export * from "./inspection.js";
 export * from "./tracing.js";
 export * from "./control.js";
