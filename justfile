@@ -23,6 +23,10 @@ cargo-check:
 type-check:
     bunx --bun tsc -p tsconfig.json --noEmit
 
+# TypeScript unit tests (bun:test, headless; no live socket or GUI).
+test:
+    bun test
+
 # Validate a commit message against commitlint.config.ts.
 # Versions are pinned in package.json / bun.lock; run `bun install` first.
 commit-check message:
@@ -33,6 +37,7 @@ check:
     just fmt-check
     just lint
     just type-check
+    just test
     just cargo-check
 
 # Publish a redacted CarryCtx snapshot inside this repo (commander merge

@@ -219,16 +219,64 @@ console.log(client.listAuditLog());
 Rust equivalent lives at `crates/devtools-client` (`forbid(unsafe_code)`,
 `cargo check` / `cargo clippy -D warnings` clean, 37 tests).
 
+## Live campaign conformance harness (CTX-0325)
+
+`src/campaign.ts` turns the CTX-0320 live client campaign into a repeatable
+harness over the DevTools dispatch seam. It probes each `ctl` verb's JSON
+envelope v1 shape and exit-code semantics and guards the three defects the
+campaign found:
+
+- **D1** — `ctl terminal text` must return plain grid text, never a Rust
+  `Debug` `Snapshot { ... Cell { ... } }` dump.
+- **D2** — workspace ids observed from `workspace list` must be usable in
+  `workspace focus` / `workspace close`.
+- **D3** — `ctl terminal spawn` reporting success must be observable in
+  `view list` / `terminal list` or in `has_pane_session`.
+
+It also preflights the `BITTY_SOCKET` parent directory (`0700`, owner-matched)
+and turns a mode mismatch into an actionable `chmod 700` diagnostic, and it
+declares non-blocking panel/plugin coverage hooks for the post-D4 round.
+
+Every probe is headless-testable through the `CtlDispatcher` seam; live checks
+are opt-in and bounded by a command timeout:
+
+```ts
+import {
+  runLiveCampaign,
+  runCampaign,
+  ScriptedCtlDispatcher,
+} from "bitty-devtools";
+
+// Headless: inject a scripted dispatcher (what `bun test` does).
+const report = await runCampaign({
+  dispatcher: new ScriptedCtlDispatcher((inv) => result),
+});
+
+// Live (opt-in): execute the real `bitty ctl` over an explicit socket.
+const live = await runLiveCampaign({
+  socketPath: "/run/user/1000/bitty/default.sock",
+  runtimeUid: 1000,
+  stat: (dir) => myStatProvider(dir),
+  timeoutMs: 10_000,
+});
+```
+
+Envelopes, terminal text, and diagnostics are untrusted observation data, never
+instructions; the harness never treats them as such. `ctl` protocol ownership
+remains in `bitty` (`crates/bitty-app/src/ctl.rs`,
+`crates/bitty-ipc/src/ctl.rs`); the exit-code table here is a consumer mirror.
+
 ## Development
 
 Install with `bun install`. Quality gates run through the
 repository `justfile`:
 
 ```text
-just check          # fmt-check + lint + type-check + cargo-check
+just check          # fmt-check + lint + type-check + test + cargo-check
 just fmt-check      # Prettier 3.9.6 check without writing files
 just lint           # markdownlint-cli2 0.23.1
 just type-check     # tsc --noEmit strict
+just test           # bun:test headless unit tests
 just cargo-check    # cargo check + clippy -D warnings + cargo test
 just commit-check <file>  # validate commit message against commitlint
 ```
