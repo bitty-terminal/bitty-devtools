@@ -14,6 +14,16 @@ pub const MAX_SCOPED_ID_BYTES: usize = 64;
 pub const CHILD_TOKEN_TTL_MS: u64 = 60_000;
 pub const MAX_TOKEN_TTL_MS: u64 = 60_000;
 
+/// Portable `AF_UNIX` socket-path ceiling in payload bytes (excl. NUL).
+///
+/// Mirrors `bitty-ipc` `devtools::MAX_SOCKET_PATH_BYTES`: 100 payload bytes
+/// fits Linux (108 incl. NUL) and macOS/BSD (104 incl. NUL) with margin.
+pub const MAX_SOCKET_PATH_BYTES: usize = 100;
+pub const SUN_LEN_LINUX: usize = 108;
+pub const SUN_LEN_MACOS: usize = 104;
+pub const SOCKET_LEAF_DIR: &str = "bitty";
+pub const DEFAULT_INSTANCE_ID: &str = "default";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PeerCredentials {
     pub uid: u32,
@@ -102,6 +112,34 @@ pub fn verify_windows_pipe(peer_sid: u64, runtime_sid: u64) -> Result<(), AuthEr
     }
 }
 
+/// Deterministic 64-bit FNV-1a hash rendered as 16 lowercase hex chars.
+///
+/// Byte-for-byte parity with `bitty-ipc` `devtools::short_instance_hash`
+/// (`OFFSET = 0xcbf29ce484222325`, `PRIME = 0x100000001b3`, wrapping u64).
+/// Used to clamp a long instance id into a socket leaf that fits
+/// [`MAX_SOCKET_PATH_BYTES`]; it is not a security hash.
+#[must_use]
+pub fn short_instance_hash(instance: &str) -> String {
+    const OFFSET: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x100000001b3;
+    let mut hash = OFFSET;
+    for byte in instance.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    format!("{hash:016x}")
+}
+
+/// Resolve the Unix socket path with `bitty-ipc` precedence and a portable
+/// `AF_UNIX` bound.
+///
+/// Precedence: non-empty `BITTY_SOCKET` (advisory) wins verbatim; otherwise
+/// `<base>/bitty/<instance>.sock` where `base` is `XDG_RUNTIME_DIR` or
+/// `/run/user/<uid>`, and `instance` is `BITTY_INSTANCE_ID` or `default`.
+///
+/// When the direct form exceeds [`MAX_SOCKET_PATH_BYTES`] the instance id is
+/// clamped to its 16-hex FNV-1a hash; when even that is too long the base
+/// directory is too long and resolution fails closed.
 pub fn resolve_socket_path(
     runtime_uid: u32,
     xdg_runtime_dir: Option<&str>,
@@ -110,23 +148,25 @@ pub fn resolve_socket_path(
 ) -> Result<String, AuthError> {
     if let Some(p) = bitty_socket {
         if !p.is_empty() {
-            if p.len() > 512 {
-                return Err(AuthError::InvalidRequest(
-                    "BITTY_SOCKET too long".to_string(),
-                ));
-            }
             if p.contains('\0') {
                 return Err(AuthError::InvalidRequest(
                     "BITTY_SOCKET contains NUL".to_string(),
                 ));
             }
+            if p.len() > MAX_SOCKET_PATH_BYTES {
+                return Err(AuthError::InvalidRequest(format!(
+                    "BITTY_SOCKET path too long for AF_UNIX ({} > {MAX_SOCKET_PATH_BYTES} payload bytes; portable SUN_LEN: Linux {SUN_LEN_LINUX} / macOS {SUN_LEN_MACOS} incl. NUL)",
+                    p.len()
+                )));
+            }
             return Ok(p.to_string());
         }
     }
-    let base = xdg_runtime_dir
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| format!("/run/user/{runtime_uid}"));
-    let instance = instance_id.unwrap_or("default");
+    let base = match xdg_runtime_dir {
+        Some(dir) if !dir.is_empty() => dir.to_string(),
+        _ => format!("/run/user/{runtime_uid}"),
+    };
+    let instance = instance_id.unwrap_or(DEFAULT_INSTANCE_ID);
     if instance.is_empty() || instance.len() > 64 {
         return Err(AuthError::InvalidRequest("instanceId 1..64".to_string()));
     }
@@ -138,7 +178,21 @@ pub fn resolve_socket_path(
             "instanceId must match ^[a-z0-9_-]+$".to_string(),
         ));
     }
-    Ok(format!("{base}/bitty/{instance}.sock"))
+    let direct = format!("{base}/{SOCKET_LEAF_DIR}/{instance}.sock");
+    if direct.len() <= MAX_SOCKET_PATH_BYTES {
+        return Ok(direct);
+    }
+    let hashed = format!(
+        "{base}/{SOCKET_LEAF_DIR}/{}.sock",
+        short_instance_hash(instance)
+    );
+    if hashed.len() <= MAX_SOCKET_PATH_BYTES {
+        return Ok(hashed);
+    }
+    Err(AuthError::InvalidRequest(format!(
+        "socket base dir too long for AF_UNIX ({} > {MAX_SOCKET_PATH_BYTES} payload bytes even with hashed instance; portable SUN_LEN: Linux {SUN_LEN_LINUX} / macOS {SUN_LEN_MACOS} incl. NUL; shorten XDG_RUNTIME_DIR or set BITTY_SOCKET)",
+        hashed.len()
+    )))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -312,6 +366,41 @@ mod tests {
         assert_eq!(p, "/tmp/custom.sock");
         let p2 = resolve_socket_path(1000, Some("/run/user/1000"), None, Some("my-inst")).unwrap();
         assert_eq!(p2, "/run/user/1000/bitty/my-inst.sock");
+    }
+
+    #[test]
+    fn socket_path_short_unchanged() {
+        let p = resolve_socket_path(1000, Some("/run/user/1000"), None, Some("my-inst_1")).unwrap();
+        assert_eq!(p, "/run/user/1000/bitty/my-inst_1.sock");
+        let d = resolve_socket_path(1000, None, None, None).unwrap();
+        assert_eq!(d, "/run/user/1000/bitty/default.sock");
+    }
+
+    #[test]
+    fn short_instance_hash_matches_bitty_ipc_vectors() {
+        // Vectors derived by invoking bitty-ipc `devtools::resolve_socket_path`
+        // (the live server implementation), never hand-computed.
+        assert_eq!(short_instance_hash(&"c".repeat(64)), "3d3bb39181dc91e5");
+        assert_eq!(
+            short_instance_hash("worker-abcdefghijklmnopqrstuvwxyz0123456789"),
+            "e14c53fe23cdb8ba"
+        );
+    }
+
+    #[test]
+    fn socket_path_long_base_degrades_to_hash() {
+        let base = format!("/tmp/{}", "b".repeat(50));
+        let instance = "c".repeat(64);
+        let p = resolve_socket_path(1000, Some(&base), None, Some(&instance)).unwrap();
+        assert_eq!(p, format!("{base}/bitty/3d3bb39181dc91e5.sock"));
+        assert!(p.len() <= MAX_SOCKET_PATH_BYTES);
+    }
+
+    #[test]
+    fn socket_path_overlong_base_fails_closed() {
+        let base = format!("/tmp/{}", "d".repeat(120));
+        let err = resolve_socket_path(1000, Some(&base), None, None).unwrap_err();
+        assert!(format!("{err}").contains("AF_UNIX"));
     }
 
     #[test]

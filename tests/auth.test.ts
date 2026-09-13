@@ -5,6 +5,7 @@ import {
   verifyUnixEndpoint,
   verifyWindowsPipe,
   resolveSocketPath,
+  shortInstanceHash,
   newChildToken,
   childTokenAuthorizes,
   ChildTokenStore,
@@ -70,6 +71,44 @@ describe("auth peer-creds (phase 2, live runtime)", () => {
     expect(() =>
       resolveSocketPath({ runtimeUid: 1000, instanceId: "bad/id" }),
     ).toThrow("must match");
+  });
+
+  test("short socket path stays verbatim below the portable bound", () => {
+    expect(
+      resolveSocketPath({
+        runtimeUid: 1000,
+        xdgRuntimeDir: "/run/user/1000",
+        instanceId: "my-inst_1",
+      }),
+    ).toBe("/run/user/1000/bitty/my-inst_1.sock");
+  });
+
+  test("SUN_LEN fallback matches bitty-ipc FNV-1a vectors", () => {
+    // Vectors derived by invoking bitty-ipc `devtools::resolve_socket_path`
+    // (the live server implementation), never hand-computed.
+    expect(shortInstanceHash("c".repeat(64))).toBe("3d3bb39181dc91e5");
+    expect(
+      shortInstanceHash("worker-abcdefghijklmnopqrstuvwxyz0123456789"),
+    ).toBe("e14c53fe23cdb8ba");
+  });
+
+  test("long base degrades to the 16-hex hashed leaf byte-for-byte", () => {
+    const base = `/tmp/${"b".repeat(50)}`;
+    const instance = "c".repeat(64);
+    expect(
+      resolveSocketPath({
+        runtimeUid: 1000,
+        xdgRuntimeDir: base,
+        instanceId: instance,
+      }),
+    ).toBe(`${base}/bitty/3d3bb39181dc91e5.sock`);
+  });
+
+  test("overlong base fails closed even with the hashed instance", () => {
+    const base = `/tmp/${"d".repeat(120)}`;
+    expect(() =>
+      resolveSocketPath({ runtimeUid: 1000, xdgRuntimeDir: base }),
+    ).toThrow(/AF_UNIX/);
   });
 
   test("child token short-lived, PTY fd never env, 0600, bounded 64", () => {
