@@ -19,6 +19,27 @@ export const MAX_SCOPED_ID_BYTES = 64 as const;
 export const CHILD_TOKEN_TTL_MS = 60_000 as const;
 export const MAX_TOKEN_TTL_MS = 60_000 as const;
 
+/**
+ * Portable `AF_UNIX` socket-path ceiling in payload bytes (excl. NUL).
+ *
+ * `sockaddr_un.sun_path` is 108 bytes incl. NUL on Linux and 104 incl. NUL on
+ * macOS/BSD; 100 payload bytes fits every target with margin. Mirrors
+ * `bitty-ipc` `devtools::MAX_SOCKET_PATH_BYTES` and replaces the former
+ * 512-byte advisory check, which is wrong for `bind`/`connect`.
+ */
+export const MAX_SOCKET_PATH_BYTES = 100 as const;
+
+export const SUN_LEN_LINUX = 108 as const;
+export const SUN_LEN_MACOS = 104 as const;
+export const SOCKET_LEAF_DIR = "bitty" as const;
+export const DEFAULT_INSTANCE_ID = "default" as const;
+
+const UTF8 = new TextEncoder();
+
+function utf8ByteLength(value: string): number {
+  return UTF8.encode(value).length;
+}
+
 export type PeerCredentials = {
   uid: number;
   gid: number;
@@ -119,23 +140,64 @@ export type EndpointConfig = {
   instanceId?: string;
 };
 
+/**
+ * Deterministic 64-bit FNV-1a hash rendered as 16 lowercase hex chars.
+ *
+ * Byte-for-byte parity with `bitty-ipc` `devtools::short_instance_hash`
+ * (`OFFSET = 0xcbf29ce484222325`, `PRIME = 0x100000001b3`, wrapping u64).
+ * Used to clamp a long instance id into a socket leaf that fits
+ * `MAX_SOCKET_PATH_BYTES`; it is not a security hash.
+ */
+export function shortInstanceHash(instance: string): string {
+  const OFFSET = 0xcbf29ce484222325n;
+  const PRIME = 0x100000001b3n;
+  const MASK = 0xffffffffffffffffn;
+  let hash = OFFSET;
+  for (const byte of UTF8.encode(instance)) {
+    hash = ((hash ^ BigInt(byte)) * PRIME) & MASK;
+  }
+  return hash.toString(16).padStart(16, "0");
+}
+
+/**
+ * Resolve the Unix socket path with `bitty-ipc` precedence and a portable
+ * `AF_UNIX` bound.
+ *
+ * Precedence: non-empty `BITTY_SOCKET` (advisory) wins verbatim; otherwise
+ * `<base>/bitty/<instance>.sock` where `base` is `XDG_RUNTIME_DIR` or
+ * `/run/user/<uid>`, and `instance` is `BITTY_INSTANCE_ID` or `default`.
+ *
+ * When the direct form exceeds {@link MAX_SOCKET_PATH_BYTES} the instance id
+ * is clamped to its 16-hex FNV-1a hash; when even that is too long the base
+ * directory is too long and resolution fails closed. Lengths are UTF-8 byte
+ * counts so the thresholds match the Rust server exactly.
+ */
 export function resolveSocketPath(config: EndpointConfig): string {
-  // Precedence: BITTY_SOCKET env (advisory) > XDG_RUNTIME_DIR/bitty/<instance>.sock
-  // Forged BITTY_SOCKET without peer credential still fails at verify step.
   if (config.bittySocket !== undefined && config.bittySocket.length > 0) {
-    if (config.bittySocket.length > 512)
-      throw new Error("BITTY_SOCKET path too long");
     if (config.bittySocket.includes("\0"))
       throw new Error("BITTY_SOCKET contains NUL");
+    if (utf8ByteLength(config.bittySocket) > MAX_SOCKET_PATH_BYTES)
+      throw new Error(
+        `BITTY_SOCKET path too long for AF_UNIX (${utf8ByteLength(config.bittySocket)} > ${MAX_SOCKET_PATH_BYTES} payload bytes; portable SUN_LEN: Linux ${SUN_LEN_LINUX} / macOS ${SUN_LEN_MACOS} incl. NUL)`,
+      );
     return config.bittySocket;
   }
-  const base = config.xdgRuntimeDir ?? `/run/user/${config.runtimeUid}`;
-  const instance = config.instanceId ?? "default";
+  const base =
+    config.xdgRuntimeDir !== undefined && config.xdgRuntimeDir.length > 0
+      ? config.xdgRuntimeDir
+      : `/run/user/${config.runtimeUid}`;
+  const instance = config.instanceId ?? DEFAULT_INSTANCE_ID;
   if (instance.length === 0 || instance.length > 64)
     throw new Error("instanceId must be 1..64");
   if (!/^[a-z0-9_-]+$/i.test(instance))
     throw new Error("instanceId must match ^[a-z0-9_-]+$");
-  return `${base}/bitty/${instance}.sock`;
+  const direct = `${base}/${SOCKET_LEAF_DIR}/${instance}.sock`;
+  if (utf8ByteLength(direct) <= MAX_SOCKET_PATH_BYTES) return direct;
+  const hashed = `${base}/${SOCKET_LEAF_DIR}/${shortInstanceHash(instance)}.sock`;
+  if (utf8ByteLength(hashed) <= MAX_SOCKET_PATH_BYTES) return hashed;
+  throw new Error(
+    `socket base dir too long for AF_UNIX (${utf8ByteLength(hashed)} > ${MAX_SOCKET_PATH_BYTES} payload bytes even with hashed instance; portable SUN_LEN: Linux ${SUN_LEN_LINUX} / macOS ${SUN_LEN_MACOS} incl. NUL; shorten XDG_RUNTIME_DIR or set BITTY_SOCKET)`,
+  );
 }
 
 export function isBittyEnvDiscoverySafe(): string {
