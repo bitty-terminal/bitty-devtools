@@ -25,6 +25,8 @@ import { InspectionClient } from "./inspection.js";
 import type { InspectionTransport } from "./inspection.js";
 import { TracingClient } from "./tracing.js";
 import { ControlClient } from "./control.js";
+import { AutomationClient } from "./automation.js";
+import type { AutomationCapability } from "./automation.js";
 import type {
   PanelRuntimeSnapshot,
   PanelId,
@@ -509,6 +511,25 @@ export class DevtoolsClient {
   listAuditLog(limit?: number): ReturnType<ControlClient["listAuditLog"]> {
     this.requireConnected();
     return this.control.listAuditLog(this.activeScope(), limit);
+  }
+
+  // -------------------------------------------------------------------------
+  // Test automation (debug.control/trace + terminal capability + bearer)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Bind a test-automation client to the connected transport. The debug scope
+   * comes from this session's granted scopes; terminal capability scopes are
+   * explicit because `grantScope` models only the debug scopes. Bearers are
+   * consent-issued by the server and supplied per call, never minted here.
+   */
+  automationClient(
+    capabilities: Iterable<AutomationCapability>,
+  ): AutomationClient {
+    this.requireConnected();
+    const scopes = new Set<string>(this.session.scopes);
+    for (const capability of capabilities) scopes.add(capability);
+    return new AutomationClient(this.inspectionTransport, scopes);
   }
 
   // -------------------------------------------------------------------------
