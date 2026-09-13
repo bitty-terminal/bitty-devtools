@@ -157,6 +157,31 @@ Rust counterpart at `crates/devtools-client` mirrors the same contracts:
 `cargo test` `37` tests pass; `just check` green; `bun test` `62` tests
 pass. No `unsafe`, no PTY/GPU/window handle, no TCP, no ambient credential.
 
+## Test-automation drivers (candidate, CTX-0024)
+
+`src/automation.ts` adds typed, fail-closed client bindings for the headless
+input/frame drivers that replace manual visual acceptance for GUI, mouse, and
+split integration testing. The bindings target the `bitty` candidate methods
+`bitty.debug/synthesizeInput`, `bitty.debug/captureFrame`, and
+`bitty.debug/frameHash` (serving dispatcher
+`crates/bitty-ipc/src/devtools.rs`, CTX-0188/CTX-0244); they remain
+`Candidate` here because the accepted
+[DevTools RFC](https://github.com/bitty-terminal/bitty-docs/blob/main/docs/specifications/devtools-rfc.md)
+does not yet name these methods.
+
+- Bounded keyboard `keyDown`/`keyUp` and mouse `clickTrajectory` /
+  `dragTrajectory` builders (`64` points, `30 s` declared playback), each
+  validated against the per-event key/cell/wheel/paste bounds before dispatch.
+- Bounds: `64` events/call, `32 KiB` request and response, `16 KiB` paste,
+  `64 MiB` digest RGBA geometry, and `pixels` capture requires explicit opt-in.
+- Authority is never inferred: each call needs `debug.control` +
+  `terminal.input` (`synthesizeInput`) or `debug.trace` + `terminal.inspect`
+  (`captureFrame`/`frameHash`) plus a consent-issued bearer. Connection alone
+  grants nothing.
+- Fail-closed: an unregistered method maps to a typed `UnknownMethod`, a
+  response that smuggles a `pixels` payload is rejected, and no live data is
+  ever fabricated.
+
 ## Usage (local, human-facing)
 
 ```ts

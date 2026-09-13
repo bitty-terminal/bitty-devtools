@@ -9,6 +9,23 @@ and this project adheres to no released version yet.
 
 ### Added
 
+- **Test-automation drivers (CTX-0024, candidate)**: typed, fail-closed client
+  bindings in `src/automation.ts` for `bitty.debug/synthesizeInput`,
+  `bitty.debug/captureFrame`, and `bitty.debug/frameHash` — the headless
+  input/frame drivers that replace manual visual acceptance for GUI, mouse,
+  and split integration testing. Bounded keyboard `keyDown`/`keyUp` and mouse
+  `clickTrajectory`/`dragTrajectory` builders (`64` points, `30 s` declared
+  duration) are validated before dispatch; per-call bounds are `64` events,
+  `32 KiB` request/response, `16 KiB` paste, and `64 MiB` digest RGBA geometry,
+  with `pixels` capture gated on explicit opt-in. Each call requires the debug
+  scope plus the terminal capability scope (`debug.control` + `terminal.input`
+  or `debug.trace` + `terminal.inspect`) and a consent-issued bearer;
+  connection alone grants nothing. An unregistered method maps to a typed
+  `UnknownMethod`, a `pixels` response that smuggles a payload is rejected, and
+  no live data is fabricated. Verified against the `bitty` dispatcher
+  `crates/bitty-ipc/src/devtools.rs` (CTX-0188/CTX-0244); the accepted
+  `devtools-rfc` does not yet name these methods (naming gap reported).
+
 - **Diagnostics client phase 2 (CTX-0012)**: advanced tracing, control
   surfaces, and real IPC socket/pipe peer-creds integration against the live
   Bitty runtime. Reuses Panel Runtime and 14×4 compat matrix and extends

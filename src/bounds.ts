@@ -52,6 +52,28 @@ export const BOUNDS = {
   MAX_TRACE_DURATION_MS: 5 * 60 * 1000,
   MAX_CONNECTIONS: 16,
 
+  // Test automation (bitty-ipc CTX-0188/CTX-0244 candidate; wire parity with
+  // the `bitty` dispatcher, not a new budget family). `MAX_TRAJECTORY_*` are
+  // client-side pacing bounds: the server bounds neither a trajectory's point
+  // count beyond the per-call event cap nor its playback duration.
+  MAX_SYNTH_EVENTS_PER_CALL: 64,
+  MAX_SYNTH_CALLS_PER_SEC: 10,
+  MAX_CAPTURE_FPS: 10,
+  MAX_AUTOMATION_PARAMS_BYTES: 32 * 1024,
+  MAX_AUTOMATION_RESPONSE_BYTES: 32 * 1024,
+  MAX_ORIGIN_LABEL_CHARS: 64,
+  MAX_BEARER_TOKEN_CHARS: 128,
+  MAX_SYNTH_PASTE_BYTES: 16 * 1024,
+  MAX_SYNTH_KEY_CHARS: 64,
+  MAX_SYNTH_CELL: 1024,
+  MAX_SYNTH_WHEEL_DELTA: 64,
+  MAX_INSPECT_ROWS: 64,
+  MAX_INSPECT_COLS: 256,
+  MAX_DIGEST_RGBA_BYTES: 64 * 1024 * 1024,
+  MAX_TRAJECTORY_POINTS: 64,
+  MAX_DRAG_STEPS: 62,
+  MAX_TRAJECTORY_DURATION_MS: 30 * 1000,
+
   // Preview bounds (redacted)
   PREVIEW_MAX_BYTES: 8 * 1024,
   PREVIEW_MAX_CHARS: 2048,

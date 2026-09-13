@@ -22,4 +22,5 @@ export * from "./campaign.js";
 export * from "./inspection.js";
 export * from "./tracing.js";
 export * from "./control.js";
+export * from "./automation.js";
 export * from "./client.js";
