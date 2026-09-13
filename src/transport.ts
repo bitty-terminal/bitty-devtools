@@ -20,6 +20,7 @@ import {
   verifyWindowsPipe,
 } from "./auth.js";
 import type { PeerCredentials } from "./auth.js";
+import { decodeResponse } from "./protocol.js";
 
 // ---------------------------------------------------------------------------
 // Constants (mirror bitty-ipc + devtools-rfc, single place)
@@ -551,6 +552,41 @@ export class IpcTransport {
       this.stub.trySendPayload(payload);
     }
     this.requests += 1;
+  }
+
+  /**
+   * Send one JSON-RPC request and decode its response (fail-closed).
+   *
+   * This is the request/response seam used by inspection callers. It reuses
+   * `sendRequest` for framing, rate limiting, and per-action peer verification,
+   * then reads the next inbound frame. The headless/test transport supplies
+   * that frame via `injectResponsePayload`; a live socket reader would supply
+   * it asynchronously. Response ids must match the request id, and the
+   * envelope is validated by `decodeResponse` before it is returned.
+   *
+   * L2 (recorded, not fixed here): this reads exactly one inbound frame and
+   * does not reassemble RC-10 256 KiB continuation frames, and the transport
+   * is still the in-memory `StdioTransportStub` rather than a live socket
+   * reader. Those remain tracked follow-ups outside PR #45's scope.
+   */
+  request(req: IpcRequest, nowMs: number): IpcResponse {
+    this.sendRequest(req, nowMs);
+    const frame = this.stub.recvIncoming();
+    if (frame === undefined) {
+      throw new TransportError(
+        "TransportClosed",
+        `no response for id ${req.id} (${req.method})`,
+      );
+    }
+    const raw = new TextDecoder().decode(frame.payload);
+    const response: IpcResponse = decodeResponse(raw);
+    if (response.id !== req.id) {
+      throw new TransportError(
+        "InvalidFrame",
+        `response id ${response.id} != request id ${req.id}`,
+      );
+    }
+    return response;
   }
 
   forwardTo(peer: IpcTransport): number {
