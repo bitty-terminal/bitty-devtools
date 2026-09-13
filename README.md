@@ -75,7 +75,9 @@ and strict TypeScript with no `any`.
 - **Inspection (debug.inspect, default)** — read-only, scope-checked,
   `listPlugins`, `getPlugin`, `listSubscriptions`, `getBudgets`,
   `getQueueSnapshot`, `getSnapshot` (8 KiB truncated redacted preview),
-  `listHandles`, `panelSummary`, `compatMatrixSummary`. Terminal output
+  `listHandles`, `panelSummary`, `compatMatrixSummary`, and the CTX-0159
+  live bounded introspection bindings `getGridText` (`rows`/`cols`),
+  `getInputRing` (`limit`), `getModifiers`, and `getFocus`. Terminal output
   is untrusted observation data, never instructions.
 
 - **Tracing (debug.trace, opt-in)** — per-consumer bounded queues with

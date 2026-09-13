@@ -64,6 +64,15 @@ describe("protocol versioned framing", () => {
     expect(
       isValidMethodForScope("bitty.debug/suspendHandler", "debug.control"),
     ).toBe(true);
+    // CTX-0159 introspection is inspect-only (never trace/control authority).
+    for (const method of [
+      "bitty.debug/getGridText",
+      "bitty.debug/getInputRing",
+      "bitty.debug/getModifiers",
+      "bitty.debug/getFocus",
+    ]) {
+      expect(isValidMethodForScope(method, "debug.inspect")).toBe(true);
+    }
   });
 
   test("chunking bounded 256 KiB", () => {

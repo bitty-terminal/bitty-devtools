@@ -95,6 +95,75 @@ export type HandleInfo = {
   refCount: number;
 };
 
+/**
+ * Bounded grid text snapshot (`bitty.debug/getGridText`, CTX-0159).
+ *
+ * Mirrors the live server shape: `lines` is top-first and bounded by the
+ * requested `rows`/`cols`; `cursor` reports the terminal cursor cell and
+ * visibility; `cols`/`rows`/`generation` are the store geometry. An empty
+ * store (never published) yields `lines: []` and `generation: 0`.
+ */
+export type GridTextCursor = {
+  row: number;
+  col: number;
+  visible: boolean;
+};
+
+export type GridTextSnapshot = {
+  snapshot: "grid-text";
+  lines: string[];
+  cursor: GridTextCursor;
+  cols: number;
+  rows: number;
+  generation: number;
+};
+
+/**
+ * Bounded input-ring snapshot (`bitty.debug/getInputRing`, CTX-0159).
+ *
+ * `events` is oldest-first and bounded by the requested `limit`. Mouse-only
+ * fields are nullable: `button`/`col`/`row`/`pressed` are `null` for key
+ * events, and `label` is the server's bounded human-readable description.
+ */
+export type InputEvent = {
+  seq: number;
+  kind: string;
+  label: string;
+  shift: boolean;
+  control: boolean;
+  alt: boolean;
+  button: string | null;
+  col: number | null;
+  row: number | null;
+  pressed: boolean | null;
+};
+
+export type InputRingSnapshot = {
+  snapshot: "input-ring";
+  events: InputEvent[];
+  count: number;
+};
+
+/** Modifier/latch state (`bitty.debug/getModifiers`, CTX-0159). */
+export type ModifiersSnapshot = {
+  snapshot: "modifiers";
+  shift: boolean;
+  control: boolean;
+  alt: boolean;
+  kittyFlags: number;
+};
+
+/** Focus/window state (`bitty.debug/getFocus`, CTX-0159). */
+export type FocusSnapshot = {
+  snapshot: "focus";
+  focused: boolean;
+  focusedView: number | null;
+  mouseCapture: boolean;
+  altScreen: boolean;
+  bracketedPaste: boolean;
+  focusEvents: boolean;
+};
+
 export class InspectionError extends Error {
   constructor(
     public readonly code: string,
@@ -113,6 +182,18 @@ const MAX_PLUGINS = 256;
 const MAX_SUBSCRIPTIONS = 32;
 const MAX_HANDLES = 256;
 const MAX_PREVIEW_CHARS = 2048;
+
+/**
+ * Introspection bounds mirror `bitty-ipc/src/devtools.rs` (CTX-0159):
+ * `MAX_INSPECT_ROWS` 64, `MAX_INSPECT_COLS` 256, `MAX_INPUT_RING` 64, and a
+ * 16-char kind / 64-char label cap. The client re-applies them so a hostile
+ * peer cannot exceed the negotiated response budget.
+ */
+const MAX_GRID_ROWS = 64;
+const MAX_GRID_COLS = 256;
+const MAX_INPUT_EVENTS = 64;
+const MAX_INPUT_KIND_CHARS = 16;
+const MAX_INPUT_LABEL_CHARS = 64;
 
 /**
  * Local, read-only snapshot source. It is consulted only when no transport is
@@ -251,6 +332,231 @@ function requireStringArray(
     throw parseError(`${field}.${key}`, "expected an array of strings");
   }
   return value as string[];
+}
+
+function requireUnsignedInt(
+  record: Record<string, unknown>,
+  key: string,
+  field: string,
+): number {
+  const value = requireNumber(record, key, field);
+  if (!Number.isInteger(value) || value < 0) {
+    throw parseError(`${field}.${key}`, "expected a non-negative integer");
+  }
+  return value;
+}
+
+function requireNullableString(
+  record: Record<string, unknown>,
+  key: string,
+  field: string,
+): string | null {
+  if (record[key] === null) return null;
+  return requireString(record, key, field);
+}
+
+function requireNullableNumber(
+  record: Record<string, unknown>,
+  key: string,
+  field: string,
+): number | null {
+  if (record[key] === null) return null;
+  return requireNumber(record, key, field);
+}
+
+function requireNullableBoolean(
+  record: Record<string, unknown>,
+  key: string,
+  field: string,
+): boolean | null {
+  if (record[key] === null) return null;
+  return requireBoolean(record, key, field);
+}
+
+function requireNullableUnsignedInt(
+  record: Record<string, unknown>,
+  key: string,
+  field: string,
+): number | null {
+  if (record[key] === null) return null;
+  return requireUnsignedInt(record, key, field);
+}
+
+/**
+ * Strict envelope policy: the required-field helpers already fail closed on
+ * missing or mistyped values; this additionally rejects any key outside the
+ * known wire schema so an unknown/extra field is a protocol error rather than
+ * silently ignored observation data.
+ */
+function requireOnlyKeys(
+  record: Record<string, unknown>,
+  allowed: readonly string[],
+  field: string,
+): void {
+  for (const key of Object.keys(record)) {
+    if (!allowed.includes(key)) {
+      throw parseError(`${field}.${key}`, "unknown field");
+    }
+  }
+}
+
+function requireSnapshotTag(
+  record: Record<string, unknown>,
+  expected: string,
+  field: string,
+): void {
+  if (record["snapshot"] !== expected) {
+    throw parseError(`${field}.snapshot`, `expected "${expected}"`);
+  }
+}
+
+function gridTextSnapshotFrom(
+  value: unknown,
+  field = "getGridText result",
+): GridTextSnapshot {
+  const r = requireRecord(value, field);
+  requireOnlyKeys(
+    r,
+    ["version", "snapshot", "lines", "cursor", "cols", "rows", "generation"],
+    field,
+  );
+  requireSnapshotTag(r, "grid-text", field);
+  const rawLines = requireArray(r["lines"], `${field}.lines`);
+  assertBounded("MAX_GRID_ROWS", rawLines.length, MAX_GRID_ROWS);
+  const lines = rawLines.map((line, i) => {
+    const lineField = `${field}.lines[${i}]`;
+    if (typeof line !== "string") {
+      throw parseError(lineField, "expected a string");
+    }
+    assertBounded("MAX_GRID_COLS", [...line].length, MAX_GRID_COLS);
+    return line;
+  });
+  const cursorField = `${field}.cursor`;
+  const cursor = requireRecord(r["cursor"], cursorField);
+  requireOnlyKeys(cursor, ["row", "col", "visible"], cursorField);
+  return {
+    snapshot: "grid-text",
+    lines,
+    cursor: {
+      row: requireUnsignedInt(cursor, "row", cursorField),
+      col: requireUnsignedInt(cursor, "col", cursorField),
+      visible: requireBoolean(cursor, "visible", cursorField),
+    },
+    cols: requireUnsignedInt(r, "cols", field),
+    rows: requireUnsignedInt(r, "rows", field),
+    generation: requireUnsignedInt(r, "generation", field),
+  };
+}
+
+function inputEventFrom(value: unknown, field: string): InputEvent {
+  const r = requireRecord(value, field);
+  requireOnlyKeys(
+    r,
+    [
+      "seq",
+      "kind",
+      "label",
+      "shift",
+      "control",
+      "alt",
+      "button",
+      "col",
+      "row",
+      "pressed",
+    ],
+    field,
+  );
+  const kind = requireString(r, "kind", field);
+  assertBounded("MAX_INPUT_KIND_CHARS", [...kind].length, MAX_INPUT_KIND_CHARS);
+  const label = requireString(r, "label", field);
+  assertBounded(
+    "MAX_INPUT_LABEL_CHARS",
+    [...label].length,
+    MAX_INPUT_LABEL_CHARS,
+  );
+  return {
+    seq: requireUnsignedInt(r, "seq", field),
+    kind,
+    label,
+    shift: requireBoolean(r, "shift", field),
+    control: requireBoolean(r, "control", field),
+    alt: requireBoolean(r, "alt", field),
+    button: requireNullableString(r, "button", field),
+    col: requireNullableNumber(r, "col", field),
+    row: requireNullableNumber(r, "row", field),
+    pressed: requireNullableBoolean(r, "pressed", field),
+  };
+}
+
+function inputRingSnapshotFrom(
+  value: unknown,
+  field = "getInputRing result",
+): InputRingSnapshot {
+  const r = requireRecord(value, field);
+  requireOnlyKeys(r, ["version", "snapshot", "events", "count"], field);
+  requireSnapshotTag(r, "input-ring", field);
+  const rawEvents = requireArray(r["events"], `${field}.events`);
+  assertBounded("MAX_INPUT_EVENTS", rawEvents.length, MAX_INPUT_EVENTS);
+  return {
+    snapshot: "input-ring",
+    events: rawEvents.map((event, i) =>
+      inputEventFrom(event, `${field}.events[${i}]`),
+    ),
+    count: requireUnsignedInt(r, "count", field),
+  };
+}
+
+function modifiersSnapshotFrom(
+  value: unknown,
+  field = "getModifiers result",
+): ModifiersSnapshot {
+  const r = requireRecord(value, field);
+  requireOnlyKeys(
+    r,
+    ["version", "snapshot", "shift", "control", "alt", "kitty_flags"],
+    field,
+  );
+  requireSnapshotTag(r, "modifiers", field);
+  return {
+    snapshot: "modifiers",
+    shift: requireBoolean(r, "shift", field),
+    control: requireBoolean(r, "control", field),
+    alt: requireBoolean(r, "alt", field),
+    // Wire key is snake_case; surfaced as camelCase per client convention.
+    kittyFlags: requireUnsignedInt(r, "kitty_flags", field),
+  };
+}
+
+function focusSnapshotFrom(
+  value: unknown,
+  field = "getFocus result",
+): FocusSnapshot {
+  const r = requireRecord(value, field);
+  requireOnlyKeys(
+    r,
+    [
+      "version",
+      "snapshot",
+      "focused",
+      "focused_view",
+      "mouse_capture",
+      "alt_screen",
+      "bracketed_paste",
+      "focus_events",
+    ],
+    field,
+  );
+  requireSnapshotTag(r, "focus", field);
+  return {
+    snapshot: "focus",
+    focused: requireBoolean(r, "focused", field),
+    // Wire keys are snake_case; surfaced as camelCase per client convention.
+    focusedView: requireNullableUnsignedInt(r, "focused_view", field),
+    mouseCapture: requireBoolean(r, "mouse_capture", field),
+    altScreen: requireBoolean(r, "alt_screen", field),
+    bracketedPaste: requireBoolean(r, "bracketed_paste", field),
+    focusEvents: requireBoolean(r, "focus_events", field),
+  };
 }
 
 function pluginSummaryFrom(value: unknown, field = "plugin"): PluginSummary {
@@ -632,6 +938,72 @@ export class InspectionClient {
     ];
     assertBounded("MAX_HANDLES", handles.length, MAX_HANDLES);
     return handles;
+  }
+
+  /**
+   * `bitty.debug/getGridText` (CTX-0159): bounded grid text plus cursor.
+   *
+   * `rows`/`cols` are optional and validated client-side to the server bounds
+   * (1..=64 / 1..=256) before any bytes are sent; the server applies the same
+   * cap and truncates on char boundaries. Read-only; no transport means a
+   * typed `NoTransport` error rather than fabricated grid data.
+   */
+  getGridText(
+    scope: string,
+    options: { rows?: number; cols?: number } = {},
+  ): GridTextSnapshot {
+    this.requireInspect(scope);
+    const params: Record<string, number> = {};
+    const rows = this.rangeParam("rows", options.rows, 1, MAX_GRID_ROWS);
+    if (rows !== undefined) params["rows"] = rows;
+    const cols = this.rangeParam("cols", options.cols, 1, MAX_GRID_COLS);
+    if (cols !== undefined) params["cols"] = cols;
+    return gridTextSnapshotFrom(this.rpc("bitty.debug/getGridText", params));
+  }
+
+  /**
+   * `bitty.debug/getInputRing` (CTX-0159): bounded last-input events.
+   *
+   * `limit` is optional and validated client-side to 1..=64. The server returns
+   * the most recent events oldest-first; an empty ring is `events: []`.
+   */
+  getInputRing(
+    scope: string,
+    options: { limit?: number } = {},
+  ): InputRingSnapshot {
+    this.requireInspect(scope);
+    const params: Record<string, number> = {};
+    const limit = this.rangeParam("limit", options.limit, 1, MAX_INPUT_EVENTS);
+    if (limit !== undefined) params["limit"] = limit;
+    return inputRingSnapshotFrom(this.rpc("bitty.debug/getInputRing", params));
+  }
+
+  /** `bitty.debug/getModifiers` (CTX-0159): modifier/latch state, no params. */
+  getModifiers(scope: string): ModifiersSnapshot {
+    this.requireInspect(scope);
+    return modifiersSnapshotFrom(this.rpc("bitty.debug/getModifiers"));
+  }
+
+  /** `bitty.debug/getFocus` (CTX-0159): focus/window state, no params. */
+  getFocus(scope: string): FocusSnapshot {
+    this.requireInspect(scope);
+    return focusSnapshotFrom(this.rpc("bitty.debug/getFocus"));
+  }
+
+  private rangeParam(
+    name: string,
+    value: number | undefined,
+    min: number,
+    max: number,
+  ): number | undefined {
+    if (value === undefined) return undefined;
+    if (!Number.isInteger(value) || value < min || value > max) {
+      throw new InspectionError(
+        "InvalidParams",
+        `${name} must be an integer in ${min}..${max}`,
+      );
+    }
+    return value;
   }
 
   /** Inspection view over PanelRuntime snapshot (human-facing, bounded). */

@@ -26,6 +26,18 @@ and this project adheres to no released version yet.
   `crates/bitty-ipc/src/devtools.rs` (CTX-0188/CTX-0244); the accepted
   `devtools-rfc` does not yet name these methods (naming gap reported).
 
+- **Live introspection bindings (CTX-0023 / #41)**: typed devtools client
+  bindings for the CTX-0159 read-only RPCs `bitty.debug/getGridText`,
+  `bitty.debug/getInputRing`, `bitty.debug/getModifiers`, and
+  `bitty.debug/getFocus`. `DevtoolsClient.getGridText({ rows?, cols? })`,
+  `getInputRing({ limit? })`, `getModifiers()`, and `getFocus()` dispatch over
+  the connected `IpcTransport`, validate optional filters client-side to the
+  server bounds (rows/cols `64`/`256`, limit `64`), and parse strictly against
+  the live server envelope (fail-closed on missing, mistyped, unknown, or
+  extra fields; bounded `lines`/`events`). Read-only `debug.inspect`; the four
+  methods are added to the inspect scope allowlist. "Unknown field" rejection
+  is enforced per the issue's strict-envelope requirement.
+
 - **Diagnostics client phase 2 (CTX-0012)**: advanced tracing, control
   surfaces, and real IPC socket/pipe peer-creds integration against the live
   Bitty runtime. Reuses Panel Runtime and 14×4 compat matrix and extends

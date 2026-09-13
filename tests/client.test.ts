@@ -147,4 +147,53 @@ describe("DevtoolsClient inspection live IPC wiring", () => {
     expect(c.isIpcConnected()).toBe(false);
     expect(() => c.listPlugins()).toThrow("not connected");
   });
+
+  test("getGridText dispatches CTX-0159 introspection over the real IpcTransport", () => {
+    const c = new DevtoolsClient();
+    const transport = new IpcTransport({
+      runtimeUid: 1000,
+      socketPath: "/run/user/1000/bitty/default.sock",
+      peer: peerCredentials(1000, 1000, 1),
+    });
+    c.connectWithTransport(transport);
+    c.grantScope("debug.inspect");
+    transport.injectResponsePayload(
+      new TextEncoder().encode(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          result: {
+            version: "1.0",
+            snapshot: "grid-text",
+            lines: ["hi"],
+            cursor: { row: 0, col: 2, visible: true },
+            cols: 80,
+            rows: 24,
+            generation: 1,
+          },
+          version: "1.0",
+        }),
+      ),
+    );
+    const snap = c.getGridText({ rows: 10 });
+    expect(snap.snapshot).toBe("grid-text");
+    expect(snap.lines).toEqual(["hi"]);
+    const sent = transport.getStub().drainOutgoing();
+    const request = JSON.parse(new TextDecoder().decode(sent[0]!.payload)) as {
+      method: string;
+      params: unknown;
+    };
+    expect(request.method).toBe("bitty.debug/getGridText");
+    expect(request.params).toEqual({ rows: 10 });
+  });
+
+  test("introspection requires a connection and a granted inspect scope", () => {
+    const c = new DevtoolsClient();
+    expect(() => c.getGridText()).toThrow("not connected");
+    c.connect();
+    expect(() => c.getFocus()).toThrow("scope required");
+    c.grantScope("debug.inspect");
+    // With a scope but no transport the live path fails closed, never mocks.
+    expect(() => c.getModifiers()).toThrow("no connected inspection transport");
+  });
 });
