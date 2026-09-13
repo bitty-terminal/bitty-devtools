@@ -332,6 +332,36 @@ export class DevtoolsClient {
     return this.inspection.listHandles(this.activeScope(), pluginId);
   }
 
+  /**
+   * Live read-only introspection (CTX-0159) over the connected transport.
+   * `getGridText`/`getInputRing` accept bounded optional filters; all four
+   * methods are `debug.inspect` and never grant control authority.
+   */
+  getGridText(options?: {
+    rows?: number;
+    cols?: number;
+  }): ReturnType<InspectionClient["getGridText"]> {
+    this.requireConnected();
+    return this.inspection.getGridText(this.activeScope(), options);
+  }
+
+  getInputRing(options?: {
+    limit?: number;
+  }): ReturnType<InspectionClient["getInputRing"]> {
+    this.requireConnected();
+    return this.inspection.getInputRing(this.activeScope(), options);
+  }
+
+  getModifiers(): ReturnType<InspectionClient["getModifiers"]> {
+    this.requireConnected();
+    return this.inspection.getModifiers(this.activeScope());
+  }
+
+  getFocus(): ReturnType<InspectionClient["getFocus"]> {
+    this.requireConnected();
+    return this.inspection.getFocus(this.activeScope());
+  }
+
   panelSummary(): ReturnType<InspectionClient["panelSummary"]> {
     this.requireConnected();
     return this.inspection.panelSummary(this.activeScope());

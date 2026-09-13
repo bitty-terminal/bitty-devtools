@@ -192,6 +192,11 @@ export function isValidMethodForScope(
     "bitty.debug/getQueueSnapshot",
     "bitty.debug/getSnapshot",
     "bitty.debug/listHandles",
+    // CTX-0159 live read-only introspection (server-registered, inspect scope).
+    "bitty.debug/getGridText",
+    "bitty.debug/getInputRing",
+    "bitty.debug/getModifiers",
+    "bitty.debug/getFocus",
   ]);
   const traceMethods = new Set([
     "bitty.debug/streamEvents",
