@@ -87,16 +87,18 @@ describe("DevtoolsClient inspection live IPC wiring", () => {
         JSON.stringify({
           jsonrpc: "2.0",
           id: 1,
-          result: [
-            {
-              id: "panel-1",
-              version: "1.0.0",
-              generation: 1,
-              state: "Activated",
-              manifestHash: "sha256:x",
-              capabilities: ["panel.provider"],
-            },
-          ],
+          result: {
+            plugins: [
+              {
+                id: "panel-1",
+                version: "1.0.0",
+                generation: 1,
+                state: "Activated",
+                manifestHash: "sha256:x",
+                capabilities: ["panel.provider"],
+              },
+            ],
+          },
           version: "1.0",
         }),
       ),
@@ -133,5 +135,16 @@ describe("DevtoolsClient inspection live IPC wiring", () => {
       },
     });
     expect(c.listPlugins()).toEqual([]);
+  });
+
+  test("failed live connect fails closed and never falls back to mock", () => {
+    const c = new DevtoolsClient({
+      socketPath: "/run/user/1000/bitty/default.sock",
+      runtimeUid: 1000,
+      peer: peerCredentials(1001, 1000, 1),
+    });
+    expect(() => c.connect()).toThrow("peer uid");
+    expect(c.isIpcConnected()).toBe(false);
+    expect(() => c.listPlugins()).toThrow("not connected");
   });
 });

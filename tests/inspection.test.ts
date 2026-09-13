@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { DevtoolsClient } from "../src/client.js";
-import { InspectionClient } from "../src/inspection.js";
+import { InspectionClient, InspectionError } from "../src/inspection.js";
 import type { InspectionTransport } from "../src/inspection.js";
 import { generation } from "../src/panel-runtime.js";
 import type { PanelRuntimeSnapshot } from "../src/panel-runtime.js";
@@ -25,6 +25,127 @@ class RecordingTransport implements InspectionTransport {
       version: "1.0",
     };
   }
+}
+
+/** Fake transport that returns a distinct result per JSON-RPC method. */
+class MethodTransport implements InspectionTransport {
+  readonly calls: IpcRequest[] = [];
+  constructor(private readonly results: Record<string, unknown>) {}
+  isConnected(): boolean {
+    return true;
+  }
+  request(request: IpcRequest, _nowMs: number): IpcResponse {
+    this.calls.push(request);
+    if (!(request.method in this.results)) {
+      throw new Error(`no fake result for ${request.method}`);
+    }
+    return {
+      jsonrpc: "2.0",
+      id: request.id,
+      result: this.results[request.method],
+      version: "1.0",
+    };
+  }
+}
+
+function expectInspectionError(fn: () => unknown, code: string): void {
+  let caught: unknown;
+  try {
+    fn();
+  } catch (error) {
+    caught = error;
+  }
+  expect(caught).toBeInstanceOf(InspectionError);
+  expect((caught as InspectionError).code).toBe(code);
+}
+
+function pluginPayload(
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    id: "plugin-a",
+    version: "1.2.3",
+    generation: 4,
+    state: "Activated",
+    manifestHash: "sha256:abc",
+    capabilities: ["panel.provider"],
+    ...overrides,
+  };
+}
+
+function subscriptionPayload(
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    eventType: "bitty.panel:mounted",
+    queueDepth: 0,
+    queuedBytes: 0,
+    dropCount: 0,
+    policy: "DropOldest",
+    ...overrides,
+  };
+}
+
+function budgetPayload(
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    generation: 7,
+    rc1Instructions: 10,
+    rc1WallMs: 1,
+    rc2MemoryBytes: 2,
+    rc4Tasks: 3,
+    rc4Timers: 4,
+    rc5QueueDepth: 5,
+    would_exceed_lua_limits: false,
+    ...overrides,
+  };
+}
+
+function queuePayload(
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    perSubscription: { limit: 64, current: 2 },
+    perPlugin: {
+      events: 12,
+      bytes: 4096,
+      limitEvents: 1024,
+      limitBytes: 262144,
+    },
+    global: {
+      events: 120,
+      bytes: 65536,
+      limitEvents: 8192,
+      limitBytes: 2097152,
+    },
+    invariant_queue_bounds: true,
+    invariant_global_bounds: true,
+    ...overrides,
+  };
+}
+
+function handlePayload(
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    handle: "handle-1",
+    capability: "panel.create",
+    refCount: 1,
+    ...overrides,
+  };
+}
+
+function semanticSnapshotPayload(
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    cursor: { row: 2, col: 5 },
+    modeFlags: ["wrap"],
+    semanticZoneCount: 1,
+    preview: "hello password=hunter2",
+    ...overrides,
+  };
 }
 
 function makeSnapshot(): PanelRuntimeSnapshot {
@@ -115,16 +236,9 @@ describe("inspection (debug.inspect default, read-only)", () => {
 
 describe("inspection over real IPC (connected path)", () => {
   test("listPlugins dispatches bitty.debug/listPlugins with generation param", () => {
-    const transport = new RecordingTransport([
-      {
-        id: "plugin-a",
-        version: "1.2.3",
-        generation: 4,
-        state: "Activated",
-        manifestHash: "sha256:abc",
-        capabilities: ["panel.provider"],
-      },
-    ]);
+    const transport = new RecordingTransport({
+      plugins: [pluginPayload()],
+    });
     const client = new InspectionClient(transport);
     const plugins = client.listPlugins("debug.inspect", generation(2));
     expect(transport.calls.length).toBe(1);
@@ -136,20 +250,37 @@ describe("inspection over real IPC (connected path)", () => {
     expect(Number(plugins[0]!.generation)).toBe(4);
   });
 
-  test("listPlugins without a generation filter sends empty params", () => {
-    const transport = new RecordingTransport([]);
+  test("listPlugins without a filter sends the RFC generation:null param", () => {
+    const transport = new RecordingTransport({ plugins: [] });
     const client = new InspectionClient(transport);
     expect(client.listPlugins("debug.inspect")).toEqual([]);
     expect(transport.calls[0]!.method).toBe("bitty.debug/listPlugins");
-    expect(transport.calls[0]!.params).toEqual({});
+    expect(transport.calls[0]!.params).toEqual({ generation: null });
   });
 
-  test("getPlugin / listSubscriptions / getBudgets use exact methods and params", () => {
-    const transport = new RecordingTransport({});
+  test("listPlugins fails closed on a non-envelope (bare array) result", () => {
+    const transport = new RecordingTransport([pluginPayload()]);
     const client = new InspectionClient(transport);
-    client.getPlugin("debug.inspect", "plugin-a");
-    client.listSubscriptions("debug.inspect", "plugin-a");
-    client.getBudgets("debug.inspect", "plugin-a", generation(7));
+    expectInspectionError(
+      () => client.listPlugins("debug.inspect"),
+      "InvalidResult",
+    );
+  });
+
+  test("getPlugin / listSubscriptions / getBudgets use RFC methods and params", () => {
+    const transport = new MethodTransport({
+      "bitty.debug/getPlugin": pluginPayload(),
+      "bitty.debug/listSubscriptions": [subscriptionPayload()],
+      "bitty.debug/getBudgets": budgetPayload(),
+    });
+    const client = new InspectionClient(transport);
+    const plugin = client.getPlugin("debug.inspect", "plugin-a");
+    const subs = client.listSubscriptions("debug.inspect", "plugin-a");
+    const budget = client.getBudgets(
+      "debug.inspect",
+      "plugin-a",
+      generation(7),
+    );
     expect(transport.calls.map((c) => c.method)).toEqual([
       "bitty.debug/getPlugin",
       "bitty.debug/listSubscriptions",
@@ -161,28 +292,77 @@ describe("inspection over real IPC (connected path)", () => {
       pluginId: "plugin-a",
       generation: generation(7),
     });
+    expect(plugin?.id).toBe("plugin-a");
+    expect(subs[0]!.eventType).toBe("bitty.panel:mounted");
+    // RFC verdict key is snake_case and is surfaced as camelCase.
+    expect(budget.wouldExceedLuaLimits).toBe(false);
   });
 
-  test("getQueueSnapshot / listHandles use exact methods and params", () => {
-    const transport = new RecordingTransport({});
+  test("getBudgets fails closed on camelCase verdict key", () => {
+    const transport = new MethodTransport({
+      "bitty.debug/getBudgets": budgetPayload({
+        would_exceed_lua_limits: undefined,
+        wouldExceedLuaLimits: false,
+      }),
+    });
     const client = new InspectionClient(transport);
-    client.getQueueSnapshot("debug.inspect", "plugin-a");
-    client.listHandles("debug.inspect", "plugin-a");
+    expect(() =>
+      client.getBudgets("debug.inspect", "plugin-a", generation(7)),
+    ).toThrow("would_exceed_lua_limits");
+  });
+
+  test("getQueueSnapshot / listHandles use RFC methods and params", () => {
+    const transport = new MethodTransport({
+      "bitty.debug/getQueueSnapshot": queuePayload(),
+      "bitty.debug/listHandles": [handlePayload()],
+    });
+    const client = new InspectionClient(transport);
+    const queue = client.getQueueSnapshot("debug.inspect", "plugin-a");
+    const handles = client.listHandles("debug.inspect", "plugin-a");
     expect(transport.calls.map((c) => c.method)).toEqual([
       "bitty.debug/getQueueSnapshot",
       "bitty.debug/listHandles",
     ]);
     expect(transport.calls[0]!.params).toEqual({ pluginId: "plugin-a" });
     expect(transport.calls[1]!.params).toEqual({ pluginId: "plugin-a" });
+    expect(queue.invariantQueueBounds).toBe(true);
+    expect(queue.invariantGlobalBounds).toBe(true);
+    expect(handles[0]!.refCount).toBe(1);
+  });
+
+  test("getQueueSnapshot fails closed on camelCase verdict keys", () => {
+    const transport = new MethodTransport({
+      "bitty.debug/getQueueSnapshot": queuePayload({
+        invariant_queue_bounds: undefined,
+        invariantQueueBounds: true,
+      }),
+    });
+    const client = new InspectionClient(transport);
+    expect(() => client.getQueueSnapshot("debug.inspect", "plugin-a")).toThrow(
+      "invariant_queue_bounds",
+    );
+  });
+
+  test("listPlugins fails closed on malformed/missing plugin fields", () => {
+    for (const bad of [
+      pluginPayload({ id: "" }),
+      pluginPayload({ version: undefined }),
+      pluginPayload({ generation: "4" }),
+      pluginPayload({ state: "Unknown" }),
+      pluginPayload({ capabilities: [1] }),
+    ]) {
+      const client = new InspectionClient(
+        new RecordingTransport({ plugins: [bad] }),
+      );
+      expectInspectionError(
+        () => client.listPlugins("debug.inspect"),
+        "InvalidResult",
+      );
+    }
   });
 
   test("getSnapshotForTerminal dispatches semantic getSnapshot and redacts", () => {
-    const transport = new RecordingTransport({
-      cursor: { row: 2, col: 5 },
-      modeFlags: ["wrap"],
-      semanticZoneCount: 1,
-      preview: "hello password=hunter2",
-    });
+    const transport = new RecordingTransport(semanticSnapshotPayload());
     const client = new InspectionClient(transport);
     const snap = client.getSnapshotForTerminal("debug.inspect", "term-1", "");
     expect(transport.calls[0]!.method).toBe("bitty.debug/getSnapshot");
@@ -193,6 +373,30 @@ describe("inspection over real IPC (connected path)", () => {
     expect(snap.cursor).toEqual({ row: 2, col: 5 });
     expect(snap.preview).toBe("hello password=hunter2");
     expect(snap.truncated).toBe(false);
+  });
+
+  test("getSnapshotForTerminal fails closed on the runtime-stats snapshot", () => {
+    const transport = new RecordingTransport({
+      snapshot: "runtime-stats",
+      instance: "default",
+      pid: 42,
+      cols: 80,
+      rows: 24,
+    });
+    const client = new InspectionClient(transport);
+    expectInspectionError(
+      () => client.getSnapshotForTerminal("debug.inspect", "term-1", ""),
+      "SemanticSnapshotUnavailable",
+    );
+  });
+
+  test("getSnapshotForTerminal fails closed on a missing semantic shape", () => {
+    const client = new InspectionClient(
+      new RecordingTransport({ preview: "hi" }),
+    );
+    expect(() =>
+      client.getSnapshotForTerminal("debug.inspect", "term-1", ""),
+    ).toThrow("getSnapshot result");
   });
 
   test("typed server error is surfaced as InspectionError", () => {

@@ -140,49 +140,128 @@ const PLUGIN_STATES: readonly PluginState[] = [
   "Disposed",
 ];
 
-function asRecord(value: unknown): Record<string, unknown> {
-  return value !== null && typeof value === "object"
-    ? (value as Record<string, unknown>)
-    : {};
+// ---------------------------------------------------------------------------
+// Fail-closed result parsing (H3): the RFC lists the required fields, so a
+// missing or mistyped field is a protocol error, never a defaulted value.
+// ---------------------------------------------------------------------------
+
+function parseError(field: string, message: string): InspectionError {
+  return new InspectionError("InvalidResult", `${field}: ${message}`);
 }
 
-function asArray(value: unknown): unknown[] {
-  return Array.isArray(value) ? value : [];
-}
-
-function asString(value: unknown, fallback = ""): string {
-  return typeof value === "string" ? value : fallback;
-}
-
-function asNumber(value: unknown, fallback: number): number {
-  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
-}
-
-function asGeneration(value: unknown, fallback: Generation): Generation {
-  if (typeof value === "number" && Number.isInteger(value) && value >= 1) {
-    return generation(value);
+function requireRecord(value: unknown, field: string): Record<string, unknown> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw parseError(field, "expected an object");
   }
-  return fallback;
+  return value as Record<string, unknown>;
 }
 
-function asPluginState(value: unknown): PluginState {
-  return typeof value === "string" &&
-    (PLUGIN_STATES as readonly string[]).includes(value)
-    ? (value as PluginState)
-    : "Activated";
+function requireArray(value: unknown, field: string): unknown[] {
+  if (!Array.isArray(value)) {
+    throw parseError(field, "expected an array");
+  }
+  return value;
 }
 
-function pluginSummaryFrom(value: unknown): PluginSummary {
-  const r = asRecord(value);
+function requireString(
+  record: Record<string, unknown>,
+  key: string,
+  field: string,
+): string {
+  const value = record[key];
+  if (typeof value !== "string") {
+    throw parseError(`${field}.${key}`, "expected a string");
+  }
+  return value;
+}
+
+function requireNonEmptyString(
+  record: Record<string, unknown>,
+  key: string,
+  field: string,
+): string {
+  const value = requireString(record, key, field);
+  if (value.length === 0) {
+    throw parseError(`${field}.${key}`, "must not be empty");
+  }
+  return value;
+}
+
+function requireNumber(
+  record: Record<string, unknown>,
+  key: string,
+  field: string,
+): number {
+  const value = record[key];
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    throw parseError(`${field}.${key}`, "expected a finite number");
+  }
+  return value;
+}
+
+function requireBoolean(
+  record: Record<string, unknown>,
+  key: string,
+  field: string,
+): boolean {
+  const value = record[key];
+  if (typeof value !== "boolean") {
+    throw parseError(`${field}.${key}`, "expected a boolean");
+  }
+  return value;
+}
+
+function requireGeneration(
+  record: Record<string, unknown>,
+  key: string,
+  field: string,
+): Generation {
+  const value = record[key];
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 1) {
+    throw parseError(`${field}.${key}`, "expected a positive integer");
+  }
+  return generation(value);
+}
+
+function requirePluginState(
+  record: Record<string, unknown>,
+  key: string,
+  field: string,
+): PluginState {
+  const value = record[key];
+  if (
+    typeof value !== "string" ||
+    !(PLUGIN_STATES as readonly string[]).includes(value)
+  ) {
+    throw parseError(
+      `${field}.${key}`,
+      `unknown plugin state ${String(value)}`,
+    );
+  }
+  return value as PluginState;
+}
+
+function requireStringArray(
+  record: Record<string, unknown>,
+  key: string,
+  field: string,
+): string[] {
+  const value = record[key];
+  if (!Array.isArray(value) || !value.every((c) => typeof c === "string")) {
+    throw parseError(`${field}.${key}`, "expected an array of strings");
+  }
+  return value as string[];
+}
+
+function pluginSummaryFrom(value: unknown, field = "plugin"): PluginSummary {
+  const r = requireRecord(value, field);
   return {
-    id: asString(r["id"]),
-    version: asString(r["version"], "0.0.0"),
-    generation: asGeneration(r["generation"], 1 as Generation),
-    state: asPluginState(r["state"]),
-    manifestHash: asString(r["manifestHash"]),
-    capabilities: asArray(r["capabilities"]).filter(
-      (c): c is string => typeof c === "string",
-    ),
+    id: requireNonEmptyString(r, "id", field),
+    version: requireNonEmptyString(r, "version", field),
+    generation: requireGeneration(r, "generation", field),
+    state: requirePluginState(r, "state", field),
+    manifestHash: requireNonEmptyString(r, "manifestHash", field),
+    capabilities: requireStringArray(r, "capabilities", field),
   };
 }
 
@@ -238,15 +317,22 @@ export class InspectionClient {
   listPlugins(scope: string, generationFilter?: Generation): PluginSummary[] {
     this.requireInspect(scope);
     if (this.isLive()) {
-      const result = this.rpc(
-        "bitty.debug/listPlugins",
-        generationFilter === undefined ? {} : { generation: generationFilter },
+      // RFC request example: `params: { "generation": null }`; the accepted
+      // result envelope is `{ "plugins": [...] }` (devtools-rfc v1).
+      const result = this.rpc("bitty.debug/listPlugins", {
+        generation: generationFilter ?? null,
+      });
+      const envelope = requireRecord(result, "listPlugins result");
+      const list = requireArray(
+        envelope["plugins"],
+        "listPlugins result.plugins",
       );
-      const list = asArray(result);
       assertBounded("MAX_PLUGINS", list.length, MAX_PLUGINS);
       return list
         .slice(0, MAX_PLUGINS)
-        .map((entry) => pluginSummaryFrom(entry));
+        .map((entry, i) =>
+          pluginSummaryFrom(entry, `listPlugins result.plugins[${i}]`),
+        );
     }
     // Headless/unit-test fallback: synthesize bounded observation data from
     // the locally injected PanelRuntime snapshot. Never used when connected.
@@ -271,7 +357,7 @@ export class InspectionClient {
     if (this.isLive()) {
       const result = this.rpc("bitty.debug/getPlugin", { pluginId });
       if (result === null || result === undefined) return null;
-      return pluginSummaryFrom(result);
+      return pluginSummaryFrom(result, "getPlugin result");
     }
     const snap = this.snapshot();
     if (!snap) return null;
@@ -293,16 +379,21 @@ export class InspectionClient {
       throw new InspectionError("InvalidPluginId", "pluginId too long");
     if (this.isLive()) {
       const result = this.rpc("bitty.debug/listSubscriptions", { pluginId });
-      const list = asArray(result);
+      const list = requireArray(result, "listSubscriptions result");
       assertBounded("MAX_SUBSCRIPTIONS", list.length, MAX_SUBSCRIPTIONS);
-      return list.slice(0, MAX_SUBSCRIPTIONS).map((entry) => {
-        const r = asRecord(entry);
+      return list.slice(0, MAX_SUBSCRIPTIONS).map((entry, i) => {
+        const field = `listSubscriptions result[${i}]`;
+        const r = requireRecord(entry, field);
+        const policy = requireNonEmptyString(r, "policy", field);
+        if (policy !== "DropOldest" && policy !== "DropNewest") {
+          throw parseError(`${field}.policy`, `unknown policy ${policy}`);
+        }
         return {
-          eventType: asString(r["eventType"]),
-          queueDepth: asNumber(r["queueDepth"], 0),
-          queuedBytes: asNumber(r["queuedBytes"], 0),
-          dropCount: asNumber(r["dropCount"], 0),
-          policy: r["policy"] === "DropNewest" ? "DropNewest" : "DropOldest",
+          eventType: requireNonEmptyString(r, "eventType", field),
+          queueDepth: requireNumber(r, "queueDepth", field),
+          queuedBytes: requireNumber(r, "queuedBytes", field),
+          dropCount: requireNumber(r, "dropCount", field),
+          policy,
         };
       });
     }
@@ -336,17 +427,23 @@ export class InspectionClient {
         pluginId,
         generation: gen,
       });
-      const r = asRecord(result);
+      const field = "getBudgets result";
+      const r = requireRecord(result, field);
       return {
         pluginId,
-        generation: asGeneration(r["generation"], gen),
-        rc1Instructions: asNumber(r["rc1Instructions"], 0),
-        rc1WallMs: asNumber(r["rc1WallMs"], 0),
-        rc2MemoryBytes: asNumber(r["rc2MemoryBytes"], 0),
-        rc4Tasks: asNumber(r["rc4Tasks"], 0),
-        rc4Timers: asNumber(r["rc4Timers"], 0),
-        rc5QueueDepth: asNumber(r["rc5QueueDepth"], 0),
-        wouldExceedLuaLimits: r["wouldExceedLuaLimits"] === true,
+        generation: requireGeneration(r, "generation", field),
+        rc1Instructions: requireNumber(r, "rc1Instructions", field),
+        rc1WallMs: requireNumber(r, "rc1WallMs", field),
+        rc2MemoryBytes: requireNumber(r, "rc2MemoryBytes", field),
+        rc4Tasks: requireNumber(r, "rc4Tasks", field),
+        rc4Timers: requireNumber(r, "rc4Timers", field),
+        rc5QueueDepth: requireNumber(r, "rc5QueueDepth", field),
+        // RFC v1 verdict spelling is snake_case (devtools-rfc:341).
+        wouldExceedLuaLimits: requireBoolean(
+          r,
+          "would_exceed_lua_limits",
+          field,
+        ),
       };
     }
     return {
@@ -368,41 +465,58 @@ export class InspectionClient {
       throw new InspectionError("InvalidPluginId", "pluginId too long");
     if (this.isLive()) {
       const result = this.rpc("bitty.debug/getQueueSnapshot", { pluginId });
-      const r = asRecord(result);
-      const perSubscription = asRecord(r["perSubscription"]);
-      const perPlugin = asRecord(r["perPlugin"]);
-      const global = asRecord(r["global"]);
+      const field = "getQueueSnapshot result";
+      const r = requireRecord(result, field);
+      const perSubscription = requireRecord(
+        r["perSubscription"],
+        `${field}.perSubscription`,
+      );
+      const perPlugin = requireRecord(r["perPlugin"], `${field}.perPlugin`);
+      const global = requireRecord(r["global"], `${field}.global`);
       return {
         perSubscription: {
-          limit: asNumber(
-            perSubscription["limit"],
-            BOUNDS.BUS_PER_SUBSCRIPTION,
+          limit: requireNumber(
+            perSubscription,
+            "limit",
+            `${field}.perSubscription`,
           ),
-          current: asNumber(perSubscription["current"], 0),
+          current: requireNumber(
+            perSubscription,
+            "current",
+            `${field}.perSubscription`,
+          ),
         },
         perPlugin: {
-          events: asNumber(perPlugin["events"], 0),
-          bytes: asNumber(perPlugin["bytes"], 0),
-          limitEvents: asNumber(
-            perPlugin["limitEvents"],
-            BOUNDS.BUS_PER_PANEL_EVENTS,
+          events: requireNumber(perPlugin, "events", `${field}.perPlugin`),
+          bytes: requireNumber(perPlugin, "bytes", `${field}.perPlugin`),
+          limitEvents: requireNumber(
+            perPlugin,
+            "limitEvents",
+            `${field}.perPlugin`,
           ),
-          limitBytes: asNumber(
-            perPlugin["limitBytes"],
-            BOUNDS.BUS_PER_PANEL_BYTES,
+          limitBytes: requireNumber(
+            perPlugin,
+            "limitBytes",
+            `${field}.perPlugin`,
           ),
         },
         global: {
-          events: asNumber(global["events"], 0),
-          bytes: asNumber(global["bytes"], 0),
-          limitEvents: asNumber(
-            global["limitEvents"],
-            BOUNDS.BUS_GLOBAL_EVENTS,
-          ),
-          limitBytes: asNumber(global["limitBytes"], BOUNDS.BUS_GLOBAL_BYTES),
+          events: requireNumber(global, "events", `${field}.global`),
+          bytes: requireNumber(global, "bytes", `${field}.global`),
+          limitEvents: requireNumber(global, "limitEvents", `${field}.global`),
+          limitBytes: requireNumber(global, "limitBytes", `${field}.global`),
         },
-        invariantQueueBounds: r["invariantQueueBounds"] === true,
-        invariantGlobalBounds: r["invariantGlobalBounds"] === true,
+        // RFC v1 verdict spelling is snake_case (devtools-rfc:340).
+        invariantQueueBounds: requireBoolean(
+          r,
+          "invariant_queue_bounds",
+          field,
+        ),
+        invariantGlobalBounds: requireBoolean(
+          r,
+          "invariant_global_bounds",
+          field,
+        ),
       };
     }
     return {
@@ -441,22 +555,34 @@ export class InspectionClient {
         terminalId,
         scope: "semantic",
       });
-      const r = asRecord(result);
-      const serverPreview = asString(r["preview"]);
+      const field = "getSnapshot result";
+      const r = requireRecord(result, field);
+      // H1: the bitty server's registered `bitty.debug/getSnapshot` handler is
+      // the runtime-stats snapshot (emits `{"snapshot":"runtime-stats",...}`
+      // and ignores these params), not the RFC semantic snapshot. Never coerce
+      // it into a plausible empty preview: fail closed and surface the gap.
+      // Cross-repo question: bitty must implement a semantic `getSnapshot`
+      // (devtools-rfc:341) or expose a distinct semantic method.
+      if (r["snapshot"] === "runtime-stats") {
+        throw new InspectionError(
+          "SemanticSnapshotUnavailable",
+          "bitty.debug/getSnapshot returned the runtime-stats snapshot, not the RFC semantic snapshot; bitty must implement a semantic getSnapshot or expose a distinct method",
+        );
+      }
+      const serverPreview = requireString(r, "preview", field);
+      const cursor = requireRecord(r["cursor"], `${field}.cursor`);
+      const modeFlags = requireStringArray(r, "modeFlags", field);
       const bounded = serverPreview.slice(0, MAX_PREVIEW_CHARS);
       const { text, marker } = redactPreview(bounded, "terminal.preview");
-      const cursor = asRecord(r["cursor"]);
       return {
         terminalId,
         scope: "semantic",
         cursor: {
-          row: asNumber(cursor["row"], 0),
-          col: asNumber(cursor["col"], 0),
+          row: requireNumber(cursor, "row", `${field}.cursor`),
+          col: requireNumber(cursor, "col", `${field}.cursor`),
         },
-        modeFlags: asArray(r["modeFlags"]).filter(
-          (m): m is string => typeof m === "string",
-        ),
-        semanticZoneCount: asNumber(r["semanticZoneCount"], 0),
+        modeFlags,
+        semanticZoneCount: requireNumber(r, "semanticZoneCount", field),
         preview: text,
         redactionMarker: {
           redacted: marker.redacted,
@@ -488,14 +614,15 @@ export class InspectionClient {
       throw new InspectionError("InvalidPluginId", "pluginId too long");
     if (this.isLive()) {
       const result = this.rpc("bitty.debug/listHandles", { pluginId });
-      const list = asArray(result);
+      const list = requireArray(result, "listHandles result");
       assertBounded("MAX_HANDLES", list.length, MAX_HANDLES);
-      return list.slice(0, MAX_HANDLES).map((entry) => {
-        const r = asRecord(entry);
+      return list.slice(0, MAX_HANDLES).map((entry, i) => {
+        const field = `listHandles result[${i}]`;
+        const r = requireRecord(entry, field);
         return {
-          handle: asString(r["handle"]),
-          capability: asString(r["capability"]),
-          refCount: asNumber(r["refCount"], 0),
+          handle: requireNonEmptyString(r, "handle", field),
+          capability: requireNonEmptyString(r, "capability", field),
+          refCount: requireNumber(r, "refCount", field),
         };
       });
     }

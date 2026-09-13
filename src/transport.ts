@@ -563,6 +563,11 @@ export class IpcTransport {
    * that frame via `injectResponsePayload`; a live socket reader would supply
    * it asynchronously. Response ids must match the request id, and the
    * envelope is validated by `decodeResponse` before it is returned.
+   *
+   * L2 (recorded, not fixed here): this reads exactly one inbound frame and
+   * does not reassemble RC-10 256 KiB continuation frames, and the transport
+   * is still the in-memory `StdioTransportStub` rather than a live socket
+   * reader. Those remain tracked follow-ups outside PR #45's scope.
    */
   request(req: IpcRequest, nowMs: number): IpcResponse {
     this.sendRequest(req, nowMs);

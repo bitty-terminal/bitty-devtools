@@ -134,12 +134,16 @@ export class DevtoolsClient {
         this.transport.connect();
         this.session.transport = this.transport;
         this.session.socketPath = socketPath;
-      } catch {
-        // Headless fallback: keep connected without transport if peer check fails in test harness
-        // In live runtime this would fail-closed; tests may inject peer later via connectWithTransport
+      } catch (error) {
+        // H4: a live connection was explicitly requested. Fail closed instead
+        // of staying "connected" with no transport (which would let inspection
+        // silently serve the headless mock). Only calls with no live config may
+        // use the mock fallback.
         this.transport = null;
         this.session.transport = null;
         this.session.socketPath = socketPath;
+        this.session.connected = false;
+        throw error;
       }
     }
     return { ...this.session, scopes: new Set(this.session.scopes) };
