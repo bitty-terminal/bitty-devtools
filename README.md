@@ -384,7 +384,7 @@ just cargo-check    # cargo check + clippy -D warnings + cargo test
 just commit-check <file>  # validate commit message against commitlint
 ```
 
-Rust toolchain is `1.97.1` minimal (`rustfmt`, `clippy`) per
+Rust toolchain is `1.98.1` minimal (`rustfmt`, `clippy`) per
 `rust-toolchain.toml`; MSRV `1.85`. The crate is `publish = false`.
 
 Git hooks are wired by `lefthook.yml`; run `bunx --bun lefthook@2.1.10 install`
