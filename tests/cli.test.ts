@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  CliConfigError,
   CliUsageError,
   DEFAULT_GENERATION,
   MAX_CELL_CHARS,
@@ -12,6 +13,7 @@ import { peerCredentials } from "../src/auth.js";
 import { IpcTransport } from "../src/transport.js";
 import type { IpcRequest } from "../src/transport.js";
 import {
+  EXIT_CONFIG,
   EXIT_GENERIC,
   EXIT_OK,
   EXIT_PERM,
@@ -194,6 +196,10 @@ describe("parseCliArgs", () => {
     );
     expect(() => parseCliArgs(["bogus"])).toThrow(CliUsageError);
     expect(() => parseCliArgs(["inspect", "--plugin"])).toThrow(CliUsageError);
+    // N4: a following flag is rejected, not consumed as the value.
+    expect(() =>
+      parseCliArgs(["inspect", "--subscriptions", "--plugin", "--json"]),
+    ).toThrow(CliUsageError);
   });
 });
 
@@ -280,6 +286,22 @@ describe("runCli dispatch over an injected transport", () => {
     expect(output).not.toContain(huge);
   });
 
+  test("--json bounds oversized string fields like the table path", () => {
+    const transport = makeTransport();
+    const huge = "y".repeat(MAX_CELL_CHARS + 40);
+    transport.injectResponsePayload(
+      responsePayload(1, { plugins: [pluginPayload({ id: huge })] }),
+    );
+    const harness = makeHarness(transport);
+    expect(runCli(["inspect", "--plugins", "--json"], harness.deps)).toBe(
+      EXIT_OK,
+    );
+    const parsed = JSON.parse(harness.out.join("")) as Array<{ id: string }>;
+    expect(parsed[0]!.id.endsWith("...")).toBe(true);
+    expect(parsed[0]!.id.length).toBe(MAX_CELL_CHARS + 3);
+    expect(harness.out.join("")).not.toContain(huge);
+  });
+
   test("surfaces a typed server scope error and maps it to exit 7", () => {
     const transport = makeTransport();
     transport.injectResponsePayload(
@@ -332,11 +354,64 @@ describe("runCli fail-closed connection handling", () => {
     expect(code).toBe(EXIT_RUNTIME);
     expect(harness.err.join("")).toContain("TransportClosed");
   });
+
+  test("invalid --instance fails closed with exit 2, never a stack trace", () => {
+    const harness = makeHarness();
+    let caught: unknown = null;
+    let code = -1;
+    try {
+      code = runCli(
+        ["inspect", "--plugins", "--instance", "bad id!"],
+        harness.deps,
+      );
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeNull();
+    expect(code).toBe(EXIT_USAGE);
+    expect(harness.out).toEqual([]);
+    expect(harness.err.join("")).toContain("instanceId");
+    expect(harness.err.join("")).not.toContain("\n    at ");
+  });
+
+  test("invalid BITTY_INSTANCE_ID fails closed with exit 3, never a stack trace", () => {
+    const harness = makeHarness();
+    harness.deps.runtime.env = {
+      XDG_RUNTIME_DIR: "/run/user/1000",
+      BITTY_INSTANCE_ID: "bad id!",
+    };
+    let caught: unknown = null;
+    let code = -1;
+    try {
+      code = runCli(["inspect", "--plugins"], harness.deps);
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeNull();
+    expect(code).toBe(EXIT_CONFIG);
+    expect(harness.out).toEqual([]);
+    expect(harness.err.join("")).toContain("instanceId");
+    expect(harness.err.join("")).not.toContain("\n    at ");
+  });
+
+  test("overlong BITTY_SOCKET fails closed with exit 3", () => {
+    const harness = makeHarness();
+    harness.deps.runtime.env = { BITTY_SOCKET: "s".repeat(600) };
+    const code = runCli(["inspect", "--plugins"], harness.deps);
+    expect(code).toBe(EXIT_CONFIG);
+    expect(harness.err.join("")).toContain("BITTY_SOCKET");
+  });
 });
 
 describe("exitCodeForError", () => {
-  test("maps usage to 2 and unknown errors to 1", () => {
+  test("maps usage to 2, config to its code, and unknown errors to 1", () => {
     expect(exitCodeForError(new CliUsageError("bad"))).toBe(EXIT_USAGE);
+    expect(exitCodeForError(new CliConfigError("bad", EXIT_CONFIG))).toBe(
+      EXIT_CONFIG,
+    );
+    expect(exitCodeForError(new CliConfigError("bad", EXIT_USAGE))).toBe(
+      EXIT_USAGE,
+    );
     expect(exitCodeForError(new Error("boom"))).toBe(EXIT_GENERIC);
   });
 });

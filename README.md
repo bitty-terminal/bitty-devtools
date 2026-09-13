@@ -258,7 +258,15 @@ rc1Instructions      10
 ...
 
 $ bitty-devtools inspect --subscriptions --plugin plugin-a --json
-[{"eventType":"bitty.panel:mounted","queueDepth":2,"queuedBytes":256,"dropCount":1,"policy":"DropOldest"}]
+[
+  {
+    "eventType": "bitty.panel:mounted",
+    "queueDepth": 2,
+    "queuedBytes": 256,
+    "dropCount": 1,
+    "policy": "DropOldest"
+  }
+]
 ```
 
 Connection is resolved, in order, from `--socket`, `BITTY_SOCKET`,
@@ -269,7 +277,11 @@ are embedded; everything comes from flags or the environment.
 Fail-closed behavior:
 
 - No selector, an unknown flag, or a missing `--plugin` is a usage error
-  (exit `2`) that prints the help text.
+  (exit `2`) that prints the help text. Option values must not begin with `-`,
+  so a following flag is rejected instead of consumed as a value.
+- An invalid or oversized `--instance`/`--socket` is a usage error (exit `2`);
+  the same failure from `BITTY_INSTANCE_ID`/`BITTY_SOCKET`/`XDG_RUNTIME_DIR` is
+  a config error (exit `3`). Both print a clean message, never a stack trace.
 - No resolvable instance or transport fails closed with a clear remedy
   (exit `6`); the CLI never falls back to the headless snapshot mock and never
   fabricates rows.
@@ -278,8 +290,10 @@ Fail-closed behavior:
   generic). Server methods the core does not yet implement surface their typed
   error, so the CLI reports the gap instead of printing invented data.
 
-Argument parsing and table/JSON formatting are unit-tested with an injected
-`IpcTransport` (`tests/cli.test.ts`); no live socket or GUI is required.
+Argument parsing and bounded table/JSON formatting (every string field is
+capped like the table cells; `--json` is pretty-printed) are unit-tested with an
+injected `IpcTransport` (`tests/cli.test.ts`); no live socket or GUI is
+required.
 
 ## Live campaign conformance harness (CTX-0325)
 
