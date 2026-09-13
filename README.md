@@ -226,6 +226,61 @@ console.log(client.listAuditLog());
 Rust equivalent lives at `crates/devtools-client` (`forbid(unsafe_code)`,
 `cargo check` / `cargo clippy -D warnings` clean, 37 tests).
 
+## CLI wrapper (experimental, CTX-0025)
+
+`bin/bitty-devtools.ts` is a lightweight executable over the typed inspection
+client (`src/client.ts`, `src/inspection.ts`, `src/transport.ts`). It prints
+bounded tabular live state (or `--json`) for the accepted devtools-rfc v1
+inspection methods; it does not re-implement protocol logic. It is experimental
+and `Bun`-based — run it with `bun`, never `npm`/`npx`.
+
+```text
+bitty-devtools inspect --plugins [--generation <n>] [options]
+bitty-devtools inspect --subscriptions --plugin <id> [options]
+bitty-devtools inspect --budgets --plugin <id> [--generation <n>] [options]
+bitty-devtools --help
+```
+
+Run from the repository with `bun run bin/bitty-devtools.ts ...` or, after a
+Bun-linked install, as `bitty-devtools ...` (the `bin` entry in `package.json`
+wires the command).
+
+```text
+$ bitty-devtools inspect --plugins
+ID        VERSION  GEN  STATE      CAPABILITIES
+plugin-a  1.2.3    4    Activated  panel.provider
+
+$ bitty-devtools inspect --budgets --plugin plugin-a --generation 7
+FIELD                VALUE
+pluginId             plugin-a
+generation           7
+rc1Instructions      10
+...
+
+$ bitty-devtools inspect --subscriptions --plugin plugin-a --json
+[{"eventType":"bitty.panel:mounted","queueDepth":2,"queuedBytes":256,"dropCount":1,"policy":"DropOldest"}]
+```
+
+Connection is resolved, in order, from `--socket`, `BITTY_SOCKET`,
+`--instance`/`BITTY_INSTANCE_ID` (with `XDG_RUNTIME_DIR`), and is read-only:
+the CLI grants only `debug.inspect`. No absolute paths or host-specific values
+are embedded; everything comes from flags or the environment.
+
+Fail-closed behavior:
+
+- No selector, an unknown flag, or a missing `--plugin` is a usage error
+  (exit `2`) that prints the help text.
+- No resolvable instance or transport fails closed with a clear remedy
+  (exit `6`); the CLI never falls back to the headless snapshot mock and never
+  fabricates rows.
+- Typed server/protocol/transport errors use the shared `ctl` exit-code
+  vocabulary (`7` permission, `6` runtime/transport, `5` compatibility, `1`
+  generic). Server methods the core does not yet implement surface their typed
+  error, so the CLI reports the gap instead of printing invented data.
+
+Argument parsing and table/JSON formatting are unit-tested with an injected
+`IpcTransport` (`tests/cli.test.ts`); no live socket or GUI is required.
+
 ## Live campaign conformance harness (CTX-0325)
 
 `src/campaign.ts` turns the CTX-0320 live client campaign into a repeatable
