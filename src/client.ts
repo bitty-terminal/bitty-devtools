@@ -22,6 +22,7 @@
 
 import { BOUNDS } from "./bounds.js";
 import { InspectionClient } from "./inspection.js";
+import type { InspectionTransport } from "./inspection.js";
 import { TracingClient } from "./tracing.js";
 import { ControlClient } from "./control.js";
 import type {
@@ -66,6 +67,24 @@ export class DevtoolsClient {
   private transport: IpcTransport | null = null;
   private readonly config: ClientConfig;
 
+  /**
+   * Live inspection seam. Dispatches over the connected `IpcTransport` and
+   * reports disconnected when there is none, so inspection uses real IPC
+   * whenever connected. The snapshot closure below is an explicit injected
+   * fallback for the headless/unit-test path only (`setPanelSnapshot`), never
+   * the production path.
+   */
+  private readonly inspectionTransport: InspectionTransport = {
+    isConnected: () => this.transport !== null && this.transport.isConnected(),
+    request: (request, nowMs) => {
+      const transport = this.transport;
+      if (transport === null) {
+        throw new Error("no connected inspection transport");
+      }
+      return transport.request(request, nowMs);
+    },
+  };
+
   constructor(config: ClientConfig = {}) {
     const version = config.version ?? PROTOCOL_VERSION;
     negotiateVersion(version);
@@ -78,7 +97,10 @@ export class DevtoolsClient {
       transport: null,
       socketPath: null,
     };
-    this.inspection = new InspectionClient(() => this.panelSnapshot);
+    this.inspection = new InspectionClient(
+      this.inspectionTransport,
+      () => this.panelSnapshot,
+    );
     this.tracing = new TracingClient();
     this.control = new ControlClient();
   }

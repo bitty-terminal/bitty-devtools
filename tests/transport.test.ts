@@ -144,4 +144,56 @@ describe("transport framing (phase 2, live runtime, bounded 256 KiB IPC / 1 MiB 
     expect(moved).toBe(1);
     expect(b.incomingLen()).toBe(1);
   });
+
+  test("request sends and decodes the injected response envelope", () => {
+    const peer = peerCredentials(1000, 1000, 1);
+    const t = new IpcTransport({
+      runtimeUid: 1000,
+      socketPath: "/run/user/1000/bitty/default.sock",
+      peer,
+    });
+    t.connect();
+    t.injectResponsePayload(
+      new TextEncoder().encode(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 9,
+          result: { ok: true },
+          version: "1.0",
+        }),
+      ),
+    );
+    const res = t.request(
+      { id: 9, method: "bitty.debug/listPlugins", version: "1.0" },
+      0,
+    );
+    expect(res.result).toEqual({ ok: true });
+    expect(t.outgoingLen()).toBe(1);
+  });
+
+  test("request fails closed when the response id does not match", () => {
+    const peer = peerCredentials(1000, 1000, 1);
+    const t = new IpcTransport({
+      runtimeUid: 1000,
+      socketPath: "/run/user/1000/bitty/default.sock",
+      peer,
+    });
+    t.connect();
+    t.injectResponsePayload(
+      new TextEncoder().encode(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 8,
+          result: {},
+          version: "1.0",
+        }),
+      ),
+    );
+    expect(() =>
+      t.request(
+        { id: 9, method: "bitty.debug/listPlugins", version: "1.0" },
+        0,
+      ),
+    ).toThrow("response id");
+  });
 });

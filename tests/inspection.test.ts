@@ -1,6 +1,31 @@
 import { describe, expect, test } from "bun:test";
 import { DevtoolsClient } from "../src/client.js";
+import { InspectionClient } from "../src/inspection.js";
+import type { InspectionTransport } from "../src/inspection.js";
+import { generation } from "../src/panel-runtime.js";
 import type { PanelRuntimeSnapshot } from "../src/panel-runtime.js";
+import type { IpcRequest, IpcResponse } from "../src/transport.js";
+
+/** Fake transport that records the exact JSON-RPC requests it receives. */
+class RecordingTransport implements InspectionTransport {
+  readonly calls: IpcRequest[] = [];
+  constructor(
+    private readonly result: unknown,
+    private readonly connected = true,
+  ) {}
+  isConnected(): boolean {
+    return this.connected;
+  }
+  request(request: IpcRequest, _nowMs: number): IpcResponse {
+    this.calls.push(request);
+    return {
+      jsonrpc: "2.0",
+      id: request.id,
+      result: this.result,
+      version: "1.0",
+    };
+  }
+}
 
 function makeSnapshot(): PanelRuntimeSnapshot {
   return {
@@ -85,5 +110,136 @@ describe("inspection (debug.inspect default, read-only)", () => {
     const s = c.getSnapshotForTerminal("term-1", "hello world");
     // preview equals export via redactionPreview (no echo of unbounded bytes)
     expect(s.preview).toBe("hello world");
+  });
+});
+
+describe("inspection over real IPC (connected path)", () => {
+  test("listPlugins dispatches bitty.debug/listPlugins with generation param", () => {
+    const transport = new RecordingTransport([
+      {
+        id: "plugin-a",
+        version: "1.2.3",
+        generation: 4,
+        state: "Activated",
+        manifestHash: "sha256:abc",
+        capabilities: ["panel.provider"],
+      },
+    ]);
+    const client = new InspectionClient(transport);
+    const plugins = client.listPlugins("debug.inspect", generation(2));
+    expect(transport.calls.length).toBe(1);
+    expect(transport.calls[0]!.method).toBe("bitty.debug/listPlugins");
+    expect(transport.calls[0]!.params).toEqual({ generation: generation(2) });
+    expect(transport.calls[0]!.version).toBe("1.0");
+    expect(plugins.length).toBe(1);
+    expect(plugins[0]!.id).toBe("plugin-a");
+    expect(Number(plugins[0]!.generation)).toBe(4);
+  });
+
+  test("listPlugins without a generation filter sends empty params", () => {
+    const transport = new RecordingTransport([]);
+    const client = new InspectionClient(transport);
+    expect(client.listPlugins("debug.inspect")).toEqual([]);
+    expect(transport.calls[0]!.method).toBe("bitty.debug/listPlugins");
+    expect(transport.calls[0]!.params).toEqual({});
+  });
+
+  test("getPlugin / listSubscriptions / getBudgets use exact methods and params", () => {
+    const transport = new RecordingTransport({});
+    const client = new InspectionClient(transport);
+    client.getPlugin("debug.inspect", "plugin-a");
+    client.listSubscriptions("debug.inspect", "plugin-a");
+    client.getBudgets("debug.inspect", "plugin-a", generation(7));
+    expect(transport.calls.map((c) => c.method)).toEqual([
+      "bitty.debug/getPlugin",
+      "bitty.debug/listSubscriptions",
+      "bitty.debug/getBudgets",
+    ]);
+    expect(transport.calls[0]!.params).toEqual({ pluginId: "plugin-a" });
+    expect(transport.calls[1]!.params).toEqual({ pluginId: "plugin-a" });
+    expect(transport.calls[2]!.params).toEqual({
+      pluginId: "plugin-a",
+      generation: generation(7),
+    });
+  });
+
+  test("getQueueSnapshot / listHandles use exact methods and params", () => {
+    const transport = new RecordingTransport({});
+    const client = new InspectionClient(transport);
+    client.getQueueSnapshot("debug.inspect", "plugin-a");
+    client.listHandles("debug.inspect", "plugin-a");
+    expect(transport.calls.map((c) => c.method)).toEqual([
+      "bitty.debug/getQueueSnapshot",
+      "bitty.debug/listHandles",
+    ]);
+    expect(transport.calls[0]!.params).toEqual({ pluginId: "plugin-a" });
+    expect(transport.calls[1]!.params).toEqual({ pluginId: "plugin-a" });
+  });
+
+  test("getSnapshotForTerminal dispatches semantic getSnapshot and redacts", () => {
+    const transport = new RecordingTransport({
+      cursor: { row: 2, col: 5 },
+      modeFlags: ["wrap"],
+      semanticZoneCount: 1,
+      preview: "hello password=hunter2",
+    });
+    const client = new InspectionClient(transport);
+    const snap = client.getSnapshotForTerminal("debug.inspect", "term-1", "");
+    expect(transport.calls[0]!.method).toBe("bitty.debug/getSnapshot");
+    expect(transport.calls[0]!.params).toEqual({
+      terminalId: "term-1",
+      scope: "semantic",
+    });
+    expect(snap.cursor).toEqual({ row: 2, col: 5 });
+    expect(snap.preview).toBe("hello password=hunter2");
+    expect(snap.truncated).toBe(false);
+  });
+
+  test("typed server error is surfaced as InspectionError", () => {
+    const transport: InspectionTransport = {
+      isConnected: () => true,
+      request: (request) => ({
+        jsonrpc: "2.0",
+        id: request.id,
+        error: {
+          category: "scope",
+          code: "ScopeDenied",
+          message: "scope denied",
+        },
+        version: "1.0",
+      }),
+    };
+    const client = new InspectionClient(transport);
+    expect(() => client.listPlugins("debug.inspect")).toThrow("scope denied");
+  });
+});
+
+describe("inspection disconnected path (explicit mock injectable)", () => {
+  test("disconnected transport falls back to the injected snapshot mock", () => {
+    let called = 0;
+    const offline: InspectionTransport = {
+      isConnected: () => false,
+      request: () => {
+        called += 1;
+        throw new Error("IPC must not be used when disconnected");
+      },
+    };
+    const client = new InspectionClient(offline, () => makeSnapshot());
+    const plugins = client.listPlugins("debug.inspect");
+    expect(called).toBe(0);
+    expect(plugins.length).toBe(1);
+    expect(plugins[0]!.id).toBe("panel-1");
+  });
+
+  test("disconnected with no injected mock returns no fabricated data", () => {
+    const offline: InspectionTransport = {
+      isConnected: () => false,
+      request: () => {
+        throw new Error("IPC must not be used when disconnected");
+      },
+    };
+    const client = new InspectionClient(offline, null);
+    expect(client.listPlugins("debug.inspect")).toEqual([]);
+    expect(client.getPlugin("debug.inspect", "panel-1")).toBeNull();
   });
 });

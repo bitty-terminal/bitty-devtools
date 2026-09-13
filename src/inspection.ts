@@ -9,6 +9,7 @@
 
 import { BOUNDS, assertBounded } from "./bounds.js";
 import { redactPreview } from "./redaction.js";
+import { generation } from "./panel-runtime.js";
 import type {
   PanelRuntimeSnapshot,
   PanelId,
@@ -19,6 +20,8 @@ import {
   MATRIX,
   REFERENCE_TERMS,
 } from "./compat-matrix.js";
+import { PROTOCOL_VERSION } from "./protocol.js";
+import type { IpcRequest, IpcResponse } from "./transport.js";
 
 export type PluginState =
   | "Declared"
@@ -111,10 +114,116 @@ const MAX_SUBSCRIPTIONS = 32;
 const MAX_HANDLES = 256;
 const MAX_PREVIEW_CHARS = 2048;
 
+/**
+ * Local, read-only snapshot source. It is consulted only when no transport is
+ * connected (headless/unit-test fallback) and is never the production path:
+ * production inspection dispatches real JSON-RPC over `InspectionTransport`.
+ */
+export type InspectionSnapshotSource = () => PanelRuntimeSnapshot | null;
+
+/**
+ * JSON-RPC request/response seam for inspection. Production binds this to the
+ * connected `IpcTransport`; unit tests inject a fake to assert the exact
+ * method names and params. `request` returns the decoded response envelope.
+ */
+export type InspectionTransport = {
+  isConnected(): boolean;
+  request(request: IpcRequest, nowMs: number): IpcResponse;
+};
+
+const PLUGIN_STATES: readonly PluginState[] = [
+  "Declared",
+  "Resolved",
+  "Registered",
+  "Activated",
+  "Suspended",
+  "Disposed",
+];
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value !== null && typeof value === "object"
+    ? (value as Record<string, unknown>)
+    : {};
+}
+
+function asArray(value: unknown): unknown[] {
+  return Array.isArray(value) ? value : [];
+}
+
+function asString(value: unknown, fallback = ""): string {
+  return typeof value === "string" ? value : fallback;
+}
+
+function asNumber(value: unknown, fallback: number): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+function asGeneration(value: unknown, fallback: Generation): Generation {
+  if (typeof value === "number" && Number.isInteger(value) && value >= 1) {
+    return generation(value);
+  }
+  return fallback;
+}
+
+function asPluginState(value: unknown): PluginState {
+  return typeof value === "string" &&
+    (PLUGIN_STATES as readonly string[]).includes(value)
+    ? (value as PluginState)
+    : "Activated";
+}
+
+function pluginSummaryFrom(value: unknown): PluginSummary {
+  const r = asRecord(value);
+  return {
+    id: asString(r["id"]),
+    version: asString(r["version"], "0.0.0"),
+    generation: asGeneration(r["generation"], 1 as Generation),
+    state: asPluginState(r["state"]),
+    manifestHash: asString(r["manifestHash"]),
+    capabilities: asArray(r["capabilities"]).filter(
+      (c): c is string => typeof c === "string",
+    ),
+  };
+}
+
 export class InspectionClient {
+  private nextRequestId = 1;
+
   constructor(
-    private readonly getSnapshot: () => PanelRuntimeSnapshot | null,
+    private readonly transport: InspectionTransport | null = null,
+    private readonly getSnapshot: InspectionSnapshotSource | null = null,
   ) {}
+
+  private isLive(): boolean {
+    return this.transport !== null && this.transport.isConnected();
+  }
+
+  private snapshot(): PanelRuntimeSnapshot | null {
+    return this.getSnapshot === null ? null : this.getSnapshot();
+  }
+
+  private rpc(method: string, params: unknown = {}): unknown {
+    const transport = this.transport;
+    if (transport === null || !transport.isConnected()) {
+      throw new InspectionError(
+        "NoTransport",
+        "no connected inspection transport",
+      );
+    }
+    const id = this.nextRequestId;
+    this.nextRequestId += 1;
+    const response = transport.request(
+      { id, method, params, version: PROTOCOL_VERSION },
+      Date.now(),
+    );
+    if (response.error !== undefined) {
+      throw new InspectionError(
+        response.error.code,
+        `${response.error.category}: ${response.error.message}`,
+      );
+    }
+    return response.result;
+  }
 
   private requireInspect(scope: string): void {
     if (
@@ -126,17 +235,28 @@ export class InspectionClient {
     }
   }
 
-  listPlugins(scope: string, generation?: Generation): PluginSummary[] {
+  listPlugins(scope: string, generationFilter?: Generation): PluginSummary[] {
     this.requireInspect(scope);
-    // Stub: in real client this would call bitty.debug/listPlugins over IPC.
-    // Here we synthesize bounded, redacted observation data from PanelRuntime.
-    const snap = this.getSnapshot();
+    if (this.isLive()) {
+      const result = this.rpc(
+        "bitty.debug/listPlugins",
+        generationFilter === undefined ? {} : { generation: generationFilter },
+      );
+      const list = asArray(result);
+      assertBounded("MAX_PLUGINS", list.length, MAX_PLUGINS);
+      return list
+        .slice(0, MAX_PLUGINS)
+        .map((entry) => pluginSummaryFrom(entry));
+    }
+    // Headless/unit-test fallback: synthesize bounded observation data from
+    // the locally injected PanelRuntime snapshot. Never used when connected.
+    const snap = this.snapshot();
     if (!snap) return [];
     assertBounded("MAX_PLUGINS", snap.panels.length, MAX_PLUGINS);
     return snap.panels.slice(0, MAX_PLUGINS).map((p) => ({
       id: `panel-${p.id}`,
       version: "0.0.1",
-      generation: generation ?? p.generation,
+      generation: generationFilter ?? p.generation,
       state: "Activated" as PluginState,
       manifestHash: "sha256:stub",
       capabilities: ["panel.provider"],
@@ -148,7 +268,12 @@ export class InspectionClient {
     if (pluginId.length === 0 || pluginId.length > 128) {
       throw new InspectionError("InvalidPluginId", "pluginId must be 1..128");
     }
-    const snap = this.getSnapshot();
+    if (this.isLive()) {
+      const result = this.rpc("bitty.debug/getPlugin", { pluginId });
+      if (result === null || result === undefined) return null;
+      return pluginSummaryFrom(result);
+    }
+    const snap = this.snapshot();
     if (!snap) return null;
     const found = snap.panels.find((p) => `panel-${p.id}` === pluginId);
     if (!found) return null;
@@ -166,6 +291,21 @@ export class InspectionClient {
     this.requireInspect(scope);
     if (pluginId.length > 128)
       throw new InspectionError("InvalidPluginId", "pluginId too long");
+    if (this.isLive()) {
+      const result = this.rpc("bitty.debug/listSubscriptions", { pluginId });
+      const list = asArray(result);
+      assertBounded("MAX_SUBSCRIPTIONS", list.length, MAX_SUBSCRIPTIONS);
+      return list.slice(0, MAX_SUBSCRIPTIONS).map((entry) => {
+        const r = asRecord(entry);
+        return {
+          eventType: asString(r["eventType"]),
+          queueDepth: asNumber(r["queueDepth"], 0),
+          queuedBytes: asNumber(r["queuedBytes"], 0),
+          dropCount: asNumber(r["dropCount"], 0),
+          policy: r["policy"] === "DropNewest" ? "DropNewest" : "DropOldest",
+        };
+      });
+    }
     // Bounded stub: per-panel 32 topics max, per subscription 64
     const subs: SubscriptionInfo[] = [
       {
@@ -191,6 +331,24 @@ export class InspectionClient {
     this.requireInspect(scope);
     if (pluginId.length > 128)
       throw new InspectionError("InvalidPluginId", "pluginId too long");
+    if (this.isLive()) {
+      const result = this.rpc("bitty.debug/getBudgets", {
+        pluginId,
+        generation: gen,
+      });
+      const r = asRecord(result);
+      return {
+        pluginId,
+        generation: asGeneration(r["generation"], gen),
+        rc1Instructions: asNumber(r["rc1Instructions"], 0),
+        rc1WallMs: asNumber(r["rc1WallMs"], 0),
+        rc2MemoryBytes: asNumber(r["rc2MemoryBytes"], 0),
+        rc4Tasks: asNumber(r["rc4Tasks"], 0),
+        rc4Timers: asNumber(r["rc4Timers"], 0),
+        rc5QueueDepth: asNumber(r["rc5QueueDepth"], 0),
+        wouldExceedLuaLimits: r["wouldExceedLuaLimits"] === true,
+      };
+    }
     return {
       pluginId,
       generation: gen,
@@ -208,6 +366,45 @@ export class InspectionClient {
     this.requireInspect(scope);
     if (pluginId.length > 128)
       throw new InspectionError("InvalidPluginId", "pluginId too long");
+    if (this.isLive()) {
+      const result = this.rpc("bitty.debug/getQueueSnapshot", { pluginId });
+      const r = asRecord(result);
+      const perSubscription = asRecord(r["perSubscription"]);
+      const perPlugin = asRecord(r["perPlugin"]);
+      const global = asRecord(r["global"]);
+      return {
+        perSubscription: {
+          limit: asNumber(
+            perSubscription["limit"],
+            BOUNDS.BUS_PER_SUBSCRIPTION,
+          ),
+          current: asNumber(perSubscription["current"], 0),
+        },
+        perPlugin: {
+          events: asNumber(perPlugin["events"], 0),
+          bytes: asNumber(perPlugin["bytes"], 0),
+          limitEvents: asNumber(
+            perPlugin["limitEvents"],
+            BOUNDS.BUS_PER_PANEL_EVENTS,
+          ),
+          limitBytes: asNumber(
+            perPlugin["limitBytes"],
+            BOUNDS.BUS_PER_PANEL_BYTES,
+          ),
+        },
+        global: {
+          events: asNumber(global["events"], 0),
+          bytes: asNumber(global["bytes"], 0),
+          limitEvents: asNumber(
+            global["limitEvents"],
+            BOUNDS.BUS_GLOBAL_EVENTS,
+          ),
+          limitBytes: asNumber(global["limitBytes"], BOUNDS.BUS_GLOBAL_BYTES),
+        },
+        invariantQueueBounds: r["invariantQueueBounds"] === true,
+        invariantGlobalBounds: r["invariantGlobalBounds"] === true,
+      };
+    }
     return {
       perSubscription: { limit: BOUNDS.BUS_PER_SUBSCRIPTION, current: 2 },
       perPlugin: {
@@ -239,6 +436,35 @@ export class InspectionClient {
         "terminalId must be 1..64",
       );
     }
+    if (this.isLive()) {
+      const result = this.rpc("bitty.debug/getSnapshot", {
+        terminalId,
+        scope: "semantic",
+      });
+      const r = asRecord(result);
+      const serverPreview = asString(r["preview"]);
+      const bounded = serverPreview.slice(0, MAX_PREVIEW_CHARS);
+      const { text, marker } = redactPreview(bounded, "terminal.preview");
+      const cursor = asRecord(r["cursor"]);
+      return {
+        terminalId,
+        scope: "semantic",
+        cursor: {
+          row: asNumber(cursor["row"], 0),
+          col: asNumber(cursor["col"], 0),
+        },
+        modeFlags: asArray(r["modeFlags"]).filter(
+          (m): m is string => typeof m === "string",
+        ),
+        semanticZoneCount: asNumber(r["semanticZoneCount"], 0),
+        preview: text,
+        redactionMarker: {
+          redacted: marker.redacted,
+          truncated: marker.truncated,
+        },
+        truncated: marker.truncated || bounded.length < serverPreview.length,
+      };
+    }
     const bounded = previewText.slice(0, MAX_PREVIEW_CHARS);
     const { text, marker } = redactPreview(bounded, "terminal.preview");
     return {
@@ -260,6 +486,19 @@ export class InspectionClient {
     this.requireInspect(scope);
     if (pluginId.length > 128)
       throw new InspectionError("InvalidPluginId", "pluginId too long");
+    if (this.isLive()) {
+      const result = this.rpc("bitty.debug/listHandles", { pluginId });
+      const list = asArray(result);
+      assertBounded("MAX_HANDLES", list.length, MAX_HANDLES);
+      return list.slice(0, MAX_HANDLES).map((entry) => {
+        const r = asRecord(entry);
+        return {
+          handle: asString(r["handle"]),
+          capability: asString(r["capability"]),
+          refCount: asNumber(r["refCount"], 0),
+        };
+      });
+    }
     const handles: HandleInfo[] = [
       { handle: "handle-1", capability: "panel.create", refCount: 1 },
       { handle: "handle-2", capability: "fs.read", refCount: 2 },
@@ -276,7 +515,7 @@ export class InspectionClient {
     topics: string[];
   } {
     this.requireInspect(scope);
-    const snap = this.getSnapshot();
+    const snap = this.snapshot();
     if (!snap) {
       throw new InspectionError(
         "NoSnapshot",
