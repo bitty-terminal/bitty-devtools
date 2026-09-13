@@ -547,6 +547,7 @@ describe("inspection introspection (CTX-0159 read-only RPCs)", () => {
     expect(transport.calls.length).toBe(1);
     expect(transport.calls[0]!.method).toBe("bitty.debug/getGridText");
     expect(transport.calls[0]!.params).toEqual({ rows: 10 });
+    expect(transport.calls[0]!.version).toBe("1.0");
     expect(snap.snapshot).toBe("grid-text");
     expect(snap.lines).toEqual(["hello introspect", "second row"]);
     expect(snap.cursor).toEqual({ row: 0, col: 16, visible: true });
@@ -669,6 +670,111 @@ describe("inspection introspection (CTX-0159 read-only RPCs)", () => {
     expect(() => oversize.getInputRing("debug.inspect")).toThrow("exceeded");
   });
 
+  test("accepts server-truncated kind/label/button at the emitted ellipsis bound", () => {
+    // `truncate_chars(s, max)` emits `take(max) + "..."`, so the wire value is
+    // up to `max + 3`: kind 16 -> 19, label 64 -> 67, button 16 -> 19.
+    const kind = `${"k".repeat(16)}...`;
+    const label = `${"l".repeat(64)}...`;
+    const button = `${"b".repeat(16)}...`;
+    expect([...kind].length).toBe(19);
+    expect([...label].length).toBe(67);
+    expect([...button].length).toBe(19);
+    const transport = new MethodTransport({
+      "bitty.debug/getInputRing": inputRingPayload({
+        events: [
+          {
+            seq: 1,
+            kind,
+            label,
+            shift: false,
+            control: false,
+            alt: false,
+            button,
+            col: 1,
+            row: 2,
+            pressed: true,
+          },
+        ],
+        count: 1,
+      }),
+    });
+    const ring = new InspectionClient(transport).getInputRing("debug.inspect");
+    expect(ring.events[0]!.kind).toBe(kind);
+    expect(ring.events[0]!.label).toBe(label);
+    expect(ring.events[0]!.button).toBe(button);
+    expect(transport.calls[0]!.version).toBe("1.0");
+  });
+
+  test("rejects kind/label/button beyond the emitted ellipsis bound", () => {
+    const base = {
+      seq: 1,
+      shift: false,
+      control: false,
+      alt: false,
+      col: null,
+      row: null,
+      pressed: null,
+    };
+    for (const bad of [
+      { ...base, kind: `${"k".repeat(17)}...`, label: "ok", button: null },
+      { ...base, kind: "key", label: `${"l".repeat(65)}...`, button: null },
+      { ...base, kind: "key", label: "ok", button: `${"b".repeat(17)}...` },
+    ]) {
+      const client = new InspectionClient(
+        new MethodTransport({
+          "bitty.debug/getInputRing": inputRingPayload({ events: [bad] }),
+        }),
+      );
+      expect(() => client.getInputRing("debug.inspect")).toThrow("exceeded");
+    }
+  });
+
+  test("accepts grid and ring payloads at the exact server boundaries", () => {
+    const grid = new InspectionClient(
+      new MethodTransport({
+        "bitty.debug/getGridText": gridTextPayload({
+          lines: Array(64).fill("x".repeat(256)),
+        }),
+      }),
+    );
+    const snap = grid.getGridText("debug.inspect", { rows: 64, cols: 256 });
+    expect(snap.lines.length).toBe(64);
+    expect(snap.lines[0]!.length).toBe(256);
+    const ring = new InspectionClient(
+      new MethodTransport({
+        "bitty.debug/getInputRing": inputRingPayload({
+          events: Array(64).fill({
+            seq: 1,
+            kind: "key",
+            label: "key:a",
+            shift: false,
+            control: false,
+            alt: false,
+            button: null,
+            col: null,
+            row: null,
+            pressed: null,
+          }),
+          count: 64,
+        }),
+      }),
+    );
+    expect(
+      ring.getInputRing("debug.inspect", { limit: 64 }).events.length,
+    ).toBe(64);
+  });
+
+  test("rejects a result envelope whose version tag is not negotiated", () => {
+    const client = new InspectionClient(
+      new MethodTransport({
+        "bitty.debug/getGridText": gridTextPayload({ version: "2.0" }),
+      }),
+    );
+    expect(() => client.getGridText("debug.inspect")).toThrow(
+      "unsupported result version 2.0",
+    );
+  });
+
   test("getModifiers and getFocus dispatch and parse the fixture", () => {
     const transport = new MethodTransport({
       "bitty.debug/getModifiers": modifiersPayload(),
@@ -682,6 +788,7 @@ describe("inspection introspection (CTX-0159 read-only RPCs)", () => {
       "bitty.debug/getFocus",
     ]);
     expect(transport.calls[0]!.params).toEqual({});
+    for (const call of transport.calls) expect(call.version).toBe("1.0");
     expect(mods.shift).toBe(true);
     expect(mods.kittyFlags).toBe(0);
     expect(focus.focused).toBe(true);

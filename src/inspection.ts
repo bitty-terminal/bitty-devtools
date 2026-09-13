@@ -185,15 +185,28 @@ const MAX_PREVIEW_CHARS = 2048;
 
 /**
  * Introspection bounds mirror `bitty-ipc/src/devtools.rs` (CTX-0159):
- * `MAX_INSPECT_ROWS` 64, `MAX_INSPECT_COLS` 256, `MAX_INPUT_RING` 64, and a
- * 16-char kind / 64-char label cap. The client re-applies them so a hostile
- * peer cannot exceed the negotiated response budget.
+ * `MAX_INSPECT_ROWS` 64, `MAX_INSPECT_COLS` 256, `MAX_INPUT_RING` 64.
+ *
+ * The input-ring `kind`/`label`/`button` are truncated server-side by
+ * `truncate_chars(s, max)`, which appends an ellipsis when it truncates
+ * (`take(max) + "..."`), so the emitted wire value is up to `max + 3`
+ * characters. The client must bound the *emitted* length, not the
+ * pre-ellipsis cap, or it rejects valid server frames (e.g. a 67-char
+ * label). Grid text uses `truncate_line`, which appends no ellipsis, so
+ * `MAX_GRID_COLS` is the emitted bound.
  */
+const INPUT_ELLIPSIS = "..." as const;
+const INPUT_ELLIPSIS_CHARS = INPUT_ELLIPSIS.length;
 const MAX_GRID_ROWS = 64;
 const MAX_GRID_COLS = 256;
 const MAX_INPUT_EVENTS = 64;
 const MAX_INPUT_KIND_CHARS = 16;
+const MAX_INPUT_KIND_EMIT_CHARS = MAX_INPUT_KIND_CHARS + INPUT_ELLIPSIS_CHARS;
 const MAX_INPUT_LABEL_CHARS = 64;
+const MAX_INPUT_LABEL_EMIT_CHARS = MAX_INPUT_LABEL_CHARS + INPUT_ELLIPSIS_CHARS;
+const MAX_INPUT_BUTTON_CHARS = 16;
+const MAX_INPUT_BUTTON_EMIT_CHARS =
+  MAX_INPUT_BUTTON_CHARS + INPUT_ELLIPSIS_CHARS;
 
 /**
  * Local, read-only snapshot source. It is consulted only when no transport is
@@ -383,16 +396,26 @@ function requireNullableUnsignedInt(
 }
 
 /**
- * Strict envelope policy: the required-field helpers already fail closed on
- * missing or mistyped values; this additionally rejects any key outside the
- * known wire schema so an unknown/extra field is a protocol error rather than
- * silently ignored observation data.
+ * Strict-envelope policy for the introspection result objects.
+ *
+ * Protocol v1.0 defines these four result envelopes as closed: unknown or
+ * extra keys are a protocol error (fail-closed) rather than silently retained
+ * observation data, and are covered by negative tests. The guard is version
+ * scoped to the negotiated `PROTOCOL_VERSION`: an additive field is a future
+ * protocol-version concern that must be admitted by that version's parser
+ * (or by relaxing this guard during a version bump), never by ignoring v1.0
+ * strictness. This reconciles the strict parse with the debug-protocol
+ * persona's additive forward-compatibility stance
+ * (`.carryctx/personas/debug-protocol-engineer.md`).
  */
+const STRICT_RESULT_FIELDS_V1 = PROTOCOL_VERSION === "1.0";
+
 function requireOnlyKeys(
   record: Record<string, unknown>,
   allowed: readonly string[],
   field: string,
 ): void {
+  if (!STRICT_RESULT_FIELDS_V1) return;
   for (const key of Object.keys(record)) {
     if (!allowed.includes(key)) {
       throw parseError(`${field}.${key}`, "unknown field");
@@ -410,6 +433,24 @@ function requireSnapshotTag(
   }
 }
 
+/**
+ * Validate the optional result `version` tag against the negotiated version.
+ * The live server emits it; when present it must match `PROTOCOL_VERSION`,
+ * otherwise the strict v1.0 field policy would be applied to a foreign shape.
+ */
+function requireResultVersion(
+  record: Record<string, unknown>,
+  field: string,
+): void {
+  const value = record["version"];
+  if (value !== undefined && value !== PROTOCOL_VERSION) {
+    throw parseError(
+      `${field}.version`,
+      `unsupported result version ${String(value)}`,
+    );
+  }
+}
+
 function gridTextSnapshotFrom(
   value: unknown,
   field = "getGridText result",
@@ -420,6 +461,7 @@ function gridTextSnapshotFrom(
     ["version", "snapshot", "lines", "cursor", "cols", "rows", "generation"],
     field,
   );
+  requireResultVersion(r, field);
   requireSnapshotTag(r, "grid-text", field);
   const rawLines = requireArray(r["lines"], `${field}.lines`);
   assertBounded("MAX_GRID_ROWS", rawLines.length, MAX_GRID_ROWS);
@@ -467,13 +509,25 @@ function inputEventFrom(value: unknown, field: string): InputEvent {
     field,
   );
   const kind = requireString(r, "kind", field);
-  assertBounded("MAX_INPUT_KIND_CHARS", [...kind].length, MAX_INPUT_KIND_CHARS);
+  assertBounded(
+    "MAX_INPUT_KIND_EMIT_CHARS",
+    [...kind].length,
+    MAX_INPUT_KIND_EMIT_CHARS,
+  );
   const label = requireString(r, "label", field);
   assertBounded(
-    "MAX_INPUT_LABEL_CHARS",
+    "MAX_INPUT_LABEL_EMIT_CHARS",
     [...label].length,
-    MAX_INPUT_LABEL_CHARS,
+    MAX_INPUT_LABEL_EMIT_CHARS,
   );
+  const button = requireNullableString(r, "button", field);
+  if (button !== null) {
+    assertBounded(
+      "MAX_INPUT_BUTTON_EMIT_CHARS",
+      [...button].length,
+      MAX_INPUT_BUTTON_EMIT_CHARS,
+    );
+  }
   return {
     seq: requireUnsignedInt(r, "seq", field),
     kind,
@@ -481,7 +535,7 @@ function inputEventFrom(value: unknown, field: string): InputEvent {
     shift: requireBoolean(r, "shift", field),
     control: requireBoolean(r, "control", field),
     alt: requireBoolean(r, "alt", field),
-    button: requireNullableString(r, "button", field),
+    button,
     col: requireNullableNumber(r, "col", field),
     row: requireNullableNumber(r, "row", field),
     pressed: requireNullableBoolean(r, "pressed", field),
@@ -494,6 +548,7 @@ function inputRingSnapshotFrom(
 ): InputRingSnapshot {
   const r = requireRecord(value, field);
   requireOnlyKeys(r, ["version", "snapshot", "events", "count"], field);
+  requireResultVersion(r, field);
   requireSnapshotTag(r, "input-ring", field);
   const rawEvents = requireArray(r["events"], `${field}.events`);
   assertBounded("MAX_INPUT_EVENTS", rawEvents.length, MAX_INPUT_EVENTS);
@@ -516,6 +571,7 @@ function modifiersSnapshotFrom(
     ["version", "snapshot", "shift", "control", "alt", "kitty_flags"],
     field,
   );
+  requireResultVersion(r, field);
   requireSnapshotTag(r, "modifiers", field);
   return {
     snapshot: "modifiers",
@@ -546,6 +602,7 @@ function focusSnapshotFrom(
     ],
     field,
   );
+  requireResultVersion(r, field);
   requireSnapshotTag(r, "focus", field);
   return {
     snapshot: "focus",

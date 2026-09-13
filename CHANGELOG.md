@@ -34,9 +34,12 @@ and this project adheres to no released version yet.
   the connected `IpcTransport`, validate optional filters client-side to the
   server bounds (rows/cols `64`/`256`, limit `64`), and parse strictly against
   the live server envelope (fail-closed on missing, mistyped, unknown, or
-  extra fields; bounded `lines`/`events`). Read-only `debug.inspect`; the four
-  methods are added to the inspect scope allowlist. "Unknown field" rejection
-  is enforced per the issue's strict-envelope requirement.
+  extra fields; bounded `lines`/`events`). Input `kind`/`label`/`button` are
+  bounded to the server's emitted `truncate_chars` shape (`cap + "..."`:
+  `19`/`67`/`19`), not the pre-ellipsis cap. Read-only `debug.inspect`; the
+  four methods are added to the inspect scope allowlist. "Unknown field"
+  rejection is enforced as an explicit version-guarded v1.0 policy per the
+  issue's strict-envelope requirement.
 
 - **Diagnostics client phase 2 (CTX-0012)**: advanced tracing, control
   surfaces, and real IPC socket/pipe peer-creds integration against the live
