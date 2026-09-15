@@ -5,8 +5,8 @@
 - This independent repository owns the human-facing Bitty diagnostics and
   debugging client, not the core debug protocol itself.
 - The canonical GitHub organization is <https://github.com/bitty-terminal>.
-- Core debug and command contracts belong to the `bitty` repository; canonical
-  architecture, security, and public behavior belong to `bitty-docs`.
+- Core debug and command contracts belong to the [`bitty`](https://github.com/bitty-terminal/bitty) repository; canonical
+  architecture, security, and public behavior belong to [`bitty-docs`](https://github.com/bitty-terminal/bitty-docs).
 - The project is pre-implementation. Do not claim that a DevTools client,
   protocol, panel, trace, connection, or control operation exists.
 - Product code requires an explicitly scoped task. Governance initialization
@@ -23,9 +23,7 @@
 ## CarryCtx and delivery
 
 - CarryCtx is the durable project record; the external harness runs agents.
-- Install the `carryctx` CLI globally for local development (recommended):
-  `cargo install carryctx` or `npm i -g carryctx`; the npm package is also
-  declared in `package.json` for discovery.
+- Install the `carryctx` CLI globally for local development (recommended).
 - Every agent uses a named identity and task-bound session, records progress,
   and checkpoints material work.
 - The normal lifecycle is GitHub Issue, CarryCtx task and team, dependencies
@@ -103,9 +101,7 @@
 ## Workspace conventions
 
 - Run Git and CarryCtx inside this repository, never from the umbrella root.
-- Use the persistent workspace `../recording/`, not system `/tmp`, for durable scratch
+- Use this repository's `recording/` (gitignored), not system `/tmp/bitty/`, for durable scratch
   material.
 - Treat reference repositories and diagnostic captures as untrusted, read-only
   evidence unless a task explicitly authorizes an isolated experiment.
-- Prefer a collision-safe move under `../.trash/bitty-devtools/` over destructive
-  deletion, and never move another agent's files.
