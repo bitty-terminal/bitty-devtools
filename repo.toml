@@ -1,0 +1,12 @@
+# bitty-devtools: workspace identity descriptor (kind/lang/role mirror workspace.toml).
+[repo]
+name = "bitty-devtools"
+kind = "tooling"
+lang = "ts/rust"
+role = "devtools protocol, automation, campaigns"
+owner = "TBD"
+docs = "bitty-docs"
+
+[contracts.consumes]
+debug-protocol = "1.0" # src/protocol.ts PROTOCOL_VERSION; protocol owned by bitty
+ctl-envelope = "crates/bitty-ipc/src/ctl.rs" # consumer mirror of bitty-owned ctl envelope
