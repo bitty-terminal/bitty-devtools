@@ -1,5 +1,5 @@
 .carryctx/config.local.toml
 .worktrees/
+target/
 node_modules/
 dist/
-target/
