@@ -36,6 +36,61 @@ describe("compat-matrix 14x4", () => {
     expect(j.includes('"surface": "DPI"')).toBe(true);
   });
 
+  test("matrix content order parity (surface/category/corpus)", () => {
+    // H-DEV-05(c): content must stay identical across impls; this pins the
+    // 14-row order and fields the Rust matrix_content_matches_ts test mirrors.
+    const expected: Array<[string, string, string]> = [
+      [
+        "shell",
+        "shell",
+        "shell/corpus/02-dogfooding-shell-osc133-osc7-fish.bin",
+      ],
+      ["tmux", "tui", "tui/corpus/01-nvim-tmux.bin"],
+      ["nvim", "tui", "tui/corpus/03-dogfooding-nvim-tmux-fzf-htop-ssh.bin"],
+      ["fzf", "tui", "tui/corpus/02-htop-fzf.bin"],
+      ["htop", "tui", "tui/corpus/03-dogfooding-nvim-tmux-fzf-htop-ssh.bin"],
+      ["ssh", "tui", "tui/corpus/03-dogfooding-nvim-tmux-fzf-htop-ssh.bin"],
+      [
+        "alt-screen",
+        "resize",
+        "resize/corpus/02-dogfooding-resize-dpi-alt-screen.bin",
+      ],
+      ["mouse", "mouse", "mouse/corpus/03-dogfooding-mouse-resize-sgr.bin"],
+      ["resize", "resize", "resize/corpus/01-resize-reflow.bin"],
+      ["OSC", "osc", "osc/corpus/03-dogfooding-osc7-8-52-title.bin"],
+      ["clipboard", "osc", "osc/corpus/02-clipboard.bin"],
+      [
+        "Kitty",
+        "keyboard",
+        "keyboard/corpus/03-dogfooding-kitty-keyboard-bracketed.bin",
+      ],
+      ["IME", "unicode", "unicode/corpus/09-dogfooding-ime-unicode-dpi.bin"],
+      [
+        "DPI",
+        "resize",
+        "resize/corpus/02-dogfooding-resize-dpi-alt-screen.bin",
+      ],
+    ];
+    expect(MATRIX.length).toBe(expected.length);
+    for (let i = 0; i < expected.length; i++) {
+      const row = MATRIX[i];
+      const want = expected[i];
+      expect(row?.surface).toBe(want?.[0]);
+      expect(row?.category).toBe(want?.[1]);
+      expect(row?.corpusRel).toBe(want?.[2]);
+    }
+  });
+
+  test("generate json byte-matches golden fixture", async () => {
+    // Golden file is generator output plus one trailing newline (see
+    // tests/fixtures/compat-matrix-golden.json header note). Regenerate by
+    // writing generateMatrixJson() + "\n" to that path.
+    const golden = await Bun.file(
+      `${import.meta.dir}/fixtures/compat-matrix-golden.json`,
+    ).text();
+    expect(`${generateMatrixJson()}\n`).toBe(golden);
+  });
+
   test("parse bounded rejects oversize", () => {
     const j = generateMatrixJson();
     expect(parseMatrixJsonBounded(j).version).toBe(1);

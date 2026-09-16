@@ -110,6 +110,11 @@ pub fn is_valid_method_for_scope(method: &str, scope: DebugScope) -> bool {
         "bitty.debug/getQueueSnapshot",
         "bitty.debug/getSnapshot",
         "bitty.debug/listHandles",
+        // CTX-0159 live read-only introspection (server-registered, inspect scope).
+        "bitty.debug/getGridText",
+        "bitty.debug/getInputRing",
+        "bitty.debug/getModifiers",
+        "bitty.debug/getFocus",
     ];
     let trace = [
         "bitty.debug/streamEvents",
@@ -192,6 +197,24 @@ mod tests {
         ));
         for method in ["bitty.debug/captureFrame", "bitty.debug/frameHash"] {
             assert!(!is_valid_method_for_scope(method, DebugScope::Inspect));
+            assert!(is_valid_method_for_scope(method, DebugScope::Trace));
+            assert!(is_valid_method_for_scope(method, DebugScope::Control));
+        }
+    }
+
+    #[test]
+    fn scope_matrix_includes_ctx0159() {
+        // CTX-0159 live read-only introspection (server-registered, inspect
+        // scope). Mirrors TS `isValidMethodForScope`: the inspect set is the
+        // base for every scope, so these read-only methods hold for all
+        // scopes exactly like the other inspect methods above.
+        for method in [
+            "bitty.debug/getGridText",
+            "bitty.debug/getInputRing",
+            "bitty.debug/getModifiers",
+            "bitty.debug/getFocus",
+        ] {
+            assert!(is_valid_method_for_scope(method, DebugScope::Inspect));
             assert!(is_valid_method_for_scope(method, DebugScope::Trace));
             assert!(is_valid_method_for_scope(method, DebugScope::Control));
         }

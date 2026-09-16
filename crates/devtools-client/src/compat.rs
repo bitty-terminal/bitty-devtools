@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 //! Compat matrix 14×4 reuse (headless, bounded, deterministic).
 
-use crate::bounds::{MAX_ACTIONS, MAX_CORPUS_BYTES};
+use crate::bounds::{MAX_ACTIONS, MAX_CORPUS_BYTES, MAX_SNAPSHOT_JSON_BYTES};
 use std::collections::BTreeSet;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,31 +126,87 @@ pub fn check_matrix_invariants() -> Result<(), String> {
     Ok(())
 }
 
+/// Minimal JSON string escape for matrix fields (mirrors the upstream
+/// compat-lab helper; current descriptions are plain ASCII but the helper
+/// keeps the generator correct if text ever gains quotes or controls).
+fn esc(s: &str) -> String {
+    let mut o = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '"' => o.push_str("\\\""),
+            '\\' => o.push_str("\\\\"),
+            '\n' => o.push_str("\\n"),
+            '\r' => o.push_str("\\r"),
+            '\t' => o.push_str("\\t"),
+            c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
+            _ => o.push(ch),
+        }
+    }
+    o
+}
+
 pub fn generate_matrix_json() -> Result<String, String> {
     check_matrix_invariants()?;
     let mut out = String::new();
-    out.push_str("{\n  \"version\": 1,\n  \"matrix_len\": 14,\n  \"entries\": [\n");
+    // TS MatrixJson shape, byte-exact with `JSON.stringify(doc, null, 2)`:
+    // camelCase keys, generated date, bounds block, full per-entry fields.
+    out.push_str("{\n");
+    out.push_str("  \"version\": 1,\n");
+    out.push_str("  \"generated\": \"2026-09-01\",\n");
+    out.push_str("  \"matrixLen\": 14,\n");
+    out.push_str("  \"bounds\": {\n");
+    out.push_str(&format!("    \"MAX_CORPUS_BYTES\": {MAX_CORPUS_BYTES},\n"));
+    out.push_str(&format!("    \"MAX_ACTIONS\": {MAX_ACTIONS},\n"));
+    out.push_str(&format!(
+        "    \"MAX_SNAPSHOT_JSON_BYTES\": {MAX_SNAPSHOT_JSON_BYTES},\n"
+    ));
+    out.push_str("    \"GRID\": \"80x24\",\n");
+    out.push_str("    \"CANONICAL_HASH_VERSION\": 1\n");
+    out.push_str("  },\n");
+    out.push_str("  \"entries\": [\n");
     for (idx, e) in MATRIX.iter().enumerate() {
         let pseudo = e.surface.repeat(8);
-        let len = pseudo.len().min(MAX_CORPUS_BYTES);
+        let bytes = pseudo.as_bytes();
+        let len = bytes.len().min(MAX_CORPUS_BYTES);
         let actions = len.min(MAX_ACTIONS);
-        // deterministic hash: FNV
+        // Deterministic FNV-1a 64-bit over the same pseudo bytes as TS
+        // `deterministicHash` (offset basis + prime, masked to u64).
         let mut h: u64 = 0xcbf29ce484222325;
-        for b in pseudo.as_bytes().iter().take(len) {
+        for b in bytes.iter().take(len) {
             h ^= *b as u64;
             h = h.wrapping_mul(0x100000001b3);
         }
+        out.push_str("    {\n");
+        out.push_str(&format!("      \"surface\": \"{}\",\n", esc(e.surface)));
+        out.push_str(&format!("      \"category\": \"{}\",\n", esc(e.category)));
         out.push_str(&format!(
-            "    {{\"surface\":\"{}\",\"hash\":\"{:016x}\",\"bytes\":{},\"actions\":{}}}",
-            e.surface, h, len, actions
+            "      \"corpusRel\": \"{}\",\n",
+            esc(e.corpus_rel)
         ));
+        out.push_str(&format!(
+            "      \"description\": \"{}\",\n",
+            esc(e.description)
+        ));
+        out.push_str(&format!("      \"bytesLen\": {len},\n"));
+        out.push_str(&format!("      \"actionsLen\": {actions},\n"));
+        out.push_str(&format!("      \"stateHash\": \"{h:016x}\",\n"));
+        out.push_str("      \"width\": 80,\n");
+        out.push_str("      \"height\": 24,\n");
+        out.push_str("      \"generation\": 1,\n");
+        out.push_str("      \"self\": \"PASS\",\n");
+        out.push_str("      \"references\": {\n");
+        out.push_str("        \"ghostty\": \"SKIP\",\n");
+        out.push_str("        \"kitty\": \"SKIP\",\n");
+        out.push_str("        \"wezterm\": \"SKIP\",\n");
+        out.push_str("        \"alacritty\": \"SKIP\"\n");
+        out.push_str("      }\n");
         if idx + 1 < MATRIX.len() {
-            out.push_str(",\n");
+            out.push_str("    },\n");
         } else {
-            out.push('\n');
+            out.push_str("    }\n");
         }
     }
-    out.push_str("  ]\n}\n");
+    out.push_str("  ]\n}");
     if out.len() > 16 * 1024 {
         return Err(format!("json {} > 16 KiB", out.len()));
     }
@@ -172,12 +228,106 @@ mod tests {
     }
 
     #[test]
-    fn json_bounded_deterministic() {
+    fn json_matches_ts_shape() {
+        // H-DEV-05: Rust output must carry the TS MatrixJson shape exactly:
+        // camelCase top-level keys, bounds block, full per-entry fields.
         let j = generate_matrix_json().unwrap();
+        for key in [
+            "\"generated\": \"2026-09-01\"",
+            "\"matrixLen\": 14",
+            "\"bounds\": {",
+            "\"MAX_CORPUS_BYTES\": 8192",
+            "\"MAX_ACTIONS\": 4096",
+            "\"MAX_SNAPSHOT_JSON_BYTES\": 16384",
+            "\"GRID\": \"80x24\"",
+            "\"CANONICAL_HASH_VERSION\": 1",
+            "\"category\": \"shell\"",
+            "\"corpusRel\": \"shell/corpus/",
+            "\"bytesLen\": 40",
+            "\"actionsLen\": 40",
+            "\"stateHash\": \"e01e4dbbf6812045\"",
+            "\"width\": 80",
+            "\"height\": 24",
+            "\"generation\": 1",
+            "\"self\": \"PASS\"",
+            "\"ghostty\": \"SKIP\"",
+        ] {
+            assert!(j.contains(key), "missing {key}");
+        }
+        assert!(!j.contains("matrix_len"), "must use TS camelCase matrixLen");
+    }
+    #[test]
+    fn json_byte_matches_ts_golden() {
+        // Golden comparison: byte-exact equality with the checked-in TS
+        // generator output (tests/fixtures/compat-matrix-golden.json).
+        let golden = include_str!("../../../tests/fixtures/compat-matrix-golden.json");
+        let j = generate_matrix_json().unwrap();
+        assert_eq!(j, golden.trim_end());
+        // Determinism: second generation identical.
+        assert_eq!(generate_matrix_json().unwrap(), j);
         assert!(j.len() < 16 * 1024);
-        let j2 = generate_matrix_json().unwrap();
-        assert_eq!(j, j2);
-        assert!(j.contains("\"surface\":\"shell\""));
-        assert!(j.contains("\"surface\":\"DPI\""));
+    }
+
+    #[test]
+    fn matrix_content_matches_ts() {
+        // Content parity: 14 rows, same order and surface/category/corpus.
+        let expected = [
+            (
+                "shell",
+                "shell",
+                "shell/corpus/02-dogfooding-shell-osc133-osc7-fish.bin",
+            ),
+            ("tmux", "tui", "tui/corpus/01-nvim-tmux.bin"),
+            (
+                "nvim",
+                "tui",
+                "tui/corpus/03-dogfooding-nvim-tmux-fzf-htop-ssh.bin",
+            ),
+            ("fzf", "tui", "tui/corpus/02-htop-fzf.bin"),
+            (
+                "htop",
+                "tui",
+                "tui/corpus/03-dogfooding-nvim-tmux-fzf-htop-ssh.bin",
+            ),
+            (
+                "ssh",
+                "tui",
+                "tui/corpus/03-dogfooding-nvim-tmux-fzf-htop-ssh.bin",
+            ),
+            (
+                "alt-screen",
+                "resize",
+                "resize/corpus/02-dogfooding-resize-dpi-alt-screen.bin",
+            ),
+            (
+                "mouse",
+                "mouse",
+                "mouse/corpus/03-dogfooding-mouse-resize-sgr.bin",
+            ),
+            ("resize", "resize", "resize/corpus/01-resize-reflow.bin"),
+            ("OSC", "osc", "osc/corpus/03-dogfooding-osc7-8-52-title.bin"),
+            ("clipboard", "osc", "osc/corpus/02-clipboard.bin"),
+            (
+                "Kitty",
+                "keyboard",
+                "keyboard/corpus/03-dogfooding-kitty-keyboard-bracketed.bin",
+            ),
+            (
+                "IME",
+                "unicode",
+                "unicode/corpus/09-dogfooding-ime-unicode-dpi.bin",
+            ),
+            (
+                "DPI",
+                "resize",
+                "resize/corpus/02-dogfooding-resize-dpi-alt-screen.bin",
+            ),
+        ];
+        assert_eq!(MATRIX.len(), expected.len());
+        for (entry, (surface, category, corpus)) in MATRIX.iter().zip(expected) {
+            assert_eq!(entry.surface, surface);
+            assert_eq!(entry.category, category);
+            assert_eq!(entry.corpus_rel, corpus);
+        }
     }
 }
