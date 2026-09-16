@@ -33,6 +33,7 @@ import type {
 } from "./inspection.js";
 import { AuthError, peerCredentials, resolveSocketPath } from "./auth.js";
 import { IpcTransport, TransportError } from "./transport.js";
+import { connectLiveSocket } from "./ipc-socket.js";
 import { ProtocolErrorImpl } from "./protocol.js";
 import {
   EXIT_CONFIG,
@@ -441,6 +442,101 @@ function dispatch(client: DevtoolsClient, options: InspectOptions): string {
   }
 }
 
+/**
+ * Live dispatch for `runCliLive`: same selectors as `dispatch`, but each
+ * inspection call goes over the socket via `client.requestLive` instead of
+ * the headless stub. Request ids start at 1 per invocation.
+ */
+async function dispatchLive(
+  client: DevtoolsClient,
+  options: InspectOptions,
+  nowMs: number,
+): Promise<string> {
+  switch (options.selector) {
+    case "plugins": {
+      const response = await client.requestLive(
+        {
+          id: 1,
+          method: "bitty.debug/listPlugins",
+          params: {
+            generation: options.generation,
+          },
+          version: "1.0",
+        },
+        nowMs,
+      );
+      if (response.error !== undefined) {
+        throw new InspectionError(
+          response.error.code,
+          `${response.error.category}: ${response.error.message}`,
+        );
+      }
+      // The accepted result envelope is `{ "plugins": [...] }`
+      // (devtools-rfc v1); fail closed on a mistyped envelope.
+      const envelope = response.result as { plugins?: unknown };
+      if (!Array.isArray(envelope?.plugins)) {
+        throw new InspectionError(
+          "InvalidResult",
+          "listPlugins result.plugins: expected an array",
+        );
+      }
+      const plugins = envelope.plugins as Parameters<typeof renderPlugins>[0];
+      return options.json ? toJson(plugins) : renderPlugins(plugins);
+    }
+    case "subscriptions": {
+      const plugin = requirePlugin(options);
+      const response = await client.requestLive(
+        {
+          id: 1,
+          method: "bitty.debug/listSubscriptions",
+          params: { pluginId: plugin },
+          version: "1.0",
+        },
+        nowMs,
+      );
+      if (response.error !== undefined) {
+        throw new InspectionError(
+          response.error.code,
+          `${response.error.category}: ${response.error.message}`,
+        );
+      }
+      if (!Array.isArray(response.result)) {
+        throw new InspectionError(
+          "InvalidResult",
+          "listSubscriptions result: expected an array",
+        );
+      }
+      const subs = response.result as Parameters<typeof renderSubscriptions>[0];
+      return options.json ? toJson(subs) : renderSubscriptions(subs);
+    }
+    case "budgets": {
+      const plugin = requirePlugin(options);
+      const response = await client.requestLive(
+        {
+          id: 1,
+          method: "bitty.debug/getBudgets",
+          params: {
+            pluginId: plugin,
+            generation: options.generation ?? DEFAULT_GENERATION,
+          },
+          version: "1.0",
+        },
+        nowMs,
+      );
+      if (response.error !== undefined) {
+        throw new InspectionError(
+          response.error.code,
+          `${response.error.category}: ${response.error.message}`,
+        );
+      }
+      const budget = response.result as Parameters<typeof renderBudgets>[0];
+      return options.json ? toJson(budget) : renderBudgets(budget);
+    }
+    default:
+      throw new CliUsageError("no inspect selector");
+  }
+}
+
 export function formatCliError(error: unknown): string {
   if (error instanceof CliUsageError) return error.message;
   if (error instanceof CliConfigError) return error.message;
@@ -479,6 +575,9 @@ export function exitCodeForError(error: unknown): number {
 /**
  * Run the CLI. Returns the process exit code; all I/O goes through
  * {@link CliDeps.runtime} so tests can capture output with an injected transport.
+ *
+ * The live-socket path (`deps.liveSocket === true`, CTX-0036) is async via
+ * `runCliLiveAsync`; use that entry directly when dialing is wanted.
  */
 export function runCli(argv: readonly string[], deps: CliDeps): number {
   const { runtime } = deps;
@@ -543,6 +642,74 @@ export function runCli(argv: readonly string[], deps: CliDeps): number {
       client.disconnect();
     } catch {
       // Disconnect is best-effort; a closed transport must not mask the result.
+    }
+  }
+}
+
+/**
+ * Opt-in live CLI entry (CTX-0036, H-DEV-06): resolve the socket from
+ * flags/environment, attest the endpoint, dial the real `AF_UNIX` socket,
+ * and dispatch the inspect selector over it. Headless `runCli` never calls
+ * this; production wires it behind an explicit flag.
+ */
+export async function runCliLive(
+  argv: readonly string[],
+  deps: CliDeps,
+): Promise<number> {
+  const { runtime } = deps;
+  void connectLiveSocket;
+
+  let command: CliCommand;
+  try {
+    command = parseCliArgs(argv);
+  } catch (error) {
+    runtime.stderr(`bitty-devtools: ${formatCliError(error)}\n\n${USAGE}\n`);
+    return EXIT_USAGE;
+  }
+
+  if (command.kind === "help") {
+    runtime.stdout(`${USAGE}\n`);
+    return EXIT_OK;
+  }
+
+  const options = command.options;
+  let socketPath: string | null;
+  try {
+    socketPath = resolveSocket(options, runtime);
+  } catch (error) {
+    runtime.stderr(`bitty-devtools: ${formatCliError(error)}\n`);
+    return exitCodeForError(error);
+  }
+  if (socketPath === null) {
+    runtime.stderr(
+      "bitty-devtools: no connected Bitty instance; pass --socket <path> or " +
+        "--instance <id>, or set BITTY_SOCKET / BITTY_INSTANCE_ID with " +
+        "XDG_RUNTIME_DIR\n",
+    );
+    return EXIT_RUNTIME;
+  }
+
+  const client = new DevtoolsClient();
+  try {
+    await client.connectLiveSocket(
+      runtime.uid,
+      peerCredentials(runtime.uid, runtime.gid, runtime.pid),
+      runtime.env["XDG_RUNTIME_DIR"],
+      options.instance ?? undefined,
+      socketPath,
+    );
+    client.grantScope("debug.inspect");
+    const output = await dispatchLive(client, options, runtime.now());
+    runtime.stdout(`${output}\n`);
+    return EXIT_OK;
+  } catch (error) {
+    runtime.stderr(`bitty-devtools: ${formatCliError(error)}\n`);
+    return exitCodeForError(error);
+  } finally {
+    try {
+      client.disconnect();
+    } catch {
+      // Disconnect is best-effort; a closed socket must not mask the result.
     }
   }
 }

@@ -196,4 +196,82 @@ describe("DevtoolsClient inspection live IPC wiring", () => {
     // With a scope but no transport the live path fails closed, never mocks.
     expect(() => c.getModifiers()).toThrow("no connected inspection transport");
   });
+
+  test("live socket connect serves listPlugins over a loopback socket", async () => {
+    const proc = globalThis.process as unknown as {
+      getBuiltinModule(id: string): {
+        mkdirSync(p: string, o: unknown): void;
+        chmodSync(p: string, m: number): void;
+        rmSync(p: string, o: unknown): void;
+      };
+    };
+    const fs = proc.getBuiltinModule("node:fs");
+    const dir = `${process.env["XDG_RUNTIME_DIR"] ?? "/tmp"}/bitty-devtools-client-ctx0036-${process.pid}`;
+    fs.mkdirSync(dir, { recursive: true });
+    fs.chmodSync(dir, 0o700);
+    const socketPath = `${dir}/loopback.sock`;
+    const responsePayload = new TextEncoder().encode(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        result: {
+          plugins: [
+            {
+              id: "panel-live",
+              version: "1.0.0",
+              generation: 1,
+              state: "Activated",
+              manifestHash: "sha256:live",
+              capabilities: ["panel.provider"],
+            },
+          ],
+        },
+        version: "1.0",
+      }),
+    );
+    const wire = new Uint8Array(4 + responsePayload.length);
+    new DataView(wire.buffer).setUint32(0, responsePayload.length, false);
+    wire.set(responsePayload, 4);
+    const server = Bun.listen({
+      unix: socketPath,
+      socket: {
+        data(sock, _data) {
+          sock.write(wire);
+        },
+        error() {},
+      },
+    });
+    fs.chmodSync(socketPath, 0o600);
+    try {
+      const c = new DevtoolsClient();
+      const session = await c.connectLiveSocket(
+        1000,
+        peerCredentials(1000, 1000, 1),
+        undefined,
+        undefined,
+        socketPath,
+      );
+      expect(session.connected).toBe(true);
+      expect(c.isIpcConnected()).toBe(true);
+      c.grantScope("debug.inspect");
+      const response = await c.requestLive(
+        {
+          id: 1,
+          method: "bitty.debug/listPlugins",
+          params: {},
+          version: "1.0",
+        },
+        0,
+      );
+      expect(response.id).toBe(1);
+      const plugins = (response.result as { plugins: { id: string }[] })
+        .plugins;
+      expect(plugins[0]!.id).toBe("panel-live");
+      c.disconnect();
+      expect(c.isIpcConnected()).toBe(false);
+    } finally {
+      server.stop(true);
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
