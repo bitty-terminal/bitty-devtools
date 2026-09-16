@@ -78,6 +78,10 @@ and this project adheres to no released version yet.
   (`bun install --frozen-lockfile` passes). CI still installs Bun `1.4.0`
   via `bun-version` (drift noted; workflow untouched by this slice).
 
+- **CI Bun version (CTX-0047)**: align `bun-version` in
+  `.github/workflows/ci.yml` with the `bun@1.4.2` toolchain pin, removing the
+  drift noted by CTX-0046.
+
 - **Governance scaffolding**: MIT [LICENSE](./LICENSE), contribution guide
   ([CONTRIBUTING.md](./CONTRIBUTING.md)) with the Bitty delivery lifecycle and
   Conventional Commits expectation, security policy
