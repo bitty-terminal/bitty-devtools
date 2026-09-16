@@ -116,11 +116,16 @@ pub fn is_valid_method_for_scope(method: &str, scope: DebugScope) -> bool {
         "bitty.debug/startTrace",
         "bitty.debug/stopTrace",
         "bitty.debug/fetchTraceChunk",
+        // CTX-0038 automation frame reads (trace scope + terminal.inspect).
+        "bitty.debug/captureFrame",
+        "bitty.debug/frameHash",
     ];
     let control = [
         "bitty.debug/suspendHandler",
         "bitty.debug/resumePlugin",
         "bitty.debug/disposeGeneration",
+        // CTX-0038 automation input synthesis (control scope + terminal.input).
+        "bitty.debug/synthesizeInput",
     ];
     if inspect.contains(&method) {
         return true;
@@ -166,6 +171,30 @@ mod tests {
             "bitty.debug/suspendHandler",
             DebugScope::Control
         ));
+    }
+
+    #[test]
+    fn scope_matrix_includes_automation() {
+        // CTX-0038: automation drivers were omitted from the scope matrix.
+        // synthesizeInput is control-only; captureFrame and frameHash are
+        // trace-level reads held also by control.
+        assert!(!is_valid_method_for_scope(
+            "bitty.debug/synthesizeInput",
+            DebugScope::Inspect
+        ));
+        assert!(!is_valid_method_for_scope(
+            "bitty.debug/synthesizeInput",
+            DebugScope::Trace
+        ));
+        assert!(is_valid_method_for_scope(
+            "bitty.debug/synthesizeInput",
+            DebugScope::Control
+        ));
+        for method in ["bitty.debug/captureFrame", "bitty.debug/frameHash"] {
+            assert!(!is_valid_method_for_scope(method, DebugScope::Inspect));
+            assert!(is_valid_method_for_scope(method, DebugScope::Trace));
+            assert!(is_valid_method_for_scope(method, DebugScope::Control));
+        }
     }
 
     #[test]
