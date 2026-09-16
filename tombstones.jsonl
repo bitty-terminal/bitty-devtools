@@ -22,3 +22,5 @@
 {"deleted_at":"2026-09-16T13:32:08.641563981+00:00","deleted_by":null,"project_id":"01M0WAMWVXNQJP2SVJ1XE72AEE","reason":"worktree.removed","row_id":"01M2N32YRDT99WADKSBP8J1EQM","table_name":"worktrees"}
 {"deleted_at":"2026-09-16T14:14:21.576487217+00:00","deleted_by":null,"project_id":"01M0WAMWVXNQJP2SVJ1XE72AEE","reason":"worktree.removed","row_id":"01M2N42WTJX9Q1N0TYN0QA29R3","table_name":"worktrees"}
 {"deleted_at":"2026-09-16T14:14:21.596871062+00:00","deleted_by":null,"project_id":"01M0WAMWVXNQJP2SVJ1XE72AEE","reason":"worktree.removed","row_id":"01M2N42XBFV8C2XBQ1WVZ5H375","table_name":"worktrees"}
+{"deleted_at":"2026-09-16T14:50:53.603233298+00:00","deleted_by":null,"project_id":"01M0WAMWVXNQJP2SVJ1XE72AEE","reason":"worktree.removed","row_id":"01M2N583W86SXYJPDBY9R44JY2","table_name":"worktrees"}
+{"deleted_at":"2026-09-16T14:50:53.866871299+00:00","deleted_by":null,"project_id":"01M0WAMWVXNQJP2SVJ1XE72AEE","reason":"worktree.removed","row_id":"01M2N9JE7Z4GD5PBKE0FPP1A79","table_name":"worktrees"}
