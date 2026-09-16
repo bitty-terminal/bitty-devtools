@@ -408,9 +408,9 @@ export class TracingClient {
       "trace.preview",
     );
     const continuation = offset + chunk.length < rec.bytes;
-    if (!previewEqualsExport(preview, preview)) {
-      throw new TracingError("PreviewMismatch", "preview must equal export");
-    }
+    // H-DEV-02 (CTX-0032): was `previewEqualsExport(preview, preview)`, a
+    // self-comparison that always passed; re-derive from the chunk slice.
+    assertPreviewMatchesExport(preview, chunk.slice(0, 512));
     return {
       traceId,
       offset,
@@ -556,8 +556,9 @@ export class TracingClient {
       throw new TracingError("NotFound", `trace ${traceId} not found`);
     const preview = rec.chunks.slice(0, 4).join("").slice(0, 512);
     const { text } = redactPreview(preview, "trace.preview");
-    if (!previewEqualsExport(text, text))
-      throw new TracingError("PreviewMismatch", "preview must equal export");
+    // H-DEV-02 (CTX-0032): was `previewEqualsExport(text, text)`, a
+    // self-comparison that always passed; re-derive from the export bytes.
+    assertPreviewMatchesExport(text, preview);
     return { preview: text, exportBytes: rec.bytes, spoolMode: "0600" };
   }
 
@@ -568,5 +569,30 @@ export class TracingClient {
 
   listTraces(): string[] {
     return [...this.traces.keys()];
+  }
+}
+
+/**
+ * H-DEV-02 (CTX-0032): assert that a redacted preview matches the export it
+ * previews. The two historic call sites compared a value to itself
+ * (`previewEqualsExport(preview, preview)`), so the PreviewMismatch branch
+ * was dead code and any tampered export passed silently.
+ *
+ * Chosen semantics (option b): run the same unredacted export source back
+ * through `redactPreview` and compare redacted-to-redacted. Redaction
+ * legitimately changes bytes, so comparing redacted-preview to raw export
+ * would always throw on redacted content and break honest exports; the
+ * redacted-to-redacted check keeps the byte-for-byte safety intent (a
+ * tampered or diverged source redacts to a different string and throws)
+ * without penalizing redaction itself. The pure `previewEqualsExport` helper
+ * in redaction.ts is unchanged.
+ */
+export function assertPreviewMatchesExport(
+  preview: string,
+  exportSource: string,
+): void {
+  const { text: expected } = redactPreview(exportSource, "trace.preview");
+  if (!previewEqualsExport(preview, expected)) {
+    throw new TracingError("PreviewMismatch", "preview must equal export");
   }
 }

@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { DevtoolsClient } from "../src/client.js";
+import { redactPreview } from "../src/redaction.js";
+import { assertPreviewMatchesExport, TracingError } from "../src/tracing.js";
 import type { PanelRuntimeSnapshot } from "../src/panel-runtime.js";
 
 function snap(): PanelRuntimeSnapshot {
@@ -89,6 +91,34 @@ describe("tracing (debug.trace, opt-in, bounded)", () => {
     expect(chunk.chunk.length).toBe(100);
     expect(chunk.continuation).toBe(false);
     c.stopTrace(start.traceId);
+  });
+
+  test("H-DEV-02: tampered export bytes fail the preview check (no tautology)", () => {
+    // Before the fix both call sites compared the preview to itself, so this
+    // tampered export passed silently. The honest check throws PreviewMismatch.
+    let code: string | null = null;
+    try {
+      assertPreviewMatchesExport("hello", "hello-tampered");
+    } catch (e) {
+      code = e instanceof TracingError ? e.code : null;
+    }
+    expect(code).toBe("PreviewMismatch");
+  });
+
+  test("H-DEV-02: preview matches re-redacted export (redaction-safe)", () => {
+    // Redaction legitimately changes bytes: the check compares
+    // redacted-to-redacted, so any source that redacts to the returned
+    // preview passes, while a diverged source throws.
+    const source = "chunk-bytes-for-export";
+    const { text: preview } = redactPreview(source, "trace.preview");
+    expect(() => assertPreviewMatchesExport(preview, source)).not.toThrow();
+    let code: string | null = null;
+    try {
+      assertPreviewMatchesExport(preview, "diverged-chunk-bytes");
+    } catch (e) {
+      code = e instanceof TracingError ? e.code : null;
+    }
+    expect(code).toBe("PreviewMismatch");
   });
 
   test("cancellation via AbortSignal", () => {
