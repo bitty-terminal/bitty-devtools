@@ -595,6 +595,16 @@ function validatePaste(event: SyntheticPasteEvent): void {
       "paste text must not contain NUL",
     );
   }
+  // Paste newline injection: a pasted LF/CR submits the line in shells that
+  // do not handle bracketed paste, so multi-line paste would execute
+  // unintended input. DevTools never synthesizes multi-line pastes; split
+  // into single-line pastes and explicit key events instead. Fail closed.
+  if (event.text.includes("\n") || event.text.includes("\r")) {
+    throw new AutomationError(
+      "InvalidParams",
+      "paste text must not contain CR or LF",
+    );
+  }
 }
 
 /** Validate one synthetic event against the serving bounds (fail closed). */

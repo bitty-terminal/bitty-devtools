@@ -378,6 +378,35 @@ describe("AutomationClient synthesizeInput", () => {
     expect(transport.requests.length).toBe(0);
   });
 
+  test("rejects paste text with newline injection before dispatch", () => {
+    const transport = new FakeTransport();
+    const client = new AutomationClient(transport, allScopes());
+    // A pasted LF/CR submits the line in shells that do not handle bracketed
+    // paste, so multi-line paste would execute unintended input. Fail closed.
+    for (const text of [
+      "echo hi\nrm -rf /tmp/x\n",
+      "line1\nline2",
+      "a\rb",
+      "a\r\nb",
+    ]) {
+      expectCode(
+        () =>
+          client.synthesizeInput({
+            terminalId: TERMINAL,
+            bearer: BEARER,
+            originLabel: "harness",
+            events: [{ type: "paste", text }],
+          }),
+        "InvalidParams",
+      );
+      expectCode(
+        () => validateSyntheticEvent({ type: "paste", text }),
+        "InvalidParams",
+      );
+    }
+    expect(transport.requests.length).toBe(0);
+  });
+
   test("rejects an out-of-range event before dispatch", () => {
     const transport = new FakeTransport();
     const client = new AutomationClient(transport, allScopes());
