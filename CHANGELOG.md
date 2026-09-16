@@ -73,6 +73,11 @@ and this project adheres to no released version yet.
   `debug.trace` opt-in, `debug.control` audited) and versioned debug
   protocol `1.0`.
 
+- **Toolchain pin (CTX-0046)**: pin `packageManager` to `bun@1.4.2` in
+  `package.json`, matching the workspace toolchain. `bun.lock` is unchanged
+  (`bun install --frozen-lockfile` passes). CI still installs Bun `1.4.0`
+  via `bun-version` (drift noted; workflow untouched by this slice).
+
 - **Governance scaffolding**: MIT [LICENSE](./LICENSE), contribution guide
   ([CONTRIBUTING.md](./CONTRIBUTING.md)) with the Bitty delivery lifecycle and
   Conventional Commits expectation, security policy
