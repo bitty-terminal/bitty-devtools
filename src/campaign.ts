@@ -499,16 +499,122 @@ export type VerbExpectation = {
   /** Whether the verb requires `BITTY_CTL_ELEVATE` authority. */
   elevated: boolean;
   note: string;
+  /**
+   * Whether the row injects keystrokes into a live terminal. Keystroke rows
+   * are excluded from the default matrix (see {@link CTL_VERB_MATRIX}) and
+   * only run when {@link keystrokeProbeOptIn} approves an explicit target.
+   */
+  keystroke?: boolean;
 };
+
+/** Canonical keystroke-injection verb label. */
+export const KEYSTROKE_PROBE_VERB = "terminal.send" as const;
+
+/** Explicit-opt-in swallow for the keystroke-injection probe target. */
+export type KeystrokeProbeTarget = {
+  /** Terminal id to probe, e.g. `t:42`. Must not be the default `t:1`. */
+  terminalId: string;
+  /**
+   * Explicit opt-in marker: the caller must deliberately enable live
+   * keystroke injection (spreading `BITTY_CAMPAIGN_PROBE` text is never
+   * implied by constructing the config).
+   */
+  allowLiveKeystrokes: boolean;
+};
+
+/** Canonical keystroke-injection payload (kept in one place for tests). */
+export const KEYSTROKE_PROBE_PAYLOAD = "echo BITTY_CAMPAIGN_PROBE" as const;
+
+const TERMINAL_ID_RE = /^t:\d+$/;
+
+/**
+ * Validate an explicit keystroke-probe target. Fails closed unless the caller
+ * passes `allowLiveKeystrokes: true` AND a syntactically valid, non-default
+ * terminal id. The bare default `t:1` is always rejected: a live probe must
+ * name a scratch terminal, never whatever happens to be `t:1`.
+ */
+export function assertKeystrokeProbeTarget(target: KeystrokeProbeTarget): void {
+  if (target.allowLiveKeystrokes !== true) {
+    throw new CampaignError(
+      "MissingField",
+      "keystroke probe requires explicit allowLiveKeystrokes: true (never enabled by default)",
+    );
+  }
+  if (
+    typeof target.terminalId !== "string" ||
+    !TERMINAL_ID_RE.test(target.terminalId)
+  ) {
+    throw new CampaignError(
+      "MissingField",
+      `invalid keystroke probe terminal id '${target.terminalId}' (want t:<n>)`,
+    );
+  }
+  if (target.terminalId === "t:1") {
+    throw new CampaignError(
+      "MissingField",
+      "keystroke probe refuses the default t:1 socket (name an explicit scratch terminal)",
+    );
+  }
+}
+
+/**
+ * Opt-in gate for the keystroke-injection probe. Returns true only when the
+ * caller explicitly opts in with `allowLiveKeystrokes: true` and a valid,
+ * non-default terminal id. Never throws; use
+ * {@link assertKeystrokeProbeTarget} for the diagnostic form.
+ */
+export function keystrokeProbeOptIn(
+  target: KeystrokeProbeTarget | undefined,
+): target is KeystrokeProbeTarget {
+  if (target === undefined) return false;
+  try {
+    assertKeystrokeProbeTarget(target);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Build the keystroke-injection row for an approved explicit target. */
+export function keystrokeProbeExpectation(
+  target: KeystrokeProbeTarget,
+): VerbExpectation {
+  assertKeystrokeProbeTarget(target);
+  return {
+    verb: KEYSTROKE_PROBE_VERB,
+    args: [
+      "terminal",
+      "send",
+      target.terminalId,
+      KEYSTROKE_PROBE_PAYLOAD,
+      "--format",
+      "json",
+    ],
+    outcome: "ok",
+    elevated: false,
+    note: "terminal.input, explicit scratch target only",
+    keystroke: true,
+  };
+}
+
+/** True when the row would inject keystrokes into a live terminal. */
+export function isKeystrokeProbeRow(row: VerbExpectation): boolean {
+  return row.keystroke === true || row.verb === KEYSTROKE_PROBE_VERB;
+}
 
 /**
  * The CTX-0320 campaign `ctl` verb matrix. Outcomes are deterministic for the
  * baseline live instance (empty or single-window); denied rows assert the
- * fail-closed elevation policy and no partial state. The matrix includes
- * mutating verbs (`view.split`, `workspace.new`, `terminal.send`), so a live run
- * must target a scratch instance. `workspace.close` and the currently-unfocused
- * `terminal.send` conflict case are environment-dependent and are exercised by
- * the dedicated round-trip/spawn probes instead.
+ * fail-closed elevation policy and no partial state. The matrix is
+ * keystroke-free by default: the legacy `terminal.send` keystroke-injection
+ * probe (H-DEV-04) is NOT a matrix row. It only runs when the caller passes an
+ * explicit opt-in target (see {@link keystrokeProbeExpectation} and the
+ * `keystrokeTarget` option), so a default or headless run never types into
+ * whatever terminal happens to be `t:1`. Mutating rows (`view.split`,
+ * `workspace.new`) remain, so a live run must still target a scratch
+ * instance. `workspace.close` and the currently-unfocused `terminal.send`
+ * conflict case are environment-dependent and are exercised by the dedicated
+ * round-trip/spawn probes instead.
  */
 export const CTL_VERB_MATRIX: readonly VerbExpectation[] = [
   {
@@ -538,20 +644,6 @@ export const CTL_VERB_MATRIX: readonly VerbExpectation[] = [
     outcome: "ok",
     elevated: false,
     note: "read-only inspect",
-  },
-  {
-    verb: "terminal.send",
-    args: [
-      "terminal",
-      "send",
-      "t:1",
-      "echo BITTY_CAMPAIGN_PROBE",
-      "--format",
-      "json",
-    ],
-    outcome: "ok",
-    elevated: false,
-    note: "terminal.input, focused leaf",
   },
   {
     verb: "terminal.text",
@@ -690,14 +782,32 @@ function expectedClassFor(outcome: ExpectedOutcome): string | undefined {
  * Probe one expectation against the dispatcher and return per-verb results.
  * A `usage` row asserts exit 2 with a stderr diagnostic and no envelope; all
  * other rows assert a v1 envelope whose class/code and exit code agree.
+ *
+ * Keystroke-injection rows are refused fail-closed unless the caller approves
+ * them with an explicit opt-in target (see {@link keystrokeProbeOptIn}): a
+ * matrix that smuggles a `terminal.send` row (or the bare
+ * `terminal.send` verb) dispatches nothing and records a `fail` instead of
+ * typing into a live terminal.
  */
 export async function probeEnvelopeConformance(
   dispatcher: CtlDispatcher,
   matrix: readonly VerbExpectation[] = CTL_VERB_MATRIX,
+  opts: { keystrokeTarget?: KeystrokeProbeTarget } = {},
 ): Promise<ProbeResult[]> {
   const results: ProbeResult[] = [];
+  const allowKeystrokes = keystrokeProbeOptIn(opts.keystrokeTarget);
   for (const expectation of matrix) {
     const name = `envelope:${expectation.verb}`;
+    if (isKeystrokeProbeRow(expectation) && !allowKeystrokes) {
+      results.push(
+        fail(
+          name,
+          "keystroke probe refused: pass an explicit keystrokeTarget with allowLiveKeystrokes:true and a non-default terminal id",
+          [`verb=${expectation.verb}`],
+        ),
+      );
+      continue;
+    }
     let result: CtlResult;
     try {
       result = await dispatcher.dispatch({
@@ -1391,21 +1501,39 @@ export type CampaignOptions = {
   closeWorkspaces?: boolean;
   /** Override the verb matrix (tests inject focused matrices). */
   matrix?: readonly VerbExpectation[];
+  /**
+   * Explicit opt-in for the keystroke-injection probe. Absent (or invalid) by
+   * default, so `terminal.send` rows are refused and never dispatched. When
+   * approved, the probe row is appended for the named scratch terminal only.
+   */
+  keystrokeTarget?: KeystrokeProbeTarget;
 };
 
 /**
  * Run the full headless-or-live campaign: envelope conformance, the D1/D2/D3
  * regression guards, the socket preflight, and the non-blocking post-D4 hooks.
+ *
+ * The default path never injects keystrokes: `terminal.send` is not part of
+ * {@link CTL_VERB_MATRIX} and any keystroke row smuggled in via `matrix` is
+ * refused fail-closed (recorded as `fail`, dispatched never) unless
+ * `keystrokeTarget` explicitly opts in with a non-default terminal id.
  */
 export async function runCampaign(
   options: CampaignOptions,
 ): Promise<CampaignReport> {
   const results: ProbeResult[] = [];
+  const allowKeystrokes = keystrokeProbeOptIn(options.keystrokeTarget);
+  const matrix =
+    allowKeystrokes && options.keystrokeTarget !== undefined
+      ? [
+          ...(options.matrix ?? CTL_VERB_MATRIX),
+          keystrokeProbeExpectation(options.keystrokeTarget),
+        ]
+      : (options.matrix ?? CTL_VERB_MATRIX);
   results.push(
-    ...(await probeEnvelopeConformance(
-      options.dispatcher,
-      options.matrix ?? CTL_VERB_MATRIX,
-    )),
+    ...(await probeEnvelopeConformance(options.dispatcher, matrix, {
+      keystrokeTarget: options.keystrokeTarget,
+    })),
   );
   results.push(
     await probeWorkspaceIdRoundTrip(options.dispatcher, {
@@ -1451,6 +1579,12 @@ export type LiveCampaignConfig = ProcessDispatcherConfig & {
   stat?: (dir: string) => SocketDirStat | null;
   /** Set true to also exercise workspace `close` (destructive; live only). */
   closeWorkspaces?: boolean;
+  /**
+   * Explicit opt-in for the keystroke-injection probe. Absent by default, so
+   * even the live entry never types into a terminal unless the caller names
+   * a scratch terminal and passes `allowLiveKeystrokes: true`.
+   */
+  keystrokeTarget?: KeystrokeProbeTarget;
 };
 
 /**
@@ -1476,6 +1610,7 @@ export async function runLiveCampaign(
     dispatcher,
     terminalId: config.terminalId,
     closeWorkspaces: config.closeWorkspaces,
+    keystrokeTarget: config.keystrokeTarget,
     socket,
   });
 }

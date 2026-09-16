@@ -1,9 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import {
   CTL_VERB_MATRIX,
+  KEYSTROKE_PROBE_PAYLOAD,
+  KEYSTROKE_PROBE_VERB,
   CampaignError,
   DEFAULT_ELEVATION_SCOPES,
   EXIT_CONFLICT,
+  assertKeystrokeProbeTarget,
   assertSafeWorkspaceId,
   EXIT_GENERIC,
   EXIT_OK,
@@ -16,6 +19,9 @@ import {
   ScriptedCtlDispatcher,
   detectDebugDump,
   expectedExitForError,
+  isKeystrokeProbeRow,
+  keystrokeProbeExpectation,
+  keystrokeProbeOptIn,
   makeErrorResult,
   makeOkResult,
   makeUsageResult,
@@ -679,5 +685,111 @@ describe("campaign aggregation", () => {
   test("timeout sentinel is distinct from a ctl exit code", () => {
     expect(EXIT_TIMEOUT).not.toBe(EXIT_OK);
     expect(EXIT_TIMEOUT).not.toBe(EXIT_USAGE);
+  });
+});
+
+describe("keystroke-injection probe gating (H-DEV-04)", () => {
+  test("default matrix is keystroke-free (no terminal.send row)", () => {
+    expect(CTL_VERB_MATRIX.some((row) => isKeystrokeProbeRow(row))).toBe(false);
+  });
+
+  test("missing opt-in refuses: nothing dispatched, recorded as fail", async () => {
+    let dispatched = 0;
+    const dispatcher = new ScriptedCtlDispatcher(() => {
+      dispatched += 1;
+      return makeOkResult("core.terminal.send", { ok: true });
+    });
+    const results = await probeEnvelopeConformance(dispatcher, [
+      {
+        verb: KEYSTROKE_PROBE_VERB,
+        args: [
+          "terminal",
+          "send",
+          "t:1",
+          KEYSTROKE_PROBE_PAYLOAD,
+          "--format",
+          "json",
+        ],
+        outcome: "ok",
+        elevated: false,
+        note: "smuggled keystroke row",
+      },
+    ]);
+    expect(dispatched).toBe(0);
+    expect(results.length).toBe(1);
+    expect(results[0]?.status).toBe("fail");
+    expect(results[0]?.detail).toContain("keystrokeTarget");
+  });
+
+  test("bare terminal.send verb is refused without opt-in", async () => {
+    let dispatched = 0;
+    const dispatcher = new ScriptedCtlDispatcher(() => {
+      dispatched += 1;
+      return makeOkResult("core.terminal.send", { ok: true });
+    });
+    const results = await probeEnvelopeConformance(dispatcher, [
+      {
+        verb: KEYSTROKE_PROBE_VERB,
+        args: ["terminal", "send", "t:9", "hi", "--format", "json"],
+        outcome: "ok",
+        elevated: false,
+        note: "bare verb, no keystroke flag",
+      },
+    ]);
+    expect(dispatched).toBe(0);
+    expect(results[0]?.status).toBe("fail");
+  });
+
+  test("default campaign run dispatches no keystrokes", async () => {
+    const seen: string[] = [];
+    const dispatcher = new ScriptedCtlDispatcher((inv) => {
+      seen.push(inv.verb);
+      return makeOkResult(`core.${inv.verb}`, { ok: true });
+    });
+    await runCampaign({ dispatcher });
+    expect(seen).not.toContain(KEYSTROKE_PROBE_VERB);
+  });
+
+  test("opt-in target validation rejects default t:1 and missing flag", () => {
+    expect(keystrokeProbeOptIn(undefined)).toBe(false);
+    expect(
+      keystrokeProbeOptIn({ terminalId: "t:42", allowLiveKeystrokes: false }),
+    ).toBe(false);
+    expect(
+      keystrokeProbeOptIn({ terminalId: "t:1", allowLiveKeystrokes: true }),
+    ).toBe(false);
+    expect(
+      keystrokeProbeOptIn({ terminalId: "nope", allowLiveKeystrokes: true }),
+    ).toBe(false);
+    expect(
+      keystrokeProbeOptIn({ terminalId: "t:42", allowLiveKeystrokes: true }),
+    ).toBe(true);
+    expect(() =>
+      assertKeystrokeProbeTarget({
+        terminalId: "t:1",
+        allowLiveKeystrokes: true,
+      }),
+    ).toThrow("t:1");
+    const row = keystrokeProbeExpectation({
+      terminalId: "t:42",
+      allowLiveKeystrokes: true,
+    });
+    expect(row.args).toContain("t:42");
+    expect(row.args).not.toContain("t:1");
+  });
+
+  test("opted-in campaign appends the probe for the scratch terminal only", async () => {
+    const seen: string[][] = [];
+    const dispatcher = new ScriptedCtlDispatcher((inv) => {
+      seen.push(inv.args);
+      return makeOkResult(`core.${inv.verb}`, { ok: true });
+    });
+    await runCampaign({
+      dispatcher,
+      keystrokeTarget: { terminalId: "t:42", allowLiveKeystrokes: true },
+    });
+    const sends = seen.filter((args) => args[1] === "send");
+    expect(sends.length).toBe(1);
+    expect(sends[0]).toContain("t:42");
   });
 });
