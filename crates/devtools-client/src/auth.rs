@@ -24,6 +24,22 @@ pub const SUN_LEN_MACOS: usize = 104;
 pub const SOCKET_LEAF_DIR: &str = "bitty";
 pub const DEFAULT_INSTANCE_ID: &str = "default";
 
+/// Constant-time token comparison over raw bytes.
+///
+/// Byte length is compared first (fail-closed `false`); the content loop
+/// always accumulates the full XOR difference via `subtle::ConstantTimeEq`
+/// so comparison time does not leak the shared-prefix length of a candidate.
+#[must_use]
+pub fn constant_time_token_eq(a: &str, b: &str) -> bool {
+    use subtle::ConstantTimeEq;
+    let ab = a.as_bytes();
+    let bb = b.as_bytes();
+    if ab.len() != bb.len() {
+        return false;
+    }
+    ab.ct_eq(bb).unwrap_u8() == 1
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PeerCredentials {
     pub uid: u32,
@@ -258,7 +274,11 @@ impl ChildToken {
 
     #[must_use]
     pub fn authorizes(&self, scope: &str, scoped_id: &str, now_ms: u64) -> bool {
-        !self.is_expired(now_ms) && self.scope == scope && self.scoped_id == scoped_id
+        if self.is_expired(now_ms) {
+            return false;
+        }
+        constant_time_token_eq(&self.scope, scope)
+            && constant_time_token_eq(&self.scoped_id, scoped_id)
     }
 }
 
@@ -301,15 +321,35 @@ impl ChildTokenStore {
         scoped_id: &str,
         now_ms: u64,
     ) -> Result<(), AuthError> {
-        let tok = self.tokens.get(token_str).ok_or_else(|| {
-            AuthError::Unauthenticated(format!("unknown child token '{token_str}'"))
-        })?;
+        // Linear scan with a constant-time byte compare per candidate: a
+        // direct map lookup would let hash-probe timing leak how much of the
+        // candidate matches a stored key, so every stored token is compared
+        // and exactly one match is accepted. Scope and expiry are checked
+        // only after the token comparison to keep failure timing uniform.
+        let mut matched: Option<&ChildToken> = None;
+        let mut matches = 0usize;
+        for candidate in self.tokens.values() {
+            if constant_time_token_eq(&candidate.token, token_str) {
+                matched = Some(candidate);
+                matches += 1;
+            }
+        }
+        let tok = match (matched, matches) {
+            (Some(tok), 1) => tok,
+            _ => {
+                return Err(AuthError::Unauthenticated(format!(
+                    "unknown child token '{token_str}'"
+                )));
+            }
+        };
         if tok.is_expired(now_ms) {
             return Err(AuthError::Unauthenticated(format!(
                 "child token '{token_str}' expired"
             )));
         }
-        if tok.scope != scope || tok.scoped_id != scoped_id {
+        if !constant_time_token_eq(&tok.scope, scope)
+            || !constant_time_token_eq(&tok.scoped_id, scoped_id)
+        {
             return Err(AuthError::ScopeDenied(format!(
                 "child token scope {} id {} mismatch",
                 tok.scope, tok.scoped_id
@@ -429,5 +469,71 @@ mod tests {
                 .verify("tok-abc", "terminal.inspect", "t:4", 60_000)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn token_compare_is_constant_time_no_early_exit() {
+        // Equal inputs compare true.
+        assert!(constant_time_token_eq("tok-abc", "tok-abc"));
+        // Same-length mismatches at first, middle, and last byte all read
+        // false through the full accumulator.
+        assert!(!constant_time_token_eq("Xok-abc", "tok-abc"));
+        assert!(!constant_time_token_eq("tok-Xbc", "tok-abc"));
+        assert!(!constant_time_token_eq("tok-abX", "tok-abc"));
+        // Length mismatch reads false without panicking.
+        assert!(!constant_time_token_eq("tok-abc", "tok-abcd"));
+        assert!(!constant_time_token_eq("", "tok-abc"));
+        assert!(!constant_time_token_eq("tok-abc", ""));
+    }
+
+    #[test]
+    fn store_verify_scans_without_map_key_timing_leak() {
+        let mut store = ChildTokenStore::new();
+        store
+            .insert(
+                ChildToken::new(
+                    "tok-abc".into(),
+                    "terminal.inspect".into(),
+                    "t:4".into(),
+                    0,
+                    60_000,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        store
+            .insert(
+                ChildToken::new(
+                    "tok-xyz".into(),
+                    "terminal.inspect".into(),
+                    "t:4".into(),
+                    0,
+                    60_000,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        // Exact match still verifies.
+        assert!(
+            store
+                .verify("tok-abc", "terminal.inspect", "t:4", 500)
+                .is_ok()
+        );
+        // Near-miss candidates (shared prefix, wrong tail) must not verify.
+        assert!(
+            store
+                .verify("tok-abX", "terminal.inspect", "t:4", 500)
+                .is_err()
+        );
+        assert!(
+            store
+                .verify("tok-ab", "terminal.inspect", "t:4", 500)
+                .is_err()
+        );
+        // Scope check still applies after a valid token match.
+        assert!(matches!(
+            store.verify("tok-abc", "terminal.input", "t:4", 500),
+            Err(AuthError::ScopeDenied(_))
+        ));
     }
 }
