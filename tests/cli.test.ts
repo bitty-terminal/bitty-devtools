@@ -7,6 +7,7 @@ import {
   exitCodeForError,
   parseCliArgs,
   runCli,
+  runCliLive,
 } from "../src/cli.js";
 import type { CliRuntime } from "../src/cli.js";
 import { peerCredentials } from "../src/auth.js";
@@ -30,10 +31,16 @@ type Harness = {
 function makeHarness(transport?: IpcTransport): Harness {
   const out: string[] = [];
   const err: string[] = [];
+  const proc = globalThis.process as unknown as {
+    getuid?: () => number;
+    getgid?: () => number;
+  };
+  const uid = typeof proc.getuid === "function" ? proc.getuid() : 1000;
+  const gid = typeof proc.getgid === "function" ? proc.getgid() : 1000;
   const runtime: CliRuntime = {
     env: {},
-    uid: 1000,
-    gid: 1000,
+    uid,
+    gid,
     pid: 42,
     now: () => 0,
     stdout: (text) => out.push(text),
@@ -52,10 +59,11 @@ class RecordingTransport extends IpcTransport {
 }
 
 function makeTransport(): RecordingTransport {
+  const { uid, gid, pid } = makeHarness().deps.runtime;
   return new RecordingTransport({
-    runtimeUid: 1000,
-    socketPath: "/run/user/1000/bitty/default.sock",
-    peer: peerCredentials(1000, 1000, 42),
+    runtimeUid: uid,
+    socketPath: `/run/user/${uid}/bitty/default.sock`,
+    peer: peerCredentials(uid, gid, pid),
   });
 }
 
@@ -400,6 +408,74 @@ describe("runCli fail-closed connection handling", () => {
     const code = runCli(["inspect", "--plugins"], harness.deps);
     expect(code).toBe(EXIT_CONFIG);
     expect(harness.err.join("")).toContain("BITTY_SOCKET");
+  });
+});
+
+describe("runCliLive over a loopback socket (CTX-0036)", () => {
+  test("inspect --plugins renders live rows end to end", async () => {
+    const proc = globalThis.process as unknown as {
+      getBuiltinModule(id: string): {
+        mkdirSync(p: string, o: unknown): void;
+        chmodSync(p: string, m: number): void;
+        rmSync(p: string, o: unknown): void;
+      };
+    };
+    const fs = proc.getBuiltinModule("node:fs");
+    const dir = `${process.env["XDG_RUNTIME_DIR"] ?? "/tmp"}/bitty-devtools-cli-ctx0036-${process.pid}`;
+    fs.mkdirSync(dir, { recursive: true });
+    fs.chmodSync(dir, 0o700);
+    const socketPath = `${dir}/loopback.sock`;
+    const responsePayloadBytes = new TextEncoder().encode(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        result: { plugins: [pluginPayload()] },
+        version: "1.0",
+      }),
+    );
+    const wire = new Uint8Array(4 + responsePayloadBytes.length);
+    new DataView(wire.buffer).setUint32(0, responsePayloadBytes.length, false);
+    wire.set(responsePayloadBytes, 4);
+    const server = Bun.listen({
+      unix: socketPath,
+      socket: {
+        data(sock, _data) {
+          sock.write(wire);
+        },
+        error() {},
+      },
+    });
+    fs.chmodSync(socketPath, 0o600);
+    try {
+      const harness = makeHarness();
+      harness.deps.runtime.env = { BITTY_SOCKET: socketPath };
+      const code = await runCliLive(["inspect", "--plugins"], harness.deps);
+      expect(code).toBe(EXIT_OK);
+      expect(harness.err).toEqual([]);
+      expect(harness.out.join("")).toContain("plugin-a");
+      expect(harness.out.join("")).toContain("Activated");
+    } finally {
+      server.stop(true);
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("missing socket attestation fails closed with exit 7, never a throw", async () => {
+    const harness = makeHarness();
+    harness.deps.runtime.env = {
+      BITTY_SOCKET: `/tmp/bitty-devtools-cli-ctx0036-missing-${process.pid}.sock`,
+    };
+    let caught: unknown = null;
+    let code = -1;
+    try {
+      code = await runCliLive(["inspect", "--plugins"], harness.deps);
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeNull();
+    expect(code).toBe(EXIT_PERM);
+    expect(harness.out).toEqual([]);
+    expect(harness.err.join("")).toContain("Unauthenticated");
   });
 });
 

@@ -20,6 +20,7 @@ pub mod bounds;
 pub mod compat;
 pub mod control;
 pub mod inspection;
+pub mod ipc_socket;
 pub mod protocol;
 pub mod redaction;
 pub mod tracing;

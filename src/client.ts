@@ -40,8 +40,13 @@ import {
 } from "./protocol.js";
 import { generateMatrixJson } from "./compat-matrix.js";
 import { IpcTransport } from "./transport.js";
+import type { IpcRequest, IpcResponse } from "./transport.js";
+import { TransportError } from "./transport.js";
 import { resolveSocketPath } from "./auth.js";
 import type { PeerCredentials } from "./auth.js";
+import { decodeResponse } from "./protocol.js";
+import { connectLiveSocket, resolveLiveSocketEndpoint } from "./ipc-socket.js";
+import type { LiveSocketConnection } from "./ipc-socket.js";
 
 export type ClientConfig = {
   maxConnections?: number;
@@ -67,6 +72,7 @@ export class DevtoolsClient {
   private readonly tracing: TracingClient;
   private readonly control: ControlClient;
   private transport: IpcTransport | null = null;
+  private liveSocket: LiveSocketConnection | null = null;
   private readonly config: ClientConfig;
 
   /**
@@ -179,7 +185,92 @@ export class DevtoolsClient {
     return this.connectWithTransport(t);
   }
 
+  /**
+   * Live OS-socket path for CTX-0036 (H-DEV-06): attest the endpoint and
+   * dial the real `AF_UNIX` socket, then serve inspection over it.
+   *
+   * Unlike `connectLive` (which only verifies caller-supplied mode values
+   * on the headless stub), this opens a live connection: each inspection
+   * request writes one framed request and decodes the next framed response.
+   * The stub transport stays attached for rate limiting and scope checks;
+   * the socket supplies the bytes. Opt-in and async: headless callers keep
+   * using `connect` / `connectWithTransport`.
+   */
+  async connectLiveSocket(
+    runtimeUid: number,
+    peer: PeerCredentials,
+    xdgRuntimeDir?: string,
+    instanceId?: string,
+    socketPath?: string,
+  ): Promise<SessionState> {
+    const endpoint = resolveLiveSocketEndpoint({
+      socketPath,
+      runtimeUid,
+      xdgRuntimeDir,
+      instanceId,
+    });
+    const live = await connectLiveSocket({
+      socketPath: endpoint.socketPath,
+      runtimeUid,
+    });
+    const t = new IpcTransport({
+      runtimeUid,
+      socketPath: endpoint.socketPath,
+      peer,
+    });
+    t.connect();
+    this.transport = t;
+    this.liveSocket = live;
+    this.session.connected = true;
+    this.session.scopes.clear();
+    this.session.transport = t;
+    this.session.socketPath = endpoint.socketPath;
+    return { ...this.session, scopes: new Set(this.session.scopes) };
+  }
+
+  /**
+   * One live request/response round trip over the socket opened by
+   * `connectLiveSocket`. Encodes the request with the shared framing,
+   * writes it, decodes the next framed response, and validates the
+   * envelope (id match + `decodeResponse`).
+   */
+  async requestLive(req: IpcRequest, nowMs: number): Promise<IpcResponse> {
+    const live = this.liveSocket;
+    const transport = this.transport;
+    if (live === null || transport === null || !live.isOpen()) {
+      throw new Error(
+        "no live socket connection: call connectLiveSocket first",
+      );
+    }
+    transport.verifyPeerForPrivilegedAction();
+    transport.getRateLimiter().check(nowMs);
+    const frames = transport.encodeRequest(req);
+    let raw: Uint8Array | null = null;
+    for (const frame of frames) {
+      raw = await live.requestResponse(frame.slice(4), nowMs);
+    }
+    if (raw === null) {
+      throw new Error(`no response for id ${req.id} (${req.method})`);
+    }
+    const response: IpcResponse = decodeResponse(new TextDecoder().decode(raw));
+    if (response.id !== req.id) {
+      throw new TransportError(
+        "InvalidFrame",
+        `response id ${response.id} != request id ${req.id}`,
+      );
+    }
+    return response;
+  }
+
   disconnect(): void {
+    if (this.liveSocket !== null) {
+      try {
+        this.liveSocket.close();
+      } catch {
+        // Close is best-effort; a closed socket must not mask disconnect.
+      }
+      this.liveSocket = null;
+    }
     if (this.transport !== null) {
       this.transport.disconnect();
       this.transport = null;
@@ -191,6 +282,13 @@ export class DevtoolsClient {
   }
 
   isIpcConnected(): boolean {
+    if (this.liveSocket !== null) {
+      return (
+        this.transport !== null &&
+        this.transport.isConnected() &&
+        this.liveSocket.isOpen()
+      );
+    }
     return this.transport !== null && this.transport.isConnected();
   }
 
