@@ -120,12 +120,23 @@ export function assertStringBounded(
 export function truncateToBytes(input: string, maxBytes: number): string {
   const bytes = new TextEncoder().encode(input);
   if (bytes.length <= maxBytes) return input;
-  // Truncate at char boundary without splitting UTF-8
-  let truncated = input;
-  while (new TextEncoder().encode(truncated).length > maxBytes) {
-    truncated = truncated.slice(0, -1);
+  // Single-pass cut at maxBytes, then back off to a UTF-8 char boundary.
+  // Time O(N) for the one encode plus O(1) back-off (at most 3 continuation
+  // bytes precede the split lead); space O(N) for the encoded copy.
+  let end = Math.max(0, maxBytes);
+  const cut: number | undefined = end < bytes.length ? bytes[end] : undefined;
+  if (end > 0 && cut !== undefined && (cut & 0xc0) === 0x80) {
+    // The cut split a multi-byte sequence: walk back past its continuation
+    // bytes, then drop the lead byte. Never splits a surrogate pair, since
+    // a whole UTF-8 sequence (hence whole code point) is dropped at once.
+    while (end > 0) {
+      const prev: number | undefined = bytes[end - 1];
+      if (prev === undefined || (prev & 0xc0) !== 0x80) break;
+      end -= 1;
+    }
+    end -= 1;
   }
-  return truncated;
+  return new TextDecoder().decode(bytes.slice(0, end));
 }
 
 export function truncateToChars(

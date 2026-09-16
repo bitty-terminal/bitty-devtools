@@ -33,4 +33,41 @@ describe("bounds", () => {
     const t = truncateToBytes(s, 8192);
     expect(new TextEncoder().encode(t).length <= 8192).toBe(true);
   });
+
+  test("truncateToBytes exact-length input is a fast-path identity", () => {
+    const s = "ab".concat("é"); // 4 bytes
+    expect(new TextEncoder().encode(s).length).toBe(4);
+    expect(truncateToBytes(s, 4)).toBe(s);
+    expect(truncateToBytes("", 0)).toBe("");
+  });
+
+  test("truncateToBytes never splits emoji or CJK sequences", () => {
+    const enc = new TextEncoder();
+    // "a😀b": bytes 1 + 4 + 1; maxBytes 2..4 must stop after "a"
+    expect(truncateToBytes("a😀b", 2)).toBe("a");
+    expect(truncateToBytes("a😀b", 4)).toBe("a");
+    expect(truncateToBytes("a😀b", 5)).toBe("a😀");
+    // CJK (3 bytes each): 7-byte cap keeps 2 chars (6 bytes)
+    const cjk = truncateToBytes("日本語テスト", 7);
+    expect(enc.encode(cjk).length).toBeLessThanOrEqual(7);
+    expect(cjk).toBe("日本");
+    expect(truncateToBytes("日本語テスト", 9)).toBe("日本語");
+    for (const out of [
+      truncateToBytes("a😀b", 2),
+      truncateToBytes("日本語テスト", 7),
+    ]) {
+      // No dangling surrogate halves in the output
+      expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(out)).toBe(false);
+      expect(/(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(out)).toBe(false);
+    }
+  });
+
+  test("truncateToBytes zero cap and lone surrogates stay bounded", () => {
+    const enc = new TextEncoder();
+    expect(truncateToBytes("hello", 0)).toBe("");
+    // Lone surrogates encode to U+FFFD (3 bytes); output must stay in-budget
+    const lone = truncateToBytes("x�", 2);
+    expect(enc.encode(lone).length).toBeLessThanOrEqual(2);
+    expect(lone).toBe("x");
+  });
 });

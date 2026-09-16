@@ -102,4 +102,19 @@ mod tests {
         let t = truncate_to_bytes(&s, 8192);
         assert!(t.len() <= 8192);
     }
+
+    #[test]
+    fn truncate_bytes_multibyte_boundary_parity() {
+        // Mirrors the TypeScript truncateToBytes boundary contract:
+        // never split a multi-byte sequence, stay within budget.
+        assert_eq!(truncate_to_bytes("a😀b", 2), "a");
+        assert_eq!(truncate_to_bytes("a😀b", 4), "a");
+        assert_eq!(truncate_to_bytes("a😀b", 5), "a😀");
+        assert_eq!(truncate_to_bytes("日本語テスト", 7), "日本");
+        assert_eq!(truncate_to_bytes("日本語テスト", 9), "日本語");
+        assert_eq!(truncate_to_bytes("hello", 0), "");
+        let exact = "abé";
+        assert_eq!(exact.len(), 4);
+        assert_eq!(truncate_to_bytes(exact, 4), exact);
+    }
 }
