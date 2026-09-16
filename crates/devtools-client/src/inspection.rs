@@ -55,6 +55,8 @@ pub fn list_subscriptions(
     if plugin_id.is_empty() || plugin_id.len() > 128 {
         return Err(InspectionError::InvalidId("pluginId 1..128".to_string()));
     }
+    // Second entry uses a neutral, non-personal plugin namespace so no
+    // developer handle is embedded in shipped fixtures.
     Ok(vec![
         SubscriptionInfo {
             event_type: "bitty.panel:mounted".to_string(),
@@ -64,7 +66,7 @@ pub fn list_subscriptions(
             policy: "DropOldest".to_string(),
         },
         SubscriptionInfo {
-            event_type: "xuepoo.git:branch-changed".to_string(),
+            event_type: "example.git:branch-changed".to_string(),
             queue_depth: 2,
             queued_bytes: 256,
             drop_count: 1,

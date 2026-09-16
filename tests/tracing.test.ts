@@ -47,7 +47,7 @@ describe("tracing (debug.trace, opt-in, bounded)", () => {
     c.connect();
     c.grantScope("debug.trace");
     const batch = c.streamEvents(
-      ["bitty.panel:mounted", "xuepoo.git:branch-changed"],
+      ["bitty.panel:mounted", "example.git:branch-changed"],
       {
         maxEvents: 32,
         maxBytes: 8192,
