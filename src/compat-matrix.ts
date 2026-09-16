@@ -132,6 +132,16 @@ export const REFERENCE_TERMS: readonly string[] = [
 
 export const MATRIX_LEN = 14 as const;
 
+/**
+ * Tracks upstream bitty-term-state CANONICAL_HASH_VERSION (live canonical,
+ * now 5; upstream bitty-compat-lab emits its EXPECTED_HASH_VERSION).
+ * Divergence: devtools `stateHash` here is FNV-1a over surface-name
+ * pseudo-bytes for headless shape-parity, NOT the real canonical stream; the
+ * version field tracks upstream so consumers can tell which canonical era the
+ * matrix was generated against.
+ */
+export const CANONICAL_HASH_VERSION = 5 as const;
+
 export type MatrixJsonEntry = MatrixEntry & {
   bytesLen: number;
   actionsLen: number;
@@ -226,7 +236,10 @@ export function generateMatrixJson(): string {
       MAX_ACTIONS: BOUNDS.MAX_ACTIONS,
       MAX_SNAPSHOT_JSON_BYTES: BOUNDS.MAX_SNAPSHOT_JSON_BYTES,
       GRID: "80x24",
-      CANONICAL_HASH_VERSION: 1,
+      // Tracks upstream CANONICAL_HASH_VERSION (see CANONICAL_HASH_VERSION
+      // above); the stateHash values are headless pseudo-hashes, not the
+      // real canonical stream.
+      CANONICAL_HASH_VERSION,
     },
     entries,
   };
