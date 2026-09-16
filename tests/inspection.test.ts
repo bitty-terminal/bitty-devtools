@@ -165,7 +165,7 @@ function makeSnapshot(): PanelRuntimeSnapshot {
     ],
     panelsPerWorkspace: new Map([[1 as unknown as never, 1]]),
     totalPanels: 1,
-    topics: ["xuepoo.git:branch-changed" as never],
+    topics: ["example.git:branch-changed" as never],
     overlays: [],
     config: {
       maxPanelsPerWorkspace: 16,

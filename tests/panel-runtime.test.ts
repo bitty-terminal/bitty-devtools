@@ -33,8 +33,8 @@ describe("panel-runtime re-use", () => {
   });
 
   test("EventTopic grammar bounded 64", () => {
-    expect(parseEventTopic("xuepoo.git:branch-changed")).toBe(
-      "xuepoo.git:branch-changed",
+    expect(parseEventTopic("example.git:branch-changed")).toBe(
+      "example.git:branch-changed",
     );
     expect(() => parseEventTopic("badtopic")).toThrow("invalid topic");
     expect(() => parseEventTopic("Owner.name:topic")).toThrow("invalid topic");

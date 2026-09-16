@@ -760,7 +760,9 @@ export class InspectionClient {
         };
       });
     }
-    // Bounded stub: per-panel 32 topics max, per subscription 64
+    // Bounded stub: per-panel 32 topics max, per subscription 64.
+    // The second entry uses a neutral, non-personal plugin namespace so no
+    // developer handle is embedded in shipped fixtures.
     const subs: SubscriptionInfo[] = [
       {
         eventType: "bitty.panel:mounted",
@@ -770,7 +772,7 @@ export class InspectionClient {
         policy: "DropOldest",
       },
       {
-        eventType: "xuepoo.git:branch-changed",
+        eventType: "example.git:branch-changed",
         queueDepth: 2,
         queuedBytes: 256,
         dropCount: 1,
