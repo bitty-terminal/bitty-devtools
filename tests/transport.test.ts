@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test, spyOn } from "bun:test";
 import {
   Frame,
   Framer,
@@ -180,6 +180,45 @@ describe("transport framing (phase 2, live runtime, bounded 256 KiB IPC / 1 MiB 
     );
     expect(res.result).toEqual({ ok: true });
     expect(t.outgoingLen()).toBe(1);
+  });
+
+  test("windows pipe identity is verified at connect (CTX-0043)", () => {
+    const peer = peerCredentials(1000, 1000, 1);
+    const t = new IpcTransport({
+      runtimeUid: 1000,
+      socketPath: "\\\\.\\pipe\\bitty-default",
+      peer,
+      windowsPeerSid: 1001,
+      windowsRuntimeSid: 1000,
+    });
+    expect(() => t.connect()).toThrow("pipe peer sid");
+    expect(t.isConnected()).toBe(false);
+  });
+
+  test("windows pipe verify is called on connect and per action (CTX-0043)", async () => {
+    const auth = await import("../src/auth.js");
+    const peer = peerCredentials(1000, 1000, 1);
+    const spy = spyOn(auth, "verifyWindowsPipe");
+    try {
+      const t = new IpcTransport({
+        runtimeUid: 1000,
+        socketPath: "\\\\.\\pipe\\bitty-default",
+        peer,
+        windowsPeerSid: 1000,
+        windowsRuntimeSid: 1000,
+      });
+      t.connect();
+      expect(spy).toHaveBeenCalledTimes(1);
+      expect(spy).toHaveBeenCalledWith(1000, 1000);
+      t.sendRequest(
+        { id: 1, method: "bitty.debug/listPlugins", version: "1.0" },
+        0,
+      );
+      expect(spy.mock.calls.length >= 2).toBe(true);
+      expect(spy.mock.calls[spy.mock.calls.length - 1]).toEqual([1000, 1000]);
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   test("request fails closed when the response id does not match", () => {
