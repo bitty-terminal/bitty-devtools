@@ -4,6 +4,7 @@ import {
   CampaignError,
   DEFAULT_ELEVATION_SCOPES,
   EXIT_CONFLICT,
+  assertSafeWorkspaceId,
   EXIT_GENERIC,
   EXIT_OK,
   EXIT_PERM,
@@ -262,6 +263,89 @@ describe("workspace id round-trip guard (D2)", () => {
   test("passes when listed ids are accepted by focus", async () => {
     const result = await probeWorkspaceIdRoundTrip(campaignDispatcher());
     expect(result.status).toBe("pass");
+  });
+
+  test("flag-shaped listed id never reaches focus argv (injection)", async () => {
+    // A hostile `workspace list` response (untrusted observation data) must
+    // not smuggle a flag into the spawned `workspace focus` argv. The probe
+    // fails closed instead of dispatching the injection.
+    const seen: CtlInvocation[] = [];
+    const dispatcher = new ScriptedCtlDispatcher((inv) => {
+      seen.push(inv);
+      if (inv.verb === "workspace.list.baseline") {
+        return makeOkResult("core.workspace.list", {
+          workspaces: ["ws1"],
+          active: 1,
+          count: 1,
+        });
+      }
+      if (inv.verb === "workspace.new") {
+        return makeOkResult("core.workspace.new", { created: "ws:2" });
+      }
+      if (inv.verb === "workspace.list.after-new") {
+        return makeOkResult("core.workspace.list", {
+          workspaces: ["--socket=/tmp/evil.sock"],
+          active: 1,
+          count: 1,
+        });
+      }
+      throw new Error(`unexpected dispatch ${inv.verb}`);
+    });
+    const result = await probeWorkspaceIdRoundTrip(dispatcher);
+    expect(result.status).toBe("fail");
+    expect(result.detail).toContain("is not a workspace id");
+    expect(seen.some((inv) => inv.verb === "workspace.focus")).toBe(false);
+  });
+
+  test("bare-dash and empty listed ids never reach focus argv", async () => {
+    for (const hostile of ["-f", "--format=json", ""]) {
+      const seen: CtlInvocation[] = [];
+      const dispatcher = new ScriptedCtlDispatcher((inv) => {
+        seen.push(inv);
+        if (inv.verb === "workspace.list.baseline") {
+          return makeOkResult("core.workspace.list", {
+            workspaces: ["ws1"],
+            active: 1,
+            count: 1,
+          });
+        }
+        if (inv.verb === "workspace.new") {
+          return makeOkResult("core.workspace.new", { created: "ws:2" });
+        }
+        if (inv.verb === "workspace.list.after-new") {
+          return makeOkResult("core.workspace.list", {
+            workspaces: [hostile],
+            active: 1,
+            count: 1,
+          });
+        }
+        throw new Error(`unexpected dispatch ${inv.verb}`);
+      });
+      const result = await probeWorkspaceIdRoundTrip(dispatcher);
+      expect(result.status).toBe("fail");
+      expect(result.detail).toContain("is not a workspace id");
+      expect(seen.some((inv) => inv.verb === "workspace.focus")).toBe(false);
+    }
+  });
+
+  test("assertSafeWorkspaceId accepts canonical ids, rejects the rest", () => {
+    expect(() => assertSafeWorkspaceId("ws:1")).not.toThrow();
+    expect(() => assertSafeWorkspaceId("ws12")).not.toThrow();
+    for (const hostile of [
+      "--socket=x",
+      "-f",
+      "--format=json",
+      "ws:",
+      "ws:abc",
+      "ws:1;rm -rf /tmp/x",
+      "ws:1 ",
+      " ws:1",
+      "../ws:1",
+      "ws:007;echo",
+      "",
+    ]) {
+      expect(() => assertSafeWorkspaceId(hostile)).toThrow(CampaignError);
+    }
   });
 
   test("fails when a listed id is rejected by focus (D2 repro)", async () => {
