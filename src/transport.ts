@@ -399,6 +399,15 @@ export type IpcTransportConfig = {
   sockOwnerUid?: number;
   peer?: PeerCredentials | null;
   capacity?: number;
+  /**
+   * Windows named-pipe peer identity (CTX-0043). When both SIDs are present
+   * the transport verifies the pipe peer instead of the Unix endpoint checks
+   * (Unix mode/owner checks are meaningless on a named pipe). Absent on
+   * Unix; injected headlessly in tests since the pipe path cannot execute
+   * on Linux (Windows-CI item).
+   */
+  windowsPeerSid?: bigint | number;
+  windowsRuntimeSid?: bigint | number;
 };
 
 export type IpcRequest = {
@@ -422,13 +431,21 @@ export class IpcTransport {
   private connected = false;
   private requests = 0;
   private readonly peer: PeerCredentials | null;
-  private readonly config: Required<Omit<IpcTransportConfig, "peer">> & {
+  private readonly config: Required<
+    Omit<IpcTransportConfig, "peer" | "windowsPeerSid" | "windowsRuntimeSid">
+  > & {
     peer: PeerCredentials | null;
+    windowsPeerSid?: bigint | number;
+    windowsRuntimeSid?: bigint | number;
   };
 
   constructor(config: IpcTransportConfig) {
-    const full: Required<Omit<IpcTransportConfig, "peer">> & {
+    const full: Required<
+      Omit<IpcTransportConfig, "peer" | "windowsPeerSid" | "windowsRuntimeSid">
+    > & {
       peer: PeerCredentials | null;
+      windowsPeerSid?: bigint | number;
+      windowsRuntimeSid?: bigint | number;
     } = {
       runtimeUid: config.runtimeUid,
       socketPath: config.socketPath,
@@ -438,6 +455,8 @@ export class IpcTransport {
       sockOwnerUid: config.sockOwnerUid ?? config.runtimeUid,
       peer: config.peer ?? null,
       capacity: config.capacity ?? DEFAULT_TRANSPORT_CAPACITY,
+      windowsPeerSid: config.windowsPeerSid,
+      windowsRuntimeSid: config.windowsRuntimeSid,
     };
     this.config = full;
     this.stub = new StdioTransportStub(full.capacity);
@@ -462,7 +481,13 @@ export class IpcTransport {
   }
 
   connect(nowMs?: number): void {
-    if (this.peer !== null) {
+    if (this.isWindowsPipe()) {
+      // CTX-0043: named-pipe peers carry SIDs, not Unix modes/owners.
+      this.checkWindowsPipe(
+        this.config.windowsPeerSid as bigint | number,
+        this.config.windowsRuntimeSid as bigint | number,
+      );
+    } else if (this.peer !== null) {
       verifyUnixEndpoint(
         this.config.runtimeUid,
         this.peer,
@@ -510,6 +535,14 @@ export class IpcTransport {
   }
 
   verifyPeerForPrivilegedAction(): void {
+    if (this.isWindowsPipe()) {
+      // CTX-0043: every privileged action re-verifies the pipe peer SID.
+      this.checkWindowsPipe(
+        this.config.windowsPeerSid as bigint | number,
+        this.config.windowsRuntimeSid as bigint | number,
+      );
+      return;
+    }
     if (this.peer !== null) {
       verifyPeerUid(this.peer, this.config.runtimeUid);
     }
@@ -610,5 +643,12 @@ export class IpcTransport {
     runtimeSid: bigint | number,
   ): void {
     verifyWindowsPipe(peerSid, runtimeSid);
+  }
+
+  private isWindowsPipe(): boolean {
+    return (
+      this.config.windowsPeerSid !== undefined &&
+      this.config.windowsRuntimeSid !== undefined
+    );
   }
 }

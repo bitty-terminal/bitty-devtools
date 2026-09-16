@@ -467,6 +467,12 @@ pub struct IpcTransport {
     sock_mode: u32,
     dir_owner_uid: u32,
     sock_owner_uid: u32,
+    /// Windows named-pipe peer identity (CTX-0043). When both SIDs are
+    /// present the transport verifies the pipe peer instead of the Unix
+    /// endpoint checks. Injected headlessly in tests; the live pipe path
+    /// cannot execute on Linux (Windows-CI item).
+    windows_peer_sid: Option<u64>,
+    windows_runtime_sid: Option<u64>,
 }
 
 impl IpcTransport {
@@ -493,7 +499,35 @@ impl IpcTransport {
             sock_mode,
             dir_owner_uid,
             sock_owner_uid,
+            windows_peer_sid: None,
+            windows_runtime_sid: None,
         }
+    }
+
+    /// Windows named-pipe transport (CTX-0043): peer identity is a SID pair
+    /// verified via [`verify_windows_pipe`] at connect and per privileged
+    /// action, instead of the Unix endpoint checks.
+    pub fn with_windows_pipe(
+        runtime_uid: u32,
+        socket_path: String,
+        peer: Option<PeerCredentials>,
+        peer_sid: u64,
+        runtime_sid: u64,
+        capacity: usize,
+    ) -> Self {
+        let mut transport = Self::new(
+            runtime_uid,
+            socket_path,
+            peer,
+            0o700,
+            0o600,
+            runtime_uid,
+            runtime_uid,
+            capacity,
+        );
+        transport.windows_peer_sid = Some(peer_sid);
+        transport.windows_runtime_sid = Some(runtime_sid);
+        transport
     }
 
     pub fn with_defaults(
@@ -524,7 +558,12 @@ impl IpcTransport {
     }
 
     pub fn connect(&mut self) -> Result<(), TransportError> {
-        if let Some(peer) = self.peer {
+        if let (Some(peer_sid), Some(runtime_sid)) =
+            (self.windows_peer_sid, self.windows_runtime_sid)
+        {
+            // CTX-0043: named-pipe peers carry SIDs, not Unix modes/owners.
+            self.verify_windows_pipe(peer_sid, runtime_sid)?;
+        } else if let Some(peer) = self.peer {
             verify_unix_endpoint(
                 self.runtime_uid,
                 peer,
@@ -571,6 +610,12 @@ impl IpcTransport {
     }
 
     pub fn verify_peer_for_privileged(&self) -> Result<(), TransportError> {
+        if let (Some(peer_sid), Some(runtime_sid)) =
+            (self.windows_peer_sid, self.windows_runtime_sid)
+        {
+            // CTX-0043: every privileged action re-verifies the pipe peer SID.
+            return self.verify_windows_pipe(peer_sid, runtime_sid);
+        }
         if let Some(peer) = self.peer {
             verify_peer_uid(peer, self.runtime_uid)
                 .map_err(|e| TransportError::Unauthenticated(e.to_string()))?;
@@ -692,6 +737,40 @@ mod tests {
             Some(peer),
         );
         assert!(t.connect().is_err());
+    }
+
+    #[test]
+    fn windows_pipe_mismatch_fails_at_connect() {
+        // CTX-0043: pipe verify must run at connect, not stay dead code.
+        let peer = PeerCredentials::new(1000, 1000, 1);
+        let mut t = IpcTransport::with_windows_pipe(
+            1000,
+            "\\\\.\\pipe\\bitty-default".into(),
+            Some(peer),
+            1001,
+            1000,
+            DEFAULT_TRANSPORT_CAPACITY,
+        );
+        let err = t.connect().expect_err("foreign SID must fail closed");
+        assert!(err.to_string().contains("pipe peer sid"), "{err}");
+        assert!(!t.is_connected());
+    }
+
+    #[test]
+    fn windows_pipe_verified_at_connect_and_per_action() {
+        // CTX-0043: matching SIDs pass connect and the per-action check.
+        let peer = PeerCredentials::new(1000, 1000, 1);
+        let mut t = IpcTransport::with_windows_pipe(
+            1000,
+            "\\\\.\\pipe\\bitty-default".into(),
+            Some(peer),
+            1000,
+            1000,
+            DEFAULT_TRANSPORT_CAPACITY,
+        );
+        assert!(t.connect().is_ok());
+        assert!(t.verify_peer_for_privileged().is_ok());
+        assert!(t.verify_windows_pipe(1001, 1000).is_err());
     }
 
     #[test]
