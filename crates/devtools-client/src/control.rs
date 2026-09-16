@@ -184,7 +184,7 @@ const MAX_AUDIT_LOG: usize = 256;
 
 #[derive(Debug, Default)]
 pub struct ControlClient {
-    audit_log: Vec<AuditRecord>,
+    audit_log: std::collections::VecDeque<AuditRecord>,
 }
 
 impl ControlClient {
@@ -194,10 +194,12 @@ impl ControlClient {
     }
 
     fn push_audit(&mut self, rec: AuditRecord) {
+        // Bounded O(1) FIFO (CTX-0042): VecDeque::pop_front is O(1);
+        // Vec::remove(0) was O(K) memmove per eviction.
         if self.audit_log.len() >= MAX_AUDIT_LOG {
-            self.audit_log.remove(0);
+            self.audit_log.pop_front();
         }
-        self.audit_log.push(rec);
+        self.audit_log.push_back(rec);
     }
 
     pub fn suspend_handler_audited(
@@ -259,7 +261,7 @@ impl ControlClient {
             return Err(ControlError::Invalid(format!("limit 1..{MAX_AUDIT_LOG}")));
         }
         let start = self.audit_log.len().saturating_sub(limit);
-        Ok(self.audit_log[start..].to_vec())
+        Ok(self.audit_log.iter().skip(start).cloned().collect())
     }
 
     #[must_use]
@@ -311,6 +313,20 @@ mod tests {
         let logs = c.list_audit_log(true, 5).unwrap();
         assert_eq!(logs.len(), 5);
         assert!(c.list_audit_log(false, 5).is_err());
+    }
+
+    #[test]
+    fn audit_log_drop_oldest_preserves_fifo_order() {
+        let mut c = ControlClient::new();
+        for i in 0..(super::MAX_AUDIT_LOG as u64 + 10) {
+            c.suspend_handler_audited(true, "h", "c", "caller", i, i)
+                .unwrap();
+        }
+        assert_eq!(c.audit_count(), super::MAX_AUDIT_LOG);
+        let logs = c.list_audit_log(true, super::MAX_AUDIT_LOG).unwrap();
+        assert_eq!(logs.len(), super::MAX_AUDIT_LOG);
+        assert_eq!(logs[0].at_ms, 10);
+        assert_eq!(logs[super::MAX_AUDIT_LOG - 1].at_ms, 265);
     }
 
     #[test]

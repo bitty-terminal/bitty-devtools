@@ -13,6 +13,7 @@
 
 import type { Generation, PanelId } from "./panel-runtime.js";
 import { BOUNDS } from "./bounds.js";
+import { FifoQueue } from "./queue.js";
 
 export type ControlReceipt = {
   generation: Generation;
@@ -64,7 +65,9 @@ export class ControlError extends Error {
 const MAX_AUDIT_LOG = 256 as const;
 
 export class ControlClient {
-  private auditLog: AuditRecord[] = [];
+  // Bounded O(1) FIFO (CTX-0042): index-based ring buffer replaces
+  // Array.shift() (O(K) memmove per eviction) for the audit log.
+  private auditLog = new FifoQueue<AuditRecord>(MAX_AUDIT_LOG);
 
   private requireControl(scope: string): void {
     if (scope !== "debug.control") {
@@ -105,11 +108,11 @@ export class ControlClient {
   }
 
   private pushAudit(rec: AuditRecord): void {
-    if (this.auditLog.length >= MAX_AUDIT_LOG) {
+    if (this.auditLog.len() >= MAX_AUDIT_LOG) {
       // Drop oldest (bounded, countable)
-      this.auditLog.shift();
+      this.auditLog.dropOldest();
     }
-    this.auditLog.push(rec);
+    this.auditLog.enqueue(rec);
   }
 
   suspendHandler(
@@ -264,15 +267,15 @@ export class ControlClient {
         "InvalidLimit",
         `limit must be 1..${MAX_AUDIT_LOG}`,
       );
-    return this.auditLog.slice(-limit);
+    return this.auditLog.toArray().slice(-limit);
   }
 
   auditCount(): number {
-    return this.auditLog.length;
+    return this.auditLog.len();
   }
 
   clearAuditLog(scope: string): void {
     this.requireControl(scope);
-    this.auditLog = [];
+    this.auditLog.clear();
   }
 }
