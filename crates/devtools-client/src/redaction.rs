@@ -261,7 +261,10 @@ fn contains_secret_token(value: &str) -> bool {
 }
 
 fn is_jwt_part(bytes: &[u8]) -> bool {
-    !bytes.is_empty()
+    // Each dot-joined part must be at least 8 chars: a real JWT
+    // header/payload/signature is far longer, and without the floor version
+    // strings like "1.2.3" false-positive.
+    bytes.len() >= 8
         && bytes
             .iter()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
@@ -530,6 +533,10 @@ mod tests {
             ),
             "src/components/VeryLongComponentName/index.ts"
         );
+        // Dotted triples are version strings, not JWTs (review blocker).
+        for plain in ["1.2.3", "v1.2.3", "a.b.c", "10.0.1"] {
+            assert_eq!(redact_value(plain.to_string(), "notes"), plain);
+        }
     }
 
     #[test]

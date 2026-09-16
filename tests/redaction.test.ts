@@ -53,6 +53,11 @@ describe("redaction", () => {
     expect(redactValue("the password is required to log in", "notes")).toBe(
       "the password is required to log in",
     );
+    // Dotted triples are version strings, not JWTs (review blocker).
+    expect(redactValue("1.2.3", "notes")).toBe("1.2.3");
+    expect(redactValue("v1.2.3", "notes")).toBe("v1.2.3");
+    expect(redactValue("a.b.c", "notes")).toBe("a.b.c");
+    expect(redactValue("10.0.1", "notes")).toBe("10.0.1");
   });
 
   test("redactPreview truncates 8 KiB", () => {

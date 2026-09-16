@@ -37,7 +37,10 @@ const SECRET_TOKEN_PATTERNS: readonly RegExp[] = [
   /AIza[A-Za-z0-9_-]{8,}/,
   /AKIA[0-9A-Z]{16}/,
   /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/,
-  /[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/,
+  // JWT shape: three dot-joined parts, each at least 8 chars (a real
+  // header/payload/signature is far longer; without the floor, version
+  // strings like "1.2.3" or "v1.2.3" false-positive).
+  /[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/,
   /\b[0-9a-fA-F]{40}\b/,
   /\b[0-9a-fA-F]{64}\b/,
 ] as const;
