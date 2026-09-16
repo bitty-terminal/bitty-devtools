@@ -802,6 +802,25 @@ export async function probeEnvelopeConformance(
 const WORKSPACE_NAME_RE = /^ws(\d+)$/;
 const WORKSPACE_ID_RE = /^ws:\d+$/;
 
+/**
+ * Validate a workspace identifier before it is spliced into spawned `ctl`
+ * argv. Listed ids are untrusted observation data: a hostile `workspace
+ * list` response (or a compromised `result.created`) could otherwise smuggle
+ * a flag token (e.g. `--socket=/tmp/evil.sock`) into the positional slot,
+ * where the `ctl` parser would treat it as a flag. Fail closed on any id
+ * that is neither the canonical `ws:<digits>` form nor the bare `ws<digits>`
+ * alias the round-trip probe accepts.
+ */
+export function assertSafeWorkspaceId(identifier: string): void {
+  if (WORKSPACE_ID_RE.test(identifier) || WORKSPACE_NAME_RE.test(identifier)) {
+    return;
+  }
+  throw new CampaignError(
+    "MissingField",
+    `invalid workspace id '${identifier}' (want ws:<n> or ws<n>)`,
+  );
+}
+
 /** Candidate verb ids for a listed workspace identifier (`ws4` -> `ws:4`). */
 export function workspaceIdCandidates(identifier: string): string[] {
   const candidates = new Set<string>();
@@ -899,8 +918,14 @@ export async function probeWorkspaceIdRoundTrip(
 
     const problems: string[] = [];
     for (const identifier of afterNew) {
-      const candidates = workspaceIdCandidates(identifier);
+      try {
+        assertSafeWorkspaceId(identifier);
+      } catch {
+        problems.push(`listed id '${identifier}' is not a workspace id`);
+        continue;
+      }
       let accepted = false;
+      const candidates = workspaceIdCandidates(identifier);
       for (const candidate of candidates) {
         const focused = await dispatchEnvelope(dispatcher, {
           verb: "workspace.focus",
