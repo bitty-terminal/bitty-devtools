@@ -31,10 +31,16 @@ type Harness = {
 function makeHarness(transport?: IpcTransport): Harness {
   const out: string[] = [];
   const err: string[] = [];
+  const proc = globalThis.process as unknown as {
+    getuid?: () => number;
+    getgid?: () => number;
+  };
+  const uid = typeof proc.getuid === "function" ? proc.getuid() : 1000;
+  const gid = typeof proc.getgid === "function" ? proc.getgid() : 1000;
   const runtime: CliRuntime = {
     env: {},
-    uid: 1000,
-    gid: 1000,
+    uid,
+    gid,
     pid: 42,
     now: () => 0,
     stdout: (text) => out.push(text),
@@ -53,10 +59,11 @@ class RecordingTransport extends IpcTransport {
 }
 
 function makeTransport(): RecordingTransport {
+  const { uid, gid, pid } = makeHarness().deps.runtime;
   return new RecordingTransport({
-    runtimeUid: 1000,
-    socketPath: "/run/user/1000/bitty/default.sock",
-    peer: peerCredentials(1000, 1000, 42),
+    runtimeUid: uid,
+    socketPath: `/run/user/${uid}/bitty/default.sock`,
+    peer: peerCredentials(uid, gid, pid),
   });
 }
 

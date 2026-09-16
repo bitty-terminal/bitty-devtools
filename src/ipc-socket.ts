@@ -67,8 +67,33 @@ type UnixStat = {
   mode: number;
   uid: number;
   isSocket(): boolean;
-  isSymbolicLink(): boolean;
 };
+
+/**
+ * Non-following symlink probe. `Bun.file().stat()` follows symlinks, so its
+ * `isSymbolicLink()` can never fire on the attested path; use `node:fs`
+ * `lstatSync` (same `getBuiltinModule` pattern as `auth.ts`, no new deps).
+ * Returns false when lstat is unavailable rather than failing closed here:
+ * the mode/uid/socket-kind checks below still gate the dial.
+ */
+function isSymlinkNoFollow(path: string): boolean {
+  const proc = globalThis as unknown as {
+    process?: { getBuiltinModule?: (id: string) => unknown };
+  };
+  const getBuiltin = proc.process?.getBuiltinModule;
+  if (typeof getBuiltin !== "function") return false;
+  try {
+    const fs = getBuiltin.call(proc.process, "node:fs") as {
+      lstatSync?: (p: string) => { isSymbolicLink?: () => boolean };
+    };
+    const stat = fs.lstatSync?.(path);
+    return typeof stat?.isSymbolicLink === "function"
+      ? stat.isSymbolicLink()
+      : false;
+  } catch {
+    return false;
+  }
+}
 
 function resolveBun(): BunRuntime | null {
   const bun = (globalThis as { Bun?: unknown }).Bun as BunRuntime | undefined;
@@ -159,16 +184,12 @@ export async function attestLiveSocketEndpoint(
   if (sockStat === null) {
     throw fail(`socket '${endpoint.socketPath}' does not exist`);
   }
-  if (
-    typeof dirStat.isSymbolicLink === "function" &&
-    dirStat.isSymbolicLink()
-  ) {
+  // `Bun.file().stat()` follows symlinks, so probe link-ness separately
+  // with a non-following lstat: a symlink at either path refuses to dial.
+  if (isSymlinkNoFollow(parent)) {
     throw fail(`socket directory '${parent}' is a symlink (refusing to dial)`);
   }
-  if (
-    typeof sockStat.isSymbolicLink === "function" &&
-    sockStat.isSymbolicLink()
-  ) {
+  if (isSymlinkNoFollow(endpoint.socketPath)) {
     throw fail(
       `socket '${endpoint.socketPath}' is a symlink (refusing to dial)`,
     );

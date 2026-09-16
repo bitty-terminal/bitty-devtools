@@ -199,6 +199,7 @@ describe("DevtoolsClient inspection live IPC wiring", () => {
 
   test("live socket connect serves listPlugins over a loopback socket", async () => {
     const proc = globalThis.process as unknown as {
+      getuid?: () => number;
       getBuiltinModule(id: string): {
         mkdirSync(p: string, o: unknown): void;
         chmodSync(p: string, m: number): void;
@@ -242,11 +243,14 @@ describe("DevtoolsClient inspection live IPC wiring", () => {
       },
     });
     fs.chmodSync(socketPath, 0o600);
+    // Attestation compares the socket owner against the runtime UID: use
+    // the real local UID, never a constant.
+    const uid = typeof proc.getuid === "function" ? proc.getuid() : 1000;
     try {
       const c = new DevtoolsClient();
       const session = await c.connectLiveSocket(
-        1000,
-        peerCredentials(1000, 1000, 1),
+        uid,
+        peerCredentials(uid, uid, 1),
         undefined,
         undefined,
         socketPath,

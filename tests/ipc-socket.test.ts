@@ -1,5 +1,17 @@
 import { describe, expect, test } from "bun:test";
-import { connectLiveSocket, isLiveSocketSupported } from "../src/ipc-socket.js";
+import {
+  attestLiveSocketEndpoint,
+  connectLiveSocket,
+  isLiveSocketSupported,
+} from "../src/ipc-socket.js";
+
+/** Process UID for attestation: the real local UID, never a constant. */
+function localUid(): number {
+  const proc = globalThis.process as unknown as {
+    getuid?: () => number;
+  };
+  return typeof proc.getuid === "function" ? proc.getuid() : 1000;
+}
 
 /**
  * TDD failing-first proof for CTX-0036 (H-DEV-06): the Unix IPC socket
@@ -46,7 +58,7 @@ describe("live Unix IPC socket (CTX-0036)", () => {
     try {
       const conn = await connectLiveSocket({
         socketPath,
-        runtimeUid: 1000,
+        runtimeUid: localUid(),
       });
       try {
         const request = new TextEncoder().encode(
@@ -67,6 +79,49 @@ describe("live Unix IPC socket (CTX-0036)", () => {
       } finally {
         conn.close();
       }
+    } finally {
+      server.stop(true);
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("symlink at the socket path refuses to attest", async () => {
+    if (!isLiveSocketSupported()) return;
+    const proc = globalThis.process as unknown as {
+      getBuiltinModule(id: string): {
+        mkdirSync(p: string, o: unknown): void;
+        chmodSync(p: string, m: number): void;
+        rmSync(p: string, o: unknown): void;
+        symlinkSync(t: string, p: string): void;
+      };
+    };
+    const fs = proc.getBuiltinModule("node:fs");
+    const dir = `${process.env["XDG_RUNTIME_DIR"] ?? "/tmp"}/bitty-devtools-ctx0036-link-${process.pid}`;
+    fs.mkdirSync(dir, { recursive: true });
+    fs.chmodSync(dir, 0o700);
+    const target = `${dir}/real.sock`;
+    const link = `${dir}/loopback.sock`;
+    const server = Bun.listen({
+      unix: target,
+      socket: {
+        data() {},
+        error() {},
+      },
+    });
+    fs.chmodSync(target, 0o600);
+    fs.symlinkSync(target, link);
+    try {
+      let caught: unknown = null;
+      try {
+        await attestLiveSocketEndpoint({
+          socketPath: link,
+          runtimeUid: localUid(),
+        });
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).not.toBeNull();
+      expect(String(caught)).toContain("symlink");
     } finally {
       server.stop(true);
       fs.rmSync(dir, { recursive: true, force: true });
