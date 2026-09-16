@@ -101,6 +101,14 @@ pub const MATRIX: &[MatrixEntry] = &[
 
 pub const REFERENCE_TERMS: &[&str] = &["ghostty", "kitty", "wezterm", "alacritty"];
 
+/// Tracks upstream bitty-term-state `CANONICAL_HASH_VERSION` (live canonical,
+/// now 5; upstream bitty-compat-lab emits its `EXPECTED_HASH_VERSION`).
+/// Divergence: devtools `stateHash` here is FNV-1a over surface-name
+/// pseudo-bytes for headless shape-parity, NOT the real canonical stream; the
+/// version field tracks upstream so consumers can tell which canonical era the
+/// matrix was generated against.
+pub const CANONICAL_HASH_VERSION: u32 = 5;
+
 pub fn check_matrix_invariants() -> Result<(), String> {
     if MATRIX.len() != 14 {
         return Err(format!("matrix len {} != 14", MATRIX.len()));
@@ -161,7 +169,12 @@ pub fn generate_matrix_json() -> Result<String, String> {
         "    \"MAX_SNAPSHOT_JSON_BYTES\": {MAX_SNAPSHOT_JSON_BYTES},\n"
     ));
     out.push_str("    \"GRID\": \"80x24\",\n");
-    out.push_str("    \"CANONICAL_HASH_VERSION\": 1\n");
+    // Tracks upstream CANONICAL_HASH_VERSION (see CANONICAL_HASH_VERSION
+    // above); the stateHash values are headless pseudo-hashes, not the real
+    // canonical stream.
+    out.push_str(&format!(
+        "    \"CANONICAL_HASH_VERSION\": {CANONICAL_HASH_VERSION}\n"
+    ));
     out.push_str("  },\n");
     out.push_str("  \"entries\": [\n");
     for (idx, e) in MATRIX.iter().enumerate() {
@@ -240,7 +253,7 @@ mod tests {
             "\"MAX_ACTIONS\": 4096",
             "\"MAX_SNAPSHOT_JSON_BYTES\": 16384",
             "\"GRID\": \"80x24\"",
-            "\"CANONICAL_HASH_VERSION\": 1",
+            "\"CANONICAL_HASH_VERSION\": 5",
             "\"category\": \"shell\"",
             "\"corpusRel\": \"shell/corpus/",
             "\"bytesLen\": 40",

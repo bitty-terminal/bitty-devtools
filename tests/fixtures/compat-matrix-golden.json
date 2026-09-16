@@ -7,7 +7,7 @@
     "MAX_ACTIONS": 4096,
     "MAX_SNAPSHOT_JSON_BYTES": 16384,
     "GRID": "80x24",
-    "CANONICAL_HASH_VERSION": 1
+    "CANONICAL_HASH_VERSION": 5
   },
   "entries": [
     {
