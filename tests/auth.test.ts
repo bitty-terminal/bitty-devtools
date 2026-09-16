@@ -6,9 +6,11 @@ import {
   verifyWindowsPipe,
   resolveSocketPath,
   shortInstanceHash,
+  timingSafeTokenEqual,
   newChildToken,
   childTokenAuthorizes,
   ChildTokenStore,
+  AuthError,
   DIR_MODE,
   SOCKET_MODE,
 } from "../src/auth.js";
@@ -139,5 +141,48 @@ describe("auth peer-creds (phase 2, live runtime)", () => {
     const peer = peerCredentials(2000, 2000, 99);
     const runtimeUid = 1000;
     expect(() => verifyPeerUid(peer, runtimeUid)).toThrow("peer uid");
+  });
+
+  test("token compare is constant-time: no early-exit on prefix", () => {
+    // Equal strings compare true.
+    expect(timingSafeTokenEqual("tok-abc", "tok-abc")).toBe(true);
+    // Same-length mismatches at first, middle, and last byte all read false
+    // without short-circuiting the accumulator.
+    expect(timingSafeTokenEqual("Xok-abc", "tok-abc")).toBe(false);
+    expect(timingSafeTokenEqual("tok-Xbc", "tok-abc")).toBe(false);
+    expect(timingSafeTokenEqual("tok-abX", "tok-abc")).toBe(false);
+    // Length mismatch never throws (timingSafeEqual would) and reads false.
+    expect(timingSafeTokenEqual("tok-abc", "tok-abcd")).toBe(false);
+    expect(timingSafeTokenEqual("", "tok-abc")).toBe(false);
+    expect(timingSafeTokenEqual("tok-abc", "")).toBe(false);
+  });
+
+  test("store verify resolves tokens without Map.get key timing leak", () => {
+    const store = new ChildTokenStore();
+    store.insert(
+      newChildToken("tok-abc", "terminal.inspect", "t:4", 0, 60_000),
+    );
+    store.insert(
+      newChildToken("tok-xyz", "terminal.inspect", "t:4", 0, 60_000),
+    );
+    // Exact match still verifies.
+    expect(() =>
+      store.verify("tok-abc", "terminal.inspect", "t:4", 500),
+    ).not.toThrow();
+    // Near-miss candidates (shared prefix, wrong tail) must not verify.
+    expect(() =>
+      store.verify("tok-abX", "terminal.inspect", "t:4", 500),
+    ).toThrow("unknown child token");
+    expect(() =>
+      store.verify("tok-ab", "terminal.inspect", "t:4", 500),
+    ).toThrow("unknown child token");
+    // Scope check still applies after a valid token match.
+    try {
+      store.verify("tok-abc", "terminal.input", "t:4", 500);
+      expect.unreachable("scope mismatch must throw");
+    } catch (err) {
+      expect(err).toBeInstanceOf(AuthError);
+      expect((err as AuthError).code).toBe("ScopeDenied");
+    }
   });
 });

@@ -40,6 +40,39 @@ function utf8ByteLength(value: string): number {
   return UTF8.encode(value).length;
 }
 
+/**
+ * Constant-time token comparison over UTF-8 bytes.
+ *
+ * Uses Node `crypto.timingSafeEqual` via `process.getBuiltinModule` (Bun
+ * runtime) so comparison time does not leak the shared-prefix length of a
+ * candidate token. Length mismatch reads false (never throws) to keep
+ * callers fail-closed without a length oracle via exceptions; the byte loop
+ * itself always runs to completion.
+ */
+type TimingSafeEqual = (a: Uint8Array, b: Uint8Array) => boolean;
+
+function nodeTimingSafeEqual(): TimingSafeEqual {
+  const proc = globalThis as unknown as {
+    process?: { getBuiltinModule?: (id: string) => unknown };
+  };
+  const getBuiltin = proc.process?.getBuiltinModule;
+  if (typeof getBuiltin === "function") {
+    const mod = getBuiltin.call(proc.process, "node:crypto") as {
+      timingSafeEqual?: unknown;
+    };
+    if (typeof mod.timingSafeEqual === "function") {
+      return mod.timingSafeEqual as TimingSafeEqual;
+    }
+  }
+  throw new Error("node:crypto timingSafeEqual unavailable");
+}
+export function timingSafeTokenEqual(a: string, b: string): boolean {
+  const ab = UTF8.encode(a);
+  const bb = UTF8.encode(b);
+  if (ab.length !== bb.length) return false;
+  return nodeTimingSafeEqual()(ab, bb);
+}
+
 export type PeerCredentials = {
   uid: number;
   gid: number;
@@ -260,10 +293,10 @@ export function childTokenAuthorizes(
   scopedId: string,
   nowMs: number,
 ): boolean {
+  if (childTokenIsExpired(t, nowMs)) return false;
   return (
-    !childTokenIsExpired(t, nowMs) &&
-    t.scope === scope &&
-    t.scopedId === scopedId
+    timingSafeTokenEqual(t.scope, scope) &&
+    timingSafeTokenEqual(t.scopedId, scopedId)
   );
 }
 
@@ -291,7 +324,20 @@ export class ChildTokenStore {
     scopedId: string,
     nowMs: number,
   ): void {
-    const tok = this.tokens.get(tokenStr);
+    // Linear scan with a constant-time byte compare per candidate: a direct
+    // `Map.get(tokenStr)` would let hash-probe timing leak how much of the
+    // candidate matches a stored key, so every stored token is compared and
+    // exactly one match is accepted. Scope and expiry are checked only after
+    // the token comparison to keep failure timing uniform.
+    let matched: ChildToken | undefined = undefined;
+    let matches = 0;
+    for (const candidate of this.tokens.values()) {
+      if (timingSafeTokenEqual(candidate.token, tokenStr)) {
+        matched = candidate;
+        matches += 1;
+      }
+    }
+    const tok = matches === 1 ? matched : undefined;
     if (tok === undefined) {
       throw new AuthError(
         "Unauthenticated",
@@ -304,7 +350,10 @@ export class ChildTokenStore {
         `child token '${tokenStr}' expired`,
       );
     }
-    if (tok.scope !== scope || tok.scopedId !== scopedId) {
+    if (
+      !timingSafeTokenEqual(tok.scope, scope) ||
+      !timingSafeTokenEqual(tok.scopedId, scopedId)
+    ) {
       throw new AuthError(
         "ScopeDenied",
         `child token scope ${tok.scope} id ${tok.scopedId} mismatch`,

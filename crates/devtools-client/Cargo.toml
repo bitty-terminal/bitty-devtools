@@ -12,3 +12,4 @@ publish = false
 workspace = true
 
 [dependencies]
+subtle = "2.6.1"
