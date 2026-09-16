@@ -198,9 +198,19 @@ describe("inspection (debug.inspect default, read-only)", () => {
     c.connect();
     c.grantScope("debug.inspect");
     c.setPanelSnapshot(makeSnapshot());
-    const snap = c.getSnapshotForTerminal("term-1", "hello password=hunter2");
+    const snap = c.getSnapshotForTerminal("term-1", "hello world plain output");
     expect(snap.preview.length > 0).toBe(true);
     expect(snap.redactionMarker.redacted).toBe(false); // preview field not sensitive, content not auto-redacted
+  });
+
+  test("terminal output with embedded credential redacts (H-DEV-01)", () => {
+    const c = new DevtoolsClient();
+    c.connect();
+    c.grantScope("debug.inspect");
+    c.setPanelSnapshot(makeSnapshot());
+    const snap = c.getSnapshotForTerminal("term-1", "hello password=hunter2");
+    expect(snap.preview).toBe("[REDACTED]");
+    expect(snap.redactionMarker.redacted).toBe(true);
   });
 
   test("panel summary bounded", () => {
@@ -371,7 +381,7 @@ describe("inspection over real IPC (connected path)", () => {
       scope: "semantic",
     });
     expect(snap.cursor).toEqual({ row: 2, col: 5 });
-    expect(snap.preview).toBe("hello password=hunter2");
+    expect(snap.preview).toBe("[REDACTED]");
     expect(snap.truncated).toBe(false);
   });
 
