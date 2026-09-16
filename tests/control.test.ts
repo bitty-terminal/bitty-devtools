@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { DevtoolsClient } from "../src/client.js";
+import { ControlClient } from "../src/control.js";
 import { panelId } from "../src/panel-runtime.js";
 
 describe("control (debug.control, audited, no bypass)", () => {
@@ -54,5 +55,23 @@ describe("control (debug.control, audited, no bypass)", () => {
     expect(() => c.disposeGeneration(panelId(1), 1 as never)).toThrow(
       "debug.control",
     );
+  });
+
+  test("audit log drops oldest at bound and preserves FIFO order (CTX-0042)", () => {
+    const c = new ControlClient();
+    const scope = "debug.control";
+    for (let i = 0; i < 256 + 10; i++) {
+      c.suspendHandler(scope, panelId(1), `h${i}`, `cause ${i}`, "tester");
+    }
+    expect(c.auditCount()).toBe(256);
+    const logs = c.listAuditLog(scope, 256);
+    expect(logs.length).toBe(256);
+    // First 10 evicted; oldest live entry is h10.
+    expect(logs[0]!.target).toBe("panel:1/h10");
+    expect(logs[255]!.target).toBe("panel:1/h265");
+    // listAuditLog is read-only: repeated reads return the same entries.
+    const again = c.listAuditLog(scope, 256);
+    expect(again.length).toBe(256);
+    expect(again[0]!.target).toBe("panel:1/h10");
   });
 });

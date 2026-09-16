@@ -14,6 +14,7 @@
  */
 
 import { BOUNDS, assertBounded, assertStringBounded } from "./bounds.js";
+import { FifoQueue } from "./queue.js";
 import {
   verifyPeerUid,
   verifyUnixEndpoint,
@@ -194,7 +195,10 @@ export class Framer {
 // ---------------------------------------------------------------------------
 
 export class RateLimiter {
+  // Index-based FIFO: eviction advances a head offset (amortized O(1) per
+  // entry) instead of Array.shift() (O(K) memmove per entry).
   private timestamps: number[] = [];
+  private head = 0;
 
   constructor(
     private readonly limitPerSec: number = RC9_REQ_PER_SEC,
@@ -207,32 +211,38 @@ export class RateLimiter {
 
   countInWindow(nowMs: number): number {
     this.evictOld(nowMs);
-    return this.timestamps.length;
+    return this.timestamps.length - this.head;
   }
 
   check(nowMs: number): void {
     this.evictOld(nowMs);
-    if (this.timestamps.length >= this.burst) {
+    if (this.timestamps.length - this.head >= this.burst) {
       throw new TransportError(
         "RateLimited",
-        `rate limited: ${this.timestamps.length} requests in ${RC9_WINDOW_MS}ms exceeds burst ${this.burst}`,
+        `rate limited: ${this.timestamps.length - this.head} requests in ${RC9_WINDOW_MS}ms exceeds burst ${this.burst}`,
       );
     }
     this.timestamps.push(nowMs);
   }
 
   private evictOld(nowMs: number): void {
-    while (this.timestamps.length > 0) {
-      const front = this.timestamps[0];
+    while (this.head < this.timestamps.length) {
+      const front = this.timestamps[this.head];
       if (front === undefined) break;
       if (nowMs - front >= RC9_WINDOW_MS) {
-        this.timestamps.shift();
+        this.head += 1;
       } else break;
+    }
+    // Compact the consumed prefix once it outweighs the live window, so the
+    // backing array stays O(live) instead of growing with total history.
+    if (this.head * 2 >= this.timestamps.length) {
+      this.timestamps = this.timestamps.slice(this.head);
+      this.head = 0;
     }
   }
 
   isEmpty(): boolean {
-    return this.timestamps.length === 0;
+    return this.head >= this.timestamps.length;
   }
 }
 
@@ -265,8 +275,10 @@ export const DEFAULT_TRANSPORT_CAPACITY = 64;
 export const MAX_TRANSPORT_CAPACITY = 256;
 
 export class StdioTransportStub {
-  private outgoing: Frame[] = [];
-  private incoming: Frame[] = [];
+  // Bounded O(1) FIFOs (CTX-0042): index-based ring buffers replace
+  // Array.shift() (O(K) memmove per dequeue).
+  private outgoing: FifoQueue<Frame>;
+  private incoming: FifoQueue<Frame>;
   private closed = false;
   private droppedOutgoing = 0;
 
@@ -276,6 +288,8 @@ export class StdioTransportStub {
         `transport capacity must be 1..${MAX_TRANSPORT_CAPACITY}`,
       );
     }
+    this.outgoing = new FifoQueue<Frame>(capacity);
+    this.incoming = new FifoQueue<Frame>(capacity);
   }
 
   getCapacity(): number {
@@ -283,11 +297,11 @@ export class StdioTransportStub {
   }
 
   outgoingLen(): number {
-    return this.outgoing.length;
+    return this.outgoing.len();
   }
 
   incomingLen(): number {
-    return this.incoming.length;
+    return this.incoming.len();
   }
 
   isClosed(): boolean {
@@ -303,17 +317,17 @@ export class StdioTransportStub {
   }
 
   clear(): void {
-    this.outgoing = [];
-    this.incoming = [];
+    this.outgoing.clear();
+    this.incoming.clear();
     this.droppedOutgoing = 0;
   }
 
   trySendFrame(frame: Frame): void {
     if (this.closed)
       throw new TransportError("TransportClosed", "stdio transport is closed");
-    if (this.outgoing.length >= this.capacity)
+    if (this.outgoing.len() >= this.capacity)
       throw new TransportError("TransportFull", `capacity ${this.capacity}`);
-    this.outgoing.push(frame);
+    this.outgoing.enqueue(frame);
   }
 
   trySendPayload(payload: Uint8Array): void {
@@ -327,29 +341,27 @@ export class StdioTransportStub {
 
   sendDropOldest(frame: Frame): void {
     if (this.closed) return;
-    if (this.outgoing.length >= this.capacity) {
-      this.outgoing.shift();
+    if (this.outgoing.len() >= this.capacity) {
+      this.outgoing.dropOldest();
       this.droppedOutgoing += 1;
     }
-    this.outgoing.push(frame);
+    this.outgoing.enqueue(frame);
   }
 
   recvOutgoing(): Frame | undefined {
-    return this.outgoing.shift();
+    return this.outgoing.dequeue();
   }
 
   drainOutgoing(): Frame[] {
-    const out = [...this.outgoing];
-    this.outgoing = [];
-    return out;
+    return this.outgoing.drain();
   }
 
   injectIncoming(frame: Frame): void {
     if (this.closed)
       throw new TransportError("TransportClosed", "stdio transport is closed");
-    if (this.incoming.length >= this.capacity)
+    if (this.incoming.len() >= this.capacity)
       throw new TransportError("TransportFull", `capacity ${this.capacity}`);
-    this.incoming.push(frame);
+    this.incoming.enqueue(frame);
   }
 
   injectIncomingPayload(payload: Uint8Array): void {
@@ -357,27 +369,22 @@ export class StdioTransportStub {
   }
 
   recvIncoming(): Frame | undefined {
-    return this.incoming.shift();
+    return this.incoming.dequeue();
   }
 
   drainIncoming(): Frame[] {
-    const out = [...this.incoming];
-    this.incoming = [];
-    return out;
+    return this.incoming.drain();
   }
 
   drainIncomingBounded(limit: number): Frame[] {
-    const take = Math.min(limit, this.incoming.length);
-    const out = this.incoming.slice(0, take);
-    this.incoming = this.incoming.slice(take);
-    return out;
+    return this.incoming.drainBounded(limit);
   }
 
   forwardTo(peer: StdioTransportStub): number {
     let moved = 0;
-    while (this.outgoing.length > 0) {
+    while (this.outgoing.len() > 0) {
       if (peer.isClosed() || peer.incomingLen() >= peer.capacity) break;
-      const frame = this.outgoing.shift();
+      const frame = this.outgoing.dequeue();
       if (frame === undefined) break;
       peer.injectIncoming(frame);
       moved += 1;

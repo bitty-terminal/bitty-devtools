@@ -53,6 +53,17 @@ describe("transport framing (phase 2, live runtime, bounded 256 KiB IPC / 1 MiB 
     expect(() => lim.check(1000)).not.toThrow();
   });
 
+  test("rate limiter bulk eviction stays correct and bounded", () => {
+    const lim = new RateLimiter(200, 200);
+    for (let i = 0; i < 200; i++) lim.check(0);
+    expect(lim.countInWindow(0)).toBe(200);
+    // Window advance evicts all 200 at once (was O(K) per shift()).
+    expect(lim.countInWindow(1000)).toBe(0);
+    expect(lim.isEmpty()).toBe(true);
+    // Limiter still accepts after full eviction (head compaction correct).
+    expect(() => lim.check(1000)).not.toThrow();
+    expect(lim.countInWindow(1000)).toBe(1);
+  });
   test("payload and connection caps RC-9/RC-10", () => {
     expect(() => checkPayloadCap(0)).not.toThrow();
     expect(() => checkPayloadCap(RC9_PAYLOAD_CAP_BYTES)).not.toThrow();
