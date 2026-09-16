@@ -203,11 +203,16 @@ export function isValidMethodForScope(
     "bitty.debug/startTrace",
     "bitty.debug/stopTrace",
     "bitty.debug/fetchTraceChunk",
+    // CTX-0038 automation frame reads (trace scope + terminal.inspect).
+    "bitty.debug/captureFrame",
+    "bitty.debug/frameHash",
   ]);
   const controlMethods = new Set([
     "bitty.debug/suspendHandler",
     "bitty.debug/resumePlugin",
     "bitty.debug/disposeGeneration",
+    // CTX-0038 automation input synthesis (control scope + terminal.input).
+    "bitty.debug/synthesizeInput",
   ]);
   if (inspectMethods.has(method)) return true; // inspect is base for all
   if (traceMethods.has(method))

@@ -75,6 +75,30 @@ describe("protocol versioned framing", () => {
     }
   });
 
+  test("scope matrix includes automation methods", () => {
+    // CTX-0038: automation drivers were omitted from the scope matrix.
+    // synthesizeInput is control-only (input synthesis needs debug.control
+    // + terminal.input); captureFrame and frameHash are trace-level reads
+    // (debug.trace + terminal.inspect, held also by debug.control).
+    expect(
+      isValidMethodForScope("bitty.debug/synthesizeInput", "debug.inspect"),
+    ).toBe(false);
+    expect(
+      isValidMethodForScope("bitty.debug/synthesizeInput", "debug.trace"),
+    ).toBe(false);
+    expect(
+      isValidMethodForScope("bitty.debug/synthesizeInput", "debug.control"),
+    ).toBe(true);
+    for (const method of [
+      "bitty.debug/captureFrame",
+      "bitty.debug/frameHash",
+    ]) {
+      expect(isValidMethodForScope(method, "debug.inspect")).toBe(false);
+      expect(isValidMethodForScope(method, "debug.trace")).toBe(true);
+      expect(isValidMethodForScope(method, "debug.control")).toBe(true);
+    }
+  });
+
   test("chunking bounded 256 KiB", () => {
     const s = "a".repeat(600 * 1024);
     const chunks = chunkText(s);
