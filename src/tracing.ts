@@ -400,14 +400,42 @@ export class TracingClient {
     const rec = this.traces.get(traceId);
     if (rec === undefined)
       throw new TracingError("NotFound", `trace ${traceId} not found`);
-    assertBounded("offset", offset, rec.bytes);
-    const chunk = rec.chunks[Math.floor(offset / BOUNDS.CHUNK_BYTES)] ?? "";
+    if (!Number.isSafeInteger(offset) || offset < 0) {
+      throw new TracingError(
+        "InvalidOffset",
+        "offset must be a nonnegative byte integer",
+      );
+    }
+    const encoder = new TextEncoder();
+    let totalBytes = 0;
+    let chunk = "";
+    let chunkBytes = 0;
+    for (const storedChunk of rec.chunks) {
+      const bytes = encoder.encode(storedChunk);
+      const start = totalBytes;
+      totalBytes += bytes.length;
+      if (offset >= start && offset < totalBytes) {
+        const intraOffset = offset - start;
+        if ((bytes[intraOffset]! & 0xc0) === 0x80) {
+          throw new TracingError(
+            "InvalidOffset",
+            "offset must be a UTF-8 boundary",
+          );
+        }
+        chunk = new TextDecoder("utf-8", {
+          fatal: true,
+          ignoreBOM: true,
+        }).decode(bytes.subarray(intraOffset));
+        chunkBytes = bytes.length - intraOffset;
+      }
+    }
+    assertBounded("offset", offset, totalBytes);
     assertStringBounded("chunk", chunk, BOUNDS.CHUNK_BYTES);
     const { text: preview } = redactPreview(
       chunk.slice(0, 512),
       "trace.preview",
     );
-    const continuation = offset + chunk.length < rec.bytes;
+    const continuation = offset + chunkBytes < totalBytes;
     // H-DEV-02 (CTX-0032): was `previewEqualsExport(preview, preview)`, a
     // self-comparison that always passed; re-derive from the chunk slice.
     assertPreviewMatchesExport(preview, chunk.slice(0, 512));

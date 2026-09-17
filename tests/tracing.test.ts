@@ -1,7 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import { DevtoolsClient } from "../src/client.js";
 import { redactPreview } from "../src/redaction.js";
-import { assertPreviewMatchesExport, TracingError } from "../src/tracing.js";
+import {
+  assertPreviewMatchesExport,
+  TracingClient,
+  TracingError,
+} from "../src/tracing.js";
 import type { PanelRuntimeSnapshot } from "../src/panel-runtime.js";
 
 function snap(): PanelRuntimeSnapshot {
@@ -91,6 +95,119 @@ describe("tracing (debug.trace, opt-in, bounded)", () => {
     expect(chunk.chunk.length).toBe(100);
     expect(chunk.continuation).toBe(false);
     c.stopTrace(start.traceId);
+  });
+
+  for (const structured of [false, true]) {
+    test(`variable-size ${structured ? "structured" : "raw"} pages match the retained stream`, () => {
+      const c = new TracingClient();
+      const scope = "debug.trace";
+      const start = c.startTrace(scope, { maxBytes: 1024 * 1024 });
+      const records: string[] = [];
+      const chunks: string[] = [];
+      for (let i = 0; i < 100; i++) {
+        const payload = `${i}:` + "abcdef".repeat(900 + (i % 5) * 100);
+        const event = {
+          sequence: i,
+          owner: "panel-1",
+          kind: "sample",
+          payload,
+          generation: 1,
+          wallClockMs: i,
+        };
+        const record = structured ? JSON.stringify(event) : payload;
+        records.push(record);
+        const last = chunks.length - 1;
+        if (
+          last < 0 ||
+          chunks[last]!.length + record.length > start.chunkBytes
+        ) {
+          chunks.push(record);
+        } else {
+          chunks[last] += record;
+        }
+        if (structured) c.appendStructuredEvent(start.traceId, event);
+        else c.appendToTrace(start.traceId, payload);
+      }
+      const reference = records.join("");
+      expect(chunks.length).toBeGreaterThan(2);
+      expect(chunks[0]!.length).toBeLessThan(start.chunkBytes);
+      let startOffset = 0;
+      for (const expectedChunk of chunks) {
+        for (const intraOffset of [0, 1, expectedChunk.length - 1]) {
+          const offset = startOffset + intraOffset;
+          const page = c.fetchTraceChunk(scope, start.traceId, offset);
+          expect(page.offset).toBe(offset);
+          expect(page.chunk).toBe(expectedChunk.slice(intraOffset));
+          expect(page.chunk).toBe(
+            reference.slice(offset, offset + page.chunk.length),
+          );
+          expect(page.preview).toBe(
+            redactPreview(page.chunk.slice(0, 512), "trace.preview").text,
+          );
+          expect(page.chunk.length).toBeLessThanOrEqual(start.chunkBytes);
+          expect(page.continuation).toBe(
+            offset + page.chunk.length < reference.length,
+          );
+        }
+        startOffset += expectedChunk.length;
+      }
+      let offset = 0;
+      let reconstructed = "";
+      for (let i = 0; i < chunks.length; i++) {
+        const page = c.fetchTraceChunk(scope, start.traceId, offset);
+        expect(page.chunk.length).toBeGreaterThan(0);
+        reconstructed += page.chunk;
+        offset += page.chunk.length;
+        expect(page.continuation).toBe(i < chunks.length - 1);
+      }
+      expect(reconstructed).toBe(reference);
+      const end = c.fetchTraceChunk(scope, start.traceId, reference.length);
+      expect(end.chunk).toBe("");
+      expect(end.continuation).toBe(false);
+    });
+  }
+
+  test("fetch offsets use UTF-8 boundaries and preserve text", () => {
+    const c = new TracingClient();
+    const scope = "debug.trace";
+    const start = c.startTrace(scope, {});
+    const source = "aé中🙂\uFEFFz";
+    c.appendToTrace(start.traceId, source);
+    const encoder = new TextEncoder();
+    let offset = 0;
+    let charOffset = 0;
+    for (const char of source) {
+      const page = c.fetchTraceChunk(scope, start.traceId, offset);
+      expect(page.offset).toBe(offset);
+      expect(page.chunk).toBe(source.slice(charOffset));
+      expect(encoder.encode(page.chunk).length).toBe(
+        encoder.encode(source).length - offset,
+      );
+      expect(page.continuation).toBe(false);
+      offset += encoder.encode(char).length;
+      charOffset += char.length;
+    }
+    expect(c.fetchTraceChunk(scope, start.traceId, offset).chunk).toBe("");
+    expect(() => c.fetchTraceChunk(scope, start.traceId, 2)).toThrow();
+  });
+
+  test("empty, end and appended-tail offsets have explicit continuation", () => {
+    const c = new TracingClient();
+    const scope = "debug.trace";
+    const start = c.startTrace(scope, {});
+    expect(c.fetchTraceChunk(scope, start.traceId, 0).chunk).toBe("");
+    expect(c.fetchTraceChunk(scope, start.traceId, 0).continuation).toBe(false);
+    c.appendToTrace(start.traceId, "hello");
+    const first = c.fetchTraceChunk(scope, start.traceId, 0);
+    expect(first.continuation).toBe(false);
+    c.appendToTrace(start.traceId, " world");
+    const tail = c.fetchTraceChunk(scope, start.traceId, first.chunk.length);
+    expect(tail.chunk).toBe(" world");
+    expect(tail.continuation).toBe(false);
+    expect(c.fetchTraceChunk(scope, start.traceId, 11).chunk).toBe("");
+    for (const offset of [-1, 0.5, 12, NaN, Infinity]) {
+      expect(() => c.fetchTraceChunk(scope, start.traceId, offset)).toThrow();
+    }
   });
 
   test("H-DEV-02: tampered export bytes fail the preview check (no tautology)", () => {
