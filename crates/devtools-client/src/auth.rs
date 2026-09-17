@@ -337,15 +337,11 @@ impl ChildTokenStore {
         let tok = match (matched, matches) {
             (Some(tok), 1) => tok,
             _ => {
-                return Err(AuthError::Unauthenticated(format!(
-                    "unknown child token '{token_str}'"
-                )));
+                return Err(AuthError::Unauthenticated("unknown child token".into()));
             }
         };
         if tok.is_expired(now_ms) {
-            return Err(AuthError::Unauthenticated(format!(
-                "child token '{token_str}' expired"
-            )));
+            return Err(AuthError::Unauthenticated("child token expired".into()));
         }
         if !constant_time_token_eq(&tok.scope, scope)
             || !constant_time_token_eq(&tok.scoped_id, scoped_id)
@@ -469,6 +465,39 @@ mod tests {
                 .verify("tok-abc", "terminal.inspect", "t:4", 60_000)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn child_token_rejection_diagnostics_contain_only_fixed_categories() {
+        let marker = "benign-marker";
+        let mut store = ChildTokenStore::new();
+        let check = |store: &ChildTokenStore, message: &str| {
+            let err = store
+                .verify(marker, "terminal.inspect", "t:4", 60_000)
+                .unwrap_err();
+            assert_eq!(err, AuthError::Unauthenticated(message.into()));
+            assert!(!format!("{err}").contains(marker));
+            assert!(!format!("{err:?}").contains(marker));
+        };
+        check(&store, "unknown child token");
+        store
+            .insert(
+                ChildToken::new(
+                    marker.into(),
+                    "terminal.inspect".into(),
+                    "t:4".into(),
+                    0,
+                    60_000,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(
+            store
+                .verify(marker, "terminal.inspect", "t:4", 59_999)
+                .is_ok()
+        );
+        check(&store, "child token expired");
     }
 
     #[test]
