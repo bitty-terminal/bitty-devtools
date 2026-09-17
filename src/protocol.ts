@@ -157,25 +157,28 @@ export function chunkText(
   text: string,
   chunkBytes: number = BOUNDS.CHUNK_BYTES,
 ): string[] {
-  if (chunkBytes <= 0 || chunkBytes > BOUNDS.CHUNK_BYTES) {
+  if (
+    !Number.isSafeInteger(chunkBytes) ||
+    chunkBytes <= 0 ||
+    chunkBytes > BOUNDS.CHUNK_BYTES
+  ) {
     throw new Error(`chunkBytes must be in (0, ${BOUNDS.CHUNK_BYTES}]`);
   }
+  if (text.length === 0) return [];
   const bytes = new TextEncoder().encode(text);
-  if (bytes.length === 0) return [];
+  const decoder = new TextDecoder("utf-8", { ignoreBOM: true });
   const chunks: string[] = [];
   let offset = 0;
   while (offset < bytes.length) {
-    const slice = bytes.slice(offset, offset + chunkBytes);
-    // Decode at char boundary
-    let str = new TextDecoder().decode(slice);
-    // Avoid splitting surrogate: ensure round-trip length matches
-    // If truncated char, back off until valid
-    while (new TextEncoder().encode(str).length > slice.length) {
-      str = str.slice(0, -1);
+    let end = Math.min(offset + chunkBytes, bytes.length);
+    while (end > offset && ((bytes[end] ?? 0) & 0xc0) === 0x80) {
+      end -= 1;
     }
-    if (str.length === 0) break;
-    chunks.push(str);
-    offset += new TextEncoder().encode(str).length;
+    if (end === offset) {
+      throw new Error("chunkBytes cannot fit the next Unicode scalar");
+    }
+    chunks.push(decoder.decode(bytes.subarray(offset, end)));
+    offset = end;
   }
   return chunks;
 }

@@ -142,11 +142,20 @@ function resultFor(invocation: CtlInvocation): CtlResult {
   throw new Error(`unscripted verb ${invocation.verb}`);
 }
 
+function attestFixtureDispatcher(
+  dispatcher: ScriptedCtlDispatcher,
+): ScriptedCtlDispatcher {
+  return Object.assign(dispatcher, {
+    attestSocketTarget: (socketPath: string) =>
+      socketPath === fixtureSocketPath,
+  });
+}
+
 function campaignDispatcher(
   overrides: Record<string, CtlResult> = {},
 ): ScriptedCtlDispatcher {
-  return new ScriptedCtlDispatcher(
-    (inv) => overrides[inv.verb] ?? resultFor(inv),
+  return attestFixtureDispatcher(
+    new ScriptedCtlDispatcher((inv) => overrides[inv.verb] ?? resultFor(inv)),
   );
 }
 
@@ -615,6 +624,354 @@ describe("durable dispatcher seam", () => {
   });
 });
 
+const fixtureSocketPath = `${process.cwd()}/fixture.sock`;
+const admittedCampaign = {
+  mutationConsent: { socketPath: fixtureSocketPath, disposable: true as const },
+  socket: {
+    socketPath: fixtureSocketPath,
+    runtimeUid: OK_DIR.ownerUid,
+    stat: () => OK_DIR,
+  },
+};
+
+describe("campaign admission and ownership", () => {
+  test("relative endpoints are refused even when consent and dispatcher strings match", async () => {
+    const calls: string[][] = [];
+    const dispatcher = new ProcessCtlDispatcher(
+      { socketPath: "fixture.sock", cwd: "child" },
+      (_program, args) => {
+        calls.push([...args]);
+        return makeOkResult("core.view.list", { views: [] });
+      },
+    );
+    const report = await runCampaign({
+      ...admittedCampaign,
+      dispatcher,
+      mutationConsent: { socketPath: "fixture.sock", disposable: true },
+      socket: { ...admittedCampaign.socket, socketPath: "fixture.sock" },
+    });
+    expect(report.ok).toBe(false);
+    expect(calls).toEqual([]);
+  });
+
+  test("windows drive-letter and UNC endpoints are refused on this host", async () => {
+    for (const socketPath of [
+      "C:\\bitty\\fixture.sock",
+      "\\\\pipe\\fixture.sock",
+    ]) {
+      const calls: string[][] = [];
+      const dispatcher = new ProcessCtlDispatcher(
+        { socketPath },
+        (_program, args) => {
+          calls.push([...args]);
+          return makeOkResult("core.view.list", { views: [] });
+        },
+      );
+      const report = await runCampaign({
+        dispatcher,
+        mutationConsent: { socketPath, disposable: true },
+        socket: {
+          socketPath,
+          runtimeUid: OK_DIR.ownerUid,
+          stat: () => OK_DIR,
+        },
+      });
+      expect(report.ok).toBe(false);
+      expect(calls).toEqual([]);
+    }
+  });
+
+  test("custom dispatchers without target attestation are refused", async () => {
+    const dispatcher = new ScriptedCtlDispatcher(resultFor);
+    const socketPath = `${process.cwd()}/fixture.sock`;
+    const report = await runCampaign({
+      dispatcher,
+      mutationConsent: { socketPath, disposable: true },
+      socket: { ...admittedCampaign.socket, socketPath },
+    });
+    expect(report.ok).toBe(false);
+    expect(dispatcher.seen()).toEqual([]);
+  });
+
+  test("an absolute endpoint is passed unchanged to a process fake with another cwd", async () => {
+    const calls: string[][] = [];
+    const dispatcher = new ProcessCtlDispatcher(
+      { socketPath: fixtureSocketPath, cwd: "child" },
+      (_program, args) => {
+        calls.push([...args]);
+        return makeOkResult("core.view.list", { views: [] });
+      },
+    );
+    await runCampaign({ ...admittedCampaign, dispatcher });
+    expect(calls.length).toBeGreaterThan(0);
+    expect(
+      calls.every(
+        (args) => args[args.indexOf("--socket") + 1] === fixtureSocketPath,
+      ),
+    ).toBe(true);
+  });
+
+  test("custom target attestation is checked against the preflight endpoint", async () => {
+    const dispatcher = Object.assign(new ScriptedCtlDispatcher(resultFor), {
+      attestSocketTarget: (socketPath: string) =>
+        socketPath === `${process.cwd()}/other.sock`,
+    });
+    const report = await runCampaign({ ...admittedCampaign, dispatcher });
+    expect(report.ok).toBe(false);
+    expect(dispatcher.seen()).toEqual([]);
+  });
+
+  for (const thrown of [null, undefined, "fixture failure", 7]) {
+    test(`target attestation reports thrown ${String(thrown)}`, async () => {
+      const dispatcher = Object.assign(new ScriptedCtlDispatcher(resultFor), {
+        attestSocketTarget: () => {
+          throw thrown;
+        },
+      });
+      const report = await runCampaign({ ...admittedCampaign, dispatcher });
+      expect(report.ok).toBe(false);
+      expect(
+        report.results.find((r) => r.name === "campaign:admission")?.detail,
+      ).toBe(String(thrown));
+      expect(dispatcher.seen()).toEqual([]);
+    });
+    test(`preflight reports thrown ${String(thrown)} without dispatch`, async () => {
+      const dispatcher = campaignDispatcher();
+      const report = await runCampaign({
+        ...admittedCampaign,
+        dispatcher,
+        socket: {
+          ...admittedCampaign.socket,
+          stat: () => {
+            throw thrown;
+          },
+        },
+      });
+      expect(report.ok).toBe(false);
+      expect(report.results[0]?.detail).toContain(String(thrown));
+      expect(dispatcher.seen()).toEqual([]);
+    });
+
+    test(`observation and cleanup report thrown ${String(thrown)}`, async () => {
+      const dispatcher = new ScriptedCtlDispatcher((inv) => {
+        if (
+          inv.verb === "workspace.list.after-new" ||
+          inv.verb === "workspace.close"
+        )
+          throw thrown;
+        return resultFor(inv);
+      });
+      const result = await probeWorkspaceIdRoundTrip(dispatcher, {
+        elevated: true,
+      });
+      expect(result.status).toBe("fail");
+      expect(result.detail).toBe(
+        `${String(thrown)}; owned workspace cleanup failed: ${String(thrown)}`,
+      );
+      expect(
+        dispatcher
+          .seen()
+          .filter((inv) => inv.verb === "workspace.close")
+          .map((inv) => inv.args[2]),
+      ).toEqual(["ws:2"]);
+    });
+  }
+
+  test("process dispatcher target must match the consented socket", async () => {
+    const calls: string[][] = [];
+    const dispatcher = new ProcessCtlDispatcher(
+      { socketPath: "other.sock" },
+      (_program, args) => {
+        calls.push([...args]);
+        return makeOkResult("core.view.list", { views: [] });
+      },
+    );
+    const report = await runCampaign({ ...admittedCampaign, dispatcher });
+    expect(report.ok).toBe(false);
+    expect(calls).toEqual([]);
+  });
+
+  test("read-only labels do not admit different arguments without consent", async () => {
+    const dispatcher = campaignDispatcher();
+    await runCampaign({
+      dispatcher,
+      matrix: [
+        {
+          verb: "workspace.list",
+          args: ["workspace", "new", "--format", "json"],
+          outcome: "ok",
+          elevated: false,
+          note: "benign custom row",
+        },
+      ],
+    });
+    expect(dispatcher.seen().map((inv) => inv.verb)).toEqual(["terminal.text"]);
+  });
+
+  test("cleanup failure is reported without closing another ID", async () => {
+    const dispatcher = campaignDispatcher({
+      "workspace.close": makeErrorResult(
+        "core.workspace.close",
+        DENIED,
+        EXIT_PERM,
+      ),
+    });
+    const result = await probeWorkspaceIdRoundTrip(dispatcher, {
+      elevated: true,
+    });
+    expect(result.status).toBe("fail");
+    expect(result.detail).toContain("rejected by close");
+    expect(
+      dispatcher
+        .seen()
+        .filter((inv) => inv.verb === "workspace.close")
+        .map((inv) => inv.args[2]),
+    ).toEqual(["ws:2"]);
+  });
+
+  test("default campaign dispatches only read-only probes", async () => {
+    const dispatcher = campaignDispatcher();
+    await runCampaign({ dispatcher });
+    expect(dispatcher.seen().length).toBeGreaterThan(0);
+    expect(
+      dispatcher
+        .seen()
+        .every((inv) =>
+          [
+            "instance.list",
+            "window.list",
+            "view.list",
+            "terminal.list",
+            "terminal.text",
+            "workspace.list",
+          ].includes(inv.verb),
+        ),
+    ).toBe(true);
+  });
+
+  for (const admission of [
+    "failed",
+    "missing",
+    "mismatch",
+    "throws",
+    "not-disposable",
+  ] as const) {
+    test(`refuses mutations when admission is ${admission}`, async () => {
+      const dispatcher = campaignDispatcher();
+      const report = await runCampaign({
+        ...admittedCampaign,
+        dispatcher,
+        closeWorkspaces: true,
+        keystrokeTarget: { terminalId: "t:42", allowLiveKeystrokes: true },
+        mutationConsent: {
+          socketPath:
+            admission === "mismatch"
+              ? `${process.cwd()}/other.sock`
+              : fixtureSocketPath,
+          disposable: admission !== "not-disposable",
+        },
+        socket:
+          admission === "missing"
+            ? undefined
+            : {
+                ...admittedCampaign.socket,
+                stat: () => {
+                  if (admission === "throws")
+                    throw new Error("fixture stat failed");
+                  return admission === "failed"
+                    ? { ...OK_DIR, mode: 0o755 }
+                    : OK_DIR;
+                },
+              },
+      });
+      expect(report.ok).toBe(false);
+      expect(dispatcher.seen()).toEqual([]);
+    });
+  }
+
+  test("preflight runs before any dispatch and admission does not opt into keystrokes", async () => {
+    let checked = false;
+    const dispatcher = attestFixtureDispatcher(
+      new ScriptedCtlDispatcher((inv) => {
+        expect(checked).toBe(true);
+        return resultFor(inv);
+      }),
+    );
+    await runCampaign({
+      ...admittedCampaign,
+      dispatcher,
+      socket: {
+        ...admittedCampaign.socket,
+        stat: () => {
+          checked = true;
+          return OK_DIR;
+        },
+      },
+      closeWorkspaces: true,
+    });
+    expect(dispatcher.seen().some((inv) => inv.verb === "terminal.spawn")).toBe(
+      true,
+    );
+    expect(
+      dispatcher.seen().some((inv) => inv.verb === KEYSTROKE_PROBE_VERB),
+    ).toBe(false);
+    expect(
+      dispatcher
+        .seen()
+        .filter((inv) => inv.args[1] === "close")
+        .map((inv) => inv.args[2]),
+    ).toEqual(["ws:2"]);
+  });
+
+  test("cleanup closes only the created workspace, not newly listed or baseline IDs", async () => {
+    const dispatcher = campaignDispatcher({
+      "workspace.list.after-new": makeOkResult("core.workspace.list", {
+        workspaces: ["ws1", "ws2", "ws:3", "ws:2"],
+      }),
+    });
+    await probeWorkspaceIdRoundTrip(dispatcher, { elevated: true });
+    expect(
+      dispatcher
+        .seen()
+        .filter((inv) => inv.verb === "workspace.close")
+        .map((inv) => inv.args[2]),
+    ).toEqual(["ws:2"]);
+  });
+
+  test("a created ID already present under a baseline alias is never closed", async () => {
+    const dispatcher = campaignDispatcher({
+      "workspace.new": makeOkResult("core.workspace.new", { created: "ws:01" }),
+    });
+    const result = await probeWorkspaceIdRoundTrip(dispatcher, {
+      elevated: true,
+    });
+    expect(result.status).toBe("fail");
+    expect(
+      dispatcher.seen().some((inv) => inv.verb === "workspace.close"),
+    ).toBe(false);
+  });
+
+  test("owned cleanup runs after a later observation failure", async () => {
+    const dispatcher = campaignDispatcher({
+      "workspace.list.after-new": makeErrorResult(
+        "core.workspace.list",
+        UNAVAILABLE,
+        EXIT_RUNTIME,
+      ),
+    });
+    const result = await probeWorkspaceIdRoundTrip(dispatcher, {
+      elevated: true,
+    });
+    expect(result.status).toBe("fail");
+    expect(
+      dispatcher
+        .seen()
+        .filter((inv) => inv.verb === "workspace.close")
+        .map((inv) => inv.args[2]),
+    ).toEqual(["ws:2"]);
+  });
+});
+
 describe("campaign aggregation", () => {
   test("summarize counts and only fails on failure", () => {
     const report = summarizeCampaign([
@@ -641,13 +998,24 @@ describe("campaign aggregation", () => {
     });
     expect(report.failed).toBe(0);
     expect(report.ok).toBe(true);
-    expect(report.skipped).toBe(panelPluginCoverageHooks().length);
+    expect(
+      report.results.find((r) => r.name === "workspace:id-round-trip")?.status,
+    ).toBe("skip");
+    expect(
+      report.results.find((r) => r.name === "terminal:spawn-observable")
+        ?.status,
+    ).toBe("skip");
   });
 
   test("headless run without a socket skips the preflight", async () => {
     const report = await runCampaign({ dispatcher: campaignDispatcher() });
     expect(report.ok).toBe(true);
-    expect(report.skipped).toBe(panelPluginCoverageHooks().length + 1);
+    expect(
+      report.results.find((r) => r.name === "socket:parent-dir-0700")?.status,
+    ).toBe("skip");
+    expect(
+      report.results.find((r) => r.name === "workspace:id-round-trip")?.status,
+    ).toBe("skip");
   });
 
   test("headless run fails when the D1 guard trips", async () => {
@@ -780,11 +1148,14 @@ describe("keystroke-injection probe gating (H-DEV-04)", () => {
 
   test("opted-in campaign appends the probe for the scratch terminal only", async () => {
     const seen: string[][] = [];
-    const dispatcher = new ScriptedCtlDispatcher((inv) => {
-      seen.push(inv.args);
-      return makeOkResult(`core.${inv.verb}`, { ok: true });
-    });
+    const dispatcher = attestFixtureDispatcher(
+      new ScriptedCtlDispatcher((inv) => {
+        seen.push(inv.args);
+        return makeOkResult(`core.${inv.verb}`, { ok: true });
+      }),
+    );
     await runCampaign({
+      ...admittedCampaign,
       dispatcher,
       keystrokeTarget: { terminalId: "t:42", allowLiveKeystrokes: true },
     });

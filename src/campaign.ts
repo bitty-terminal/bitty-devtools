@@ -25,6 +25,23 @@
 
 import { DIR_MODE } from "./auth.js";
 
+function isAbsoluteSocketPath(socketPath: string): boolean {
+  const platform = (globalThis as { process?: { platform?: string } }).process
+    ?.platform;
+  if (platform === "win32") {
+    return /^[A-Za-z]:[\\/]/.test(socketPath) || socketPath.startsWith("\\\\");
+  }
+  return socketPath.startsWith("/");
+}
+
+function campaignFailureMessage(error: unknown): string {
+  try {
+    return error instanceof Error ? error.message : String(error);
+  } catch {
+    return "unknown campaign failure";
+  }
+}
+
 // ---------------------------------------------------------------------------
 // ctl exit codes and envelope (consumer mirror of bitty-app/src/ctl.rs)
 // ---------------------------------------------------------------------------
@@ -228,6 +245,7 @@ export type CtlInvocation = {
  */
 export interface CtlDispatcher {
   dispatch(invocation: CtlInvocation): Promise<CtlResult>;
+  attestSocketTarget?(absoluteSocketPath: string): boolean;
 }
 
 /** A synchronous or asynchronous dispatch handler. */
@@ -446,6 +464,13 @@ export class ProcessCtlDispatcher implements CtlDispatcher {
     this.elevationScopes = config.elevationScopes ?? DEFAULT_ELEVATION_SCOPES;
     this.cwd = config.cwd;
     this.spawn = spawn;
+  }
+
+  attestSocketTarget(absoluteSocketPath: string): boolean {
+    return (
+      isAbsoluteSocketPath(absoluteSocketPath) &&
+      this.socketPath === absoluteSocketPath
+    );
   }
 
   async dispatch(invocation: CtlInvocation): Promise<CtlResult> {
@@ -817,7 +842,7 @@ export async function probeEnvelopeConformance(
       });
     } catch (err) {
       results.push(
-        fail(name, `dispatch threw: ${(err as Error).message ?? String(err)}`),
+        fail(name, `dispatch threw: ${campaignFailureMessage(err)}`),
       );
       continue;
     }
@@ -849,7 +874,7 @@ export async function probeEnvelopeConformance(
     try {
       envelope = parseCtlEnvelope(result.stdout);
     } catch (err) {
-      results.push(fail(name, (err as Error).message, evidence));
+      results.push(fail(name, campaignFailureMessage(err), evidence));
       continue;
     }
     evidence.push(`ok=${envelope.ok}`);
@@ -994,6 +1019,9 @@ export async function probeWorkspaceIdRoundTrip(
 ): Promise<ProbeResult> {
   const name = "workspace:id-round-trip";
   const evidence: string[] = [];
+  const problems: string[] = [];
+  let owned: string | undefined;
+  let count = 0;
   try {
     const listed = workspaceNamesFrom(
       await dispatchEnvelope(dispatcher, {
@@ -1003,6 +1031,12 @@ export async function probeWorkspaceIdRoundTrip(
       }),
     );
     evidence.push(`baseline=[${listed.join(",")}]`);
+    const baseline = new Set(
+      listed.map((id) => {
+        assertSafeWorkspaceId(id);
+        return id.replace(/^ws:?0*(?=\d)/, "ws:");
+      }),
+    );
 
     const created = workspaceCreatedFrom(
       await dispatchEnvelope(dispatcher, {
@@ -1012,6 +1046,19 @@ export async function probeWorkspaceIdRoundTrip(
       }),
     );
     evidence.push(`created=${created}`);
+    if (!WORKSPACE_ID_RE.test(created)) {
+      throw new CampaignError(
+        "MissingField",
+        `workspace new created non-id '${created}'`,
+      );
+    }
+    if (baseline.has(created.replace(/^ws:?0*(?=\d)/, "ws:"))) {
+      throw new CampaignError(
+        "MissingField",
+        "workspace new returned a pre-existing id",
+      );
+    }
+    owned = created;
 
     const afterNew = workspaceNamesFrom(
       await dispatchEnvelope(dispatcher, {
@@ -1022,11 +1069,10 @@ export async function probeWorkspaceIdRoundTrip(
     );
     evidence.push(`afterNew=[${afterNew.join(",")}]`);
 
+    count = afterNew.length;
     if (afterNew.length === 0) {
-      return fail(name, "workspace list empty after new", evidence);
+      problems.push("workspace list empty after new");
     }
-
-    const problems: string[] = [];
     for (const identifier of afterNew) {
       try {
         assertSafeWorkspaceId(identifier);
@@ -1054,33 +1100,34 @@ export async function probeWorkspaceIdRoundTrip(
       if (!accepted) {
         problems.push(`listed id ${identifier} rejected by focus`);
       }
-      if (opts.elevated === true) {
+    }
+  } catch (err) {
+    problems.push(campaignFailureMessage(err));
+  } finally {
+    if (opts.elevated === true && owned !== undefined) {
+      try {
         const closed = await dispatchEnvelope(dispatcher, {
           verb: "workspace.close",
-          args: ["workspace", "close", identifier, "--format", "json"],
+          args: ["workspace", "close", owned, "--format", "json"],
           elevated: true,
         });
         if (!closed.ok) {
           problems.push(
-            `listed id ${identifier} rejected by close (${closed.error.class}/${closed.error.code})`,
+            `owned id ${owned} rejected by close (${closed.error.class}/${closed.error.code})`,
           );
+        } else {
+          evidence.push(`close(${owned})=ok`);
         }
+      } catch (err) {
+        problems.push(
+          `owned workspace cleanup failed: ${campaignFailureMessage(err)}`,
+        );
       }
     }
-    if (!WORKSPACE_ID_RE.test(created)) {
-      problems.push(`workspace new created non-id '${created}'`);
-    }
-    if (problems.length > 0) {
-      return fail(name, problems.join("; "), evidence);
-    }
-    return pass(
-      name,
-      `round-trip ok for ${afterNew.length} workspace id(s)`,
-      evidence,
-    );
-  } catch (err) {
-    return fail(name, (err as Error).message, evidence);
   }
+  return problems.length > 0
+    ? fail(name, problems.join("; "), evidence)
+    : pass(name, `round-trip ok for ${count} workspace id(s)`, evidence);
 }
 
 // ---------------------------------------------------------------------------
@@ -1138,7 +1185,7 @@ export async function probeTerminalTextShape(
       `lines=${text.split("\n").length}`,
     ]);
   } catch (err) {
-    return fail(name, (err as Error).message, [`terminal=${terminalId}`]);
+    return fail(name, campaignFailureMessage(err), [`terminal=${terminalId}`]);
   }
 }
 
@@ -1268,7 +1315,7 @@ export async function probeTerminalSpawnObservability(
       evidence,
     );
   } catch (err) {
-    return fail(name, (err as Error).message, evidence);
+    return fail(name, campaignFailureMessage(err), evidence);
   }
 }
 
@@ -1489,6 +1536,7 @@ export function summarizeCampaign(
 
 export type CampaignOptions = {
   dispatcher: CtlDispatcher;
+  mutationConsent?: { socketPath: string; disposable: boolean };
   terminalId?: string;
   /** Socket preflight inputs; omitted to skip the preflight probe. */
   socket?: {
@@ -1522,6 +1570,47 @@ export async function runCampaign(
   options: CampaignOptions,
 ): Promise<CampaignReport> {
   const results: ProbeResult[] = [];
+  if (options.socket !== undefined) {
+    try {
+      results.push(
+        probeSocketDirPreflight(preflightSocketParentDir(options.socket)),
+      );
+    } catch (err) {
+      results.push(fail("socket:parent-dir-0700", campaignFailureMessage(err)));
+    }
+    if (results[0]?.status !== "pass") return summarizeCampaign(results);
+  } else {
+    results.push(
+      skip("socket:parent-dir-0700", "no socket configured (headless)"),
+    );
+  }
+  const consent = options.mutationConsent;
+  let allowMutations = false;
+  try {
+    allowMutations =
+      consent?.disposable === true &&
+      consent.socketPath.length > 0 &&
+      isAbsoluteSocketPath(consent.socketPath) &&
+      consent.socketPath === options.socket?.socketPath &&
+      options.dispatcher.attestSocketTarget?.(consent.socketPath) === true;
+  } catch (err) {
+    results.push(fail("campaign:admission", campaignFailureMessage(err)));
+    return summarizeCampaign(results);
+  }
+  if (
+    (consent !== undefined ||
+      options.closeWorkspaces === true ||
+      options.keystrokeTarget !== undefined) &&
+    !allowMutations
+  ) {
+    results.push(
+      fail(
+        "campaign:admission",
+        "mutations require disposable-instance consent matching a preflighted socket",
+      ),
+    );
+    return summarizeCampaign(results);
+  }
   const allowKeystrokes = keystrokeProbeOptIn(options.keystrokeTarget);
   const matrix =
     allowKeystrokes && options.keystrokeTarget !== undefined
@@ -1530,15 +1619,54 @@ export async function runCampaign(
           keystrokeProbeExpectation(options.keystrokeTarget),
         ]
       : (options.matrix ?? CTL_VERB_MATRIX);
+  const admittedMatrix = matrix.filter((row) => {
+    if (row.args[1] === "close") {
+      results.push(
+        skip(
+          `envelope:${row.verb}`,
+          "close requires a run-owned identifier; exercised by workspace cleanup only",
+        ),
+      );
+      return false;
+    }
+    const readOnly =
+      !row.elevated &&
+      CTL_VERB_MATRIX.some(
+        (known) =>
+          [
+            "instance.list",
+            "window.list",
+            "view.list",
+            "terminal.list",
+            "terminal.text",
+            "workspace.list",
+          ].includes(known.verb) &&
+          row.verb === known.verb &&
+          row.args.length === known.args.length &&
+          row.args.every((arg, i) => arg === known.args[i]),
+      );
+    if (!readOnly && !allowMutations) {
+      results.push(
+        skip(
+          `envelope:${row.verb}`,
+          "mutating or unknown probe requires disposable-instance consent",
+        ),
+      );
+      return false;
+    }
+    return true;
+  });
   results.push(
-    ...(await probeEnvelopeConformance(options.dispatcher, matrix, {
+    ...(await probeEnvelopeConformance(options.dispatcher, admittedMatrix, {
       keystrokeTarget: options.keystrokeTarget,
     })),
   );
   results.push(
-    await probeWorkspaceIdRoundTrip(options.dispatcher, {
-      elevated: options.closeWorkspaces ?? false,
-    }),
+    allowMutations
+      ? await probeWorkspaceIdRoundTrip(options.dispatcher, {
+          elevated: options.closeWorkspaces ?? false,
+        })
+      : skip("workspace:id-round-trip", "requires disposable-instance consent"),
   );
   results.push(
     await probeTerminalTextShape(
@@ -1547,31 +1675,21 @@ export async function runCampaign(
     ),
   );
   results.push(
-    await probeTerminalSpawnObservability(options.dispatcher, {
-      elevated: true,
-    }),
+    allowMutations
+      ? await probeTerminalSpawnObservability(options.dispatcher, {
+          elevated: true,
+        })
+      : skip(
+          "terminal:spawn-observable",
+          "requires disposable-instance consent",
+        ),
   );
-  if (options.socket !== undefined) {
-    results.push(
-      probeSocketDirPreflight(
-        preflightSocketParentDir({
-          socketPath: options.socket.socketPath,
-          runtimeUid: options.socket.runtimeUid,
-          stat: options.socket.stat,
-          requiredMode: options.socket.requiredMode,
-        }),
-      ),
-    );
-  } else {
-    results.push(
-      skip("socket:parent-dir-0700", "no socket configured (headless)"),
-    );
-  }
   results.push(...probePanelPluginHooks());
   return summarizeCampaign(results);
 }
 
 export type LiveCampaignConfig = ProcessDispatcherConfig & {
+  mutationConsent?: CampaignOptions["mutationConsent"];
   terminalId?: string;
   /** Runtime uid for the socket preflight; required for the preflight probe. */
   runtimeUid?: number;
@@ -1608,6 +1726,7 @@ export async function runLiveCampaign(
       : undefined;
   return runCampaign({
     dispatcher,
+    mutationConsent: config.mutationConsent,
     terminalId: config.terminalId,
     closeWorkspaces: config.closeWorkspaces,
     keystrokeTarget: config.keystrokeTarget,

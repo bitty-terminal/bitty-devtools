@@ -476,6 +476,25 @@ describe("AutomationClient captureFrame", () => {
     expect(frame.masked).toBe(true);
   });
 
+  test("rejects a pixels envelope carrying a tiny non-image sentinel", () => {
+    const transport = new FakeTransport();
+    transport.response = ok(1, pixelsFrame({ pixels: [1, 2, 3] }));
+    const client = new AutomationClient(transport, allScopes());
+    expectCode(
+      () =>
+        client.captureFrame({
+          terminalId: TERMINAL,
+          bearer: BEARER,
+          format: "pixels",
+          explicitOptIn: true,
+        }),
+      "InvalidResult",
+    );
+    expect(
+      (transport.requests[0]!.params as Record<string, unknown>)["format"],
+    ).toBe("pixels");
+  });
+
   test("rejects a response that smuggles a pixels payload", () => {
     const transport = new FakeTransport();
     transport.response = ok(1, frameHash({ widthPx: 8192, heightPx: 8192 }));

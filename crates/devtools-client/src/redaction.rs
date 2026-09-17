@@ -57,16 +57,19 @@ fn contains_secret_phrase(value: &str) -> bool {
     const KEYS: [&str; 6] = [
         "password", "passwd", "secret", "api_key", "api-key", "apikey",
     ];
+    let bytes = value.as_bytes();
     for key in KEYS {
+        let key = key.as_bytes();
         let mut start = 0;
-        while start + key.len() <= value.len() {
-            let Some(rel) = value[start..].find(&key[..1]) else {
+        while start + key.len() <= bytes.len() {
+            let Some(rel) = bytes[start..].iter().position(|b| *b == key[0]) else {
                 break;
             };
             let i = start + rel;
-            if value[i..].len() >= key.len()
-                && value[i..i + key.len()].eq_ignore_ascii_case(key)
-                && is_assignment_after(&value[i + key.len()..])
+            if bytes
+                .get(i..i + key.len())
+                .is_some_and(|candidate| candidate.eq_ignore_ascii_case(key))
+                && is_assignment_after(&bytes[i + key.len()..])
             {
                 return true;
             }
@@ -85,8 +88,8 @@ fn contains_secret_phrase(value: &str) -> bool {
 /// `-`/`_` separators, optional whitespace, then `:` or `=`, optional
 /// whitespace, then a non-space secret. Returns false when the key is part of
 /// a longer word (e.g. "passwords are").
-fn is_assignment_after(rest: &str) -> bool {
-    let mut bytes = rest.bytes().peekable();
+fn is_assignment_after(rest: &[u8]) -> bool {
+    let mut bytes = rest.iter().copied().peekable();
     if matches!(bytes.peek(), Some(b'-') | Some(b'_')) {
         bytes.next();
     }
@@ -125,7 +128,7 @@ fn contains_key_assignment(value: &str, key: &str) -> bool {
                 continue 'outer;
             }
         }
-        if is_assignment_after(&value[i + kb.len()..]) {
+        if is_assignment_after(&vb[i + kb.len()..]) {
             return true;
         }
     }
@@ -143,7 +146,9 @@ fn contains_bearer_token(value: &str) -> bool {
         if !vb[i..i + KEY.len()].eq_ignore_ascii_case(KEY.as_bytes()) {
             continue;
         }
-        let after = &value[i + KEY.len()..];
+        let Some(after) = value.get(i + KEY.len()..) else {
+            continue;
+        };
         let mut chars = after.chars();
         match chars.next() {
             Some(' ') | Some('\t') => {}
@@ -182,30 +187,31 @@ fn contains_secret_token(value: &str) -> bool {
         "AIza",
         "AKIA",
     ];
+    let bytes = value.as_bytes();
     for prefix in PREFIXES {
+        let prefix = prefix.as_bytes();
         let mut start = 0;
-        while start + prefix.len() <= value.len() {
-            let Some(rel) = value[start..].find(&prefix[..1]) else {
+        while start + prefix.len() <= bytes.len() {
+            let Some(rel) = bytes[start..].iter().position(|b| *b == prefix[0]) else {
                 break;
             };
             let i = start + rel;
-            if value[i..].len() >= prefix.len()
-                && value[i..i + prefix.len()].eq_ignore_ascii_case(prefix)
+            if bytes
+                .get(i..i + prefix.len())
+                .is_some_and(|candidate| candidate.eq_ignore_ascii_case(prefix))
             {
-                let tail = &value[i + prefix.len()..];
-                let run_len = tail.bytes().take_while(|b| is_token_char(*b)).count();
-                let need = if prefix.eq_ignore_ascii_case("AKIA") {
+                let tail = &bytes[i + prefix.len()..];
+                let run_len = tail.iter().take_while(|b| is_token_char(**b)).count();
+                let need = if prefix.eq_ignore_ascii_case(b"AKIA") {
                     16
                 } else {
                     8
                 };
                 if run_len >= need {
-                    if prefix.eq_ignore_ascii_case("AKIA") {
-                        let head = &tail[..run_len.min(tail.len())];
-                        if head.len() >= 16
-                            && head.as_bytes()[..16]
-                                .iter()
-                                .all(|b: &u8| b.is_ascii_digit() || b.is_ascii_uppercase())
+                    if prefix.eq_ignore_ascii_case(b"AKIA") {
+                        if tail[..16]
+                            .iter()
+                            .all(|b| b.is_ascii_digit() || b.is_ascii_uppercase())
                         {
                             return true;
                         }
@@ -221,23 +227,26 @@ fn contains_secret_token(value: &str) -> bool {
     }
     // ghX_ single-char family (ghp_, gho_, ghu_, ghs_, ghr_).
     let mut start = 0;
-    while start + 4 <= value.len() {
-        let window = &value[start..];
-        let Some(rel) = window.find('g').or_else(|| window.find('G')) else {
+    while start + 4 <= bytes.len() {
+        let window = &bytes[start..];
+        let Some(rel) = window
+            .iter()
+            .position(|b| *b == b'g')
+            .or_else(|| window.iter().position(|b| *b == b'G'))
+        else {
             break;
         };
         let i = start + rel;
-        if value[i..].len() >= 4
-            && value[i..i + 1].eq_ignore_ascii_case("g")
-            && value[i + 1..i + 2].eq_ignore_ascii_case("h")
-            && matches!(
-                value.as_bytes()[i + 2],
-                b'p' | b'o' | b'u' | b's' | b'r' | b'P' | b'O' | b'U' | b'S' | b'R'
-            )
-            && value.as_bytes()[i + 3] == b'_'
-        {
-            let tail = &value[i + 4..];
-            if tail.bytes().take_while(|b| is_token_char(*b)).count() >= 8 {
+        if bytes.get(i..i + 4).is_some_and(|candidate| {
+            candidate[..2].eq_ignore_ascii_case(b"gh")
+                && matches!(
+                    candidate[2],
+                    b'p' | b'o' | b'u' | b's' | b'r' | b'P' | b'O' | b'U' | b'S' | b'R'
+                )
+                && candidate[3] == b'_'
+        }) {
+            let tail = &bytes[i + 4..];
+            if tail.iter().take_while(|b| is_token_char(**b)).count() >= 8 {
                 return true;
             }
             start = i + 4;
@@ -282,17 +291,17 @@ fn is_jwt_shape(value: &str) -> bool {
         if !is_jwt_part(first) {
             continue;
         }
-        let rest = &value[di1 + 1..];
-        let Some(di2_rel) = rest.find('.') else {
+        let rest = &value.as_bytes()[di1 + 1..];
+        let Some(di2_rel) = rest.iter().position(|b| *b == b'.') else {
             continue;
         };
-        let second = &rest.as_bytes()[..di2_rel];
+        let second = &rest[..di2_rel];
         let tail = &rest[di2_rel + 1..];
         let tail_end = tail
-            .bytes()
-            .position(|b| !is_bearer_char(b))
+            .iter()
+            .position(|b| !is_bearer_char(*b))
             .unwrap_or(tail.len());
-        let third = &tail.as_bytes()[..tail_end];
+        let third = &tail[..tail_end];
         if is_jwt_part(second) && is_jwt_part(third) {
             return true;
         }
@@ -536,6 +545,117 @@ mod tests {
         // Dotted triples are version strings, not JWTs (review blocker).
         for plain in ["1.2.3", "v1.2.3", "a.b.c", "10.0.1"] {
             assert_eq!(redact_value(plain.to_string(), "notes"), plain);
+        }
+    }
+
+    #[test]
+    fn multilingual_prose_is_preserved() {
+        let words = [
+            "hello",
+            "café",
+            "grüße",
+            "世界",
+            "こんにちは",
+            "안녕하세요",
+            "مرحبا",
+            "नमस्ते",
+            "γειά",
+            "привет",
+            "e\u{301}",
+            "𝄞",
+            "garden",
+            "summer",
+            "paper",
+        ];
+        let separators = [" ", "\t", "\n", "、", " — ", "\u{2003}"];
+        for seed in 0..256 {
+            let mut text = String::new();
+            for index in 0..=seed % 16 {
+                text.push_str(words[(seed + index * 7) % words.len()]);
+                text.push_str(separators[(seed + index) % separators.len()]);
+            }
+            assert!(!contains_secret_phrase(&text));
+            assert!(!contains_secret_token(&text));
+            assert!(!contains_bearer_token(&text));
+            assert!(!contains_key_assignment(&text, "access_token"));
+            assert!(!is_jwt_shape(&text));
+            assert!(!contains_hex_digest(&text));
+            assert!(!looks_like_high_entropy_secret(&text));
+            assert!(!looks_secret(&text));
+            assert_eq!(redact_value(text.clone(), "notes"), text);
+            let (preview, marker) = redact_preview(text.clone(), "notes");
+            assert_eq!(preview, text);
+            assert!(!marker.redacted);
+            assert!(!marker.truncated);
+            assert_eq!(marker.original_bytes, text.len());
+            assert_eq!(redact_value(text, "password"), "[REDACTED]");
+        }
+    }
+
+    #[test]
+    fn multilingual_context_preserves_recognition() {
+        let contexts = ["café", "世界", "مرحبا", "नमस्ते", "e\u{301}", "𝄞"];
+        let samples = [
+            ("password = example", true),
+            ("passwd: example", true),
+            ("secret_: example", true),
+            ("api_key = example", true),
+            ("api-key = example", true),
+            ("apikey = example", true),
+            ("AUTH-TOKEN = example", true),
+            ("access_token: example", true),
+            ("Bearer example", true),
+            ("bearer", false),
+            ("passwords are required", false),
+            ("release 1.2.3", false),
+            ("sk-test-xxxxxxxx", true),
+            ("sk-test-xxxxxxx", false),
+            ("ghp_xxxxxxxx", true),
+            ("ghp_xxxxxxx", false),
+            ("AKIAIOSFODNN7EXAMPLE", true),
+            ("xxxxxxxx.yyyyyyyy.zzzzzzzz", true),
+            ("da39a3ee5e6b4b0d3255bfef95601890afd80709", true),
+            ("-----BEGIN PRIVATE KEY-----", true),
+        ];
+        for before in contexts {
+            for after in contexts {
+                for (sample, expected) in samples {
+                    let text = format!("{before}【{sample}】{after}");
+                    assert_eq!(looks_secret(&text), expected);
+                    let (preview, marker) = redact_preview(text.clone(), "notes");
+                    assert_eq!(preview, if expected { "[REDACTED]" } else { &text });
+                    assert_eq!(marker.redacted, expected);
+                    assert!(!marker.truncated);
+                    assert_eq!(marker.original_bytes, text.len());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn multilingual_preview_matches_character_budget_model() {
+        for unit in ["a", "é", "界", "𝄞", "e\u{301}", "مرحبا 世界 "] {
+            for extra in 0..=4 {
+                let text = unit.repeat(PREVIEW_MAX_BYTES / unit.len() + extra);
+                let mut budget = PREVIEW_MAX_BYTES;
+                let expected: String = text
+                    .chars()
+                    .take_while(|ch| {
+                        if ch.len_utf8() > budget {
+                            false
+                        } else {
+                            budget -= ch.len_utf8();
+                            true
+                        }
+                    })
+                    .collect();
+                let (preview, marker) = redact_preview(text.clone(), "notes");
+                assert_eq!(preview, expected);
+                assert!(!marker.redacted);
+                assert_eq!(marker.truncated, text.len() > PREVIEW_MAX_BYTES);
+                assert_eq!(marker.original_bytes, text.len());
+                assert!(preview.len() <= PREVIEW_MAX_BYTES);
+            }
         }
     }
 

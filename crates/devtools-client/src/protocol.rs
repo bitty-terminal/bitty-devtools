@@ -79,24 +79,22 @@ pub fn chunk_text(text: &str, chunk_bytes: usize) -> Result<Vec<String>, String>
     if chunk_bytes == 0 || chunk_bytes > CHUNK_BYTES {
         return Err(format!("chunkBytes must be in (0, {CHUNK_BYTES}]"));
     }
-    let bytes = text.as_bytes();
-    if bytes.is_empty() {
+    if text.is_empty() {
         return Ok(Vec::new());
     }
+    let bytes = text.as_bytes();
     let mut out = Vec::new();
     let mut offset = 0usize;
     while offset < bytes.len() {
-        let end = (offset + chunk_bytes).min(bytes.len());
-        // Ensure char boundary
-        let mut e = end;
-        while e > offset && !text.is_char_boundary(e) {
-            e -= 1;
+        let mut end = (offset + chunk_bytes).min(bytes.len());
+        while end > offset && !text.is_char_boundary(end) {
+            end -= 1;
         }
-        if e == offset {
-            break;
+        if end == offset {
+            return Err("chunkBytes cannot fit the next Unicode scalar".to_string());
         }
-        out.push(text[offset..e].to_owned());
-        offset = e;
+        out.push(text[offset..end].to_owned());
+        offset = end;
     }
     Ok(out)
 }
@@ -217,6 +215,62 @@ mod tests {
             assert!(is_valid_method_for_scope(method, DebugScope::Inspect));
             assert!(is_valid_method_for_scope(method, DebugScope::Trace));
             assert!(is_valid_method_for_scope(method, DebugScope::Control));
+        }
+    }
+
+    #[test]
+    fn chunk_preserves_multilingual_text_within_byte_limits() {
+        for text in [
+            "",
+            "Hello world",
+            "café Ελληνικά",
+            "日本語 हिन्दी العربية",
+            "e\u{0301} and \u{1d11e} music",
+            "\u{feff}Hello\u{feff}世界",
+        ] {
+            let minimum = text.chars().map(char::len_utf8).max().unwrap_or(1);
+            for limit in minimum..=16 {
+                let chunks = chunk_text(text, limit).unwrap();
+                assert_eq!(chunks.concat(), text);
+                for chunk in &chunks {
+                    assert!(!chunk.is_empty());
+                    assert!(chunk.len() <= limit);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn chunk_packs_whole_scalars_at_exact_byte_boundaries() {
+        assert_eq!(
+            chunk_text("abé日本\u{1d11e}z", 4).unwrap(),
+            ["abé", "日", "本", "\u{1d11e}", "z"]
+        );
+    }
+
+    #[test]
+    fn chunk_rejects_limits_that_cannot_fit_the_next_scalar() {
+        for scalar in ["é", "日", "\u{1d11e}"] {
+            for limit in 1..scalar.len() {
+                for prefix in ["", "hello "] {
+                    assert_eq!(
+                        chunk_text(&format!("{prefix}{scalar} fin"), limit),
+                        Err("chunkBytes cannot fit the next Unicode scalar".to_string())
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn chunk_requires_a_byte_limit_in_range() {
+        for limit in [0, CHUNK_BYTES + 1, usize::MAX] {
+            for text in ["", "hello"] {
+                assert_eq!(
+                    chunk_text(text, limit),
+                    Err(format!("chunkBytes must be in (0, {CHUNK_BYTES}]"))
+                );
+            }
         }
     }
 
