@@ -12,6 +12,9 @@ import {
   MAX_FRAME_BYTES,
   RC9_PAYLOAD_CAP_BYTES,
   RC9_MAX_CONNECTIONS,
+  RC9_REQ_PER_SEC,
+  RC9_BURST_PER_SEC,
+  RC9_WINDOW_MS,
 } from "../src/transport.js";
 import { peerCredentials } from "../src/auth.js";
 
@@ -46,11 +49,124 @@ describe("transport framing (phase 2, live runtime, bounded 256 KiB IPC / 1 MiB 
     expect(new TextDecoder().decode(out[1]!.payload)).toBe("bb");
   });
 
-  test("rate limiter RC-9 100/s burst 200, window 1s", () => {
-    const lim = new RateLimiter(10, 5);
-    for (let i = 0; i < 5; i++) lim.check(0);
+  test("rate limiter defaults retain RC-9 sustained and burst values", () => {
+    const lim = RateLimiter.rc9Default();
+    for (let i = 0; i < RC9_BURST_PER_SEC; i++) lim.check(0);
     expect(() => lim.check(0)).toThrow("rate limited");
-    expect(() => lim.check(1000)).not.toThrow();
+    for (let i = 0; i < RC9_REQ_PER_SEC; i++) lim.check(RC9_WINDOW_MS);
+    expect(() => lim.check(RC9_WINDOW_MS)).toThrow("rate limited");
+  });
+
+  test("rate limiter refills at the sustained rate after the initial burst", () => {
+    const lim = new RateLimiter(2, 4);
+    for (let i = 0; i < 4; i++) lim.check(0);
+    expect(() => lim.check(0)).toThrow("rate limited");
+    for (let second = 1; second <= 10; second++) {
+      const nowMs = second * 1000;
+      for (let i = 0; i < 2; i++) lim.check(nowMs);
+      expect(() => lim.check(nowMs)).toThrow("rate limited");
+      expect(lim.countInWindow(nowMs)).toBe(2);
+    }
+  });
+
+  test("rate limiter preserves fractional refill across rejections", () => {
+    const fractional = new RateLimiter(3, 6);
+    for (let i = 0; i < 6; i++) fractional.check(0);
+    for (let i = 0; i < 3; i++) fractional.check(1000);
+    for (const nowMs of [1100, 1200, 1300, 1333]) {
+      expect(() => fractional.check(nowMs)).toThrow("rate limited");
+    }
+    expect(fractional.countInWindow(1333)).toBe(3);
+    expect(() => fractional.check(1334)).not.toThrow();
+    expect(() => fractional.check(1334)).toThrow("rate limited");
+  });
+
+  test("rate limiter caps idle credit and retains the rolling burst ceiling", () => {
+    const lim = new RateLimiter(2, 4);
+    lim.check(0);
+    for (let i = 0; i < 4; i++) lim.check(60_000);
+    expect(() => lim.check(60_000)).toThrow("rate limited");
+    expect(() => lim.check(60_500)).toThrow("rate limited");
+    for (let i = 0; i < 2; i++) lim.check(61_000);
+    expect(() => lim.check(61_000)).toThrow("rate limited");
+  });
+
+  test("rate limiter does not refill twice after a clock regression", () => {
+    const lim = new RateLimiter(2, 4);
+    for (let i = 0; i < 4; i++) lim.check(1000);
+    for (let i = 0; i < 2; i++) lim.check(2000);
+    expect(() => lim.check(1500)).toThrow("rate limited");
+    expect(() => lim.check(2000)).toThrow("rate limited");
+    expect(() => lim.check(2499)).toThrow("rate limited");
+    expect(() => lim.check(2500)).not.toThrow();
+  });
+
+  test("rate limiter zero rate never refills and zero burst never admits", () => {
+    const lim = new RateLimiter(0, 1);
+    lim.check(0);
+    expect(() => lim.check(60_000)).toThrow("rate limited");
+    expect(() => new RateLimiter(2, 0).check(60_000)).toThrow("rate limited");
+  });
+
+  test("rate limiter shares count and check time observations", () => {
+    const lim = new RateLimiter(2, 2);
+    lim.check(0);
+    lim.check(0);
+    expect(lim.countInWindow(1000)).toBe(0);
+    lim.check(500);
+    lim.check(500);
+    expect(lim.countInWindow(1500)).toBe(2);
+    expect(() => lim.check(1500)).toThrow("rate limited");
+    expect(lim.countInWindow(0)).toBe(2);
+    expect(lim.countInWindow(2000)).toBe(0);
+  });
+
+  test("rate limiter counting before admission establishes the clock", () => {
+    const lim = new RateLimiter(2, 2);
+    expect(lim.countInWindow(1000)).toBe(0);
+    lim.check(0);
+    expect(lim.countInWindow(1000)).toBe(1);
+    expect(lim.countInWindow(1999)).toBe(1);
+    expect(lim.countInWindow(2000)).toBe(0);
+  });
+
+  test("rate limiter rejects unsupported numeric configuration", () => {
+    for (const value of [-1, 0.5, NaN, Infinity, -Infinity, 2 ** 32]) {
+      expect(() => new RateLimiter(value, 2)).toThrow(RangeError);
+      expect(() => new RateLimiter(2, value)).toThrow(RangeError);
+    }
+    expect(() => new RateLimiter(2 ** 32 - 1, 2 ** 32 - 1)).not.toThrow();
+  });
+
+  test("rate limiter rejects invalid time without changing state", () => {
+    const lim = new RateLimiter(2, 2);
+    lim.check(0);
+    for (const nowMs of [-1, 0.5, NaN, Infinity, -Infinity, 2 ** 53]) {
+      expect(() => lim.check(nowMs)).toThrow(RangeError);
+      expect(() => lim.countInWindow(nowMs)).toThrow(RangeError);
+      expect(lim.countInWindow(0)).toBe(1);
+    }
+    lim.check(0);
+    expect(() => lim.check(0)).toThrow("rate limited");
+  });
+
+  test("rate limiter preserves millisecond precision at the safe integer boundary", () => {
+    const lim = new RateLimiter(2, 4);
+    const end = Number.MAX_SAFE_INTEGER;
+    for (let i = 0; i < 4; i++) lim.check(end - 1500);
+    for (let i = 0; i < 2; i++) lim.check(end - 500);
+    expect(() => lim.check(end - 1)).toThrow("rate limited");
+    lim.check(end);
+    expect(() => lim.check(end)).toThrow("rate limited");
+  });
+
+  test("rate limiter caps wide elapsed refill and rate above burst", () => {
+    const lim = new RateLimiter(2 ** 32 - 1, 1);
+    lim.check(0);
+    expect(() => lim.check(999)).toThrow("rate limited");
+    lim.check(1000);
+    lim.check(Number.MAX_SAFE_INTEGER);
+    expect(() => lim.check(Number.MAX_SAFE_INTEGER)).toThrow("rate limited");
   });
 
   test("rate limiter bulk eviction stays correct and bounded", () => {

@@ -213,6 +213,8 @@ pub struct RateLimiter {
     timestamps: std::collections::VecDeque<u64>,
     limit_per_sec: u32,
     burst: u32,
+    credit: u64,
+    last_refill_ms: Option<u64>,
 }
 
 impl RateLimiter {
@@ -224,19 +226,21 @@ impl RateLimiter {
     #[must_use]
     pub fn new(limit_per_sec: u32, burst: u32) -> Self {
         Self {
-            timestamps: std::collections::VecDeque::with_capacity(burst as usize),
+            timestamps: std::collections::VecDeque::new(),
             limit_per_sec,
             burst,
+            credit: u64::from(burst) * RC9_WINDOW_MS,
+            last_refill_ms: None,
         }
     }
 
     pub fn count_in_window(&mut self, now_ms: u64) -> usize {
-        self.evict_old(now_ms);
+        self.observe_time(now_ms);
         self.timestamps.len()
     }
 
     pub fn check(&mut self, now_ms: u64) -> Result<(), TransportError> {
-        self.evict_old(now_ms);
+        let now_ms = self.observe_time(now_ms);
         if (self.timestamps.len() as u32) >= self.burst {
             return Err(TransportError::RateLimited(format!(
                 "{} requests in {}ms exceeds burst {}",
@@ -245,9 +249,27 @@ impl RateLimiter {
                 self.burst
             )));
         }
-        let _ = self.limit_per_sec;
+        if self.credit < RC9_WINDOW_MS {
+            return Err(TransportError::RateLimited(format!(
+                "sustained limit {} requests per {}ms exhausted",
+                self.limit_per_sec, RC9_WINDOW_MS
+            )));
+        }
+        self.credit -= RC9_WINDOW_MS;
         self.timestamps.push_back(now_ms);
         Ok(())
+    }
+
+    fn observe_time(&mut self, now_ms: u64) -> u64 {
+        let now_ms = now_ms.max(self.last_refill_ms.unwrap_or(now_ms));
+        let elapsed_ms = now_ms - self.last_refill_ms.unwrap_or(now_ms);
+        self.credit = self
+            .credit
+            .saturating_add(elapsed_ms.saturating_mul(u64::from(self.limit_per_sec)))
+            .min(u64::from(self.burst) * RC9_WINDOW_MS);
+        self.last_refill_ms = Some(now_ms);
+        self.evict_old(now_ms);
+        now_ms
     }
 
     fn evict_old(&mut self, now_ms: u64) {
@@ -707,13 +729,187 @@ mod tests {
     }
 
     #[test]
-    fn rate_limiter_burst() {
-        let mut lim = RateLimiter::new(10, 5);
-        for _ in 0..5 {
+    fn rate_limiter_shared_timeline() {
+        let mut lim = RateLimiter::new(2, 2);
+        lim.check(0).unwrap();
+        lim.check(0).unwrap();
+        assert_eq!(lim.count_in_window(1000), 0);
+        lim.check(500).unwrap();
+        lim.check(500).unwrap();
+        assert_eq!(lim.count_in_window(1500), 2);
+        assert!(matches!(
+            lim.check(1500),
+            Err(TransportError::RateLimited(_))
+        ));
+        assert_eq!(lim.count_in_window(0), 2);
+        assert_eq!(lim.count_in_window(2000), 0);
+    }
+
+    #[test]
+    fn rate_limiter_count_before_check() {
+        let mut lim = RateLimiter::new(2, 2);
+        assert_eq!(lim.count_in_window(1000), 0);
+        lim.check(0).unwrap();
+        assert_eq!(lim.count_in_window(1000), 1);
+        assert_eq!(lim.count_in_window(1999), 1);
+        assert_eq!(lim.count_in_window(2000), 0);
+    }
+
+    #[test]
+    fn rate_limiter_integer_boundaries() {
+        for end in [(1_u64 << 53) - 1, u64::MAX] {
+            let mut lim = RateLimiter::new(2, 4);
+            for _ in 0..4 {
+                lim.check(end - 1500).unwrap();
+            }
+            for _ in 0..2 {
+                lim.check(end - 500).unwrap();
+            }
+            assert!(matches!(
+                lim.check(end - 1),
+                Err(TransportError::RateLimited(_))
+            ));
+            lim.check(end).unwrap();
+            assert!(matches!(
+                lim.check(end),
+                Err(TransportError::RateLimited(_))
+            ));
+        }
+        let mut lim = RateLimiter::new(u32::MAX, u32::MAX);
+        assert!(lim.is_empty());
+        assert_eq!(lim.timestamps.capacity(), 0);
+        lim.check(0).unwrap();
+        lim.check(u64::MAX).unwrap();
+        assert_eq!(lim.count_in_window(u64::MAX), 1);
+    }
+
+    #[test]
+    fn rate_limiter_rate_above_burst() {
+        let mut lim = RateLimiter::new(u32::MAX, 1);
+        lim.check(0).unwrap();
+        assert!(matches!(
+            lim.check(999),
+            Err(TransportError::RateLimited(_))
+        ));
+        lim.check(1000).unwrap();
+        lim.check((1_u64 << 53) - 1).unwrap();
+        assert!(matches!(
+            lim.check((1_u64 << 53) - 1),
+            Err(TransportError::RateLimited(_))
+        ));
+    }
+
+    #[test]
+    fn rate_limiter_rc9_defaults() {
+        let mut lim = RateLimiter::rc9_default();
+        for _ in 0..RC9_BURST_PER_SEC {
             lim.check(0).unwrap();
         }
-        assert!(lim.check(0).is_err());
-        assert!(lim.check(1000).is_ok());
+        assert!(matches!(lim.check(0), Err(TransportError::RateLimited(_))));
+        for _ in 0..RC9_REQ_PER_SEC {
+            lim.check(RC9_WINDOW_MS).unwrap();
+        }
+        assert!(matches!(
+            lim.check(RC9_WINDOW_MS),
+            Err(TransportError::RateLimited(_))
+        ));
+    }
+
+    #[test]
+    fn rate_limiter_sustained_refill() {
+        let mut lim = RateLimiter::new(2, 4);
+        for _ in 0..4 {
+            lim.check(0).unwrap();
+        }
+        assert!(matches!(lim.check(0), Err(TransportError::RateLimited(_))));
+        for second in 1..=10 {
+            let now_ms = second * RC9_WINDOW_MS;
+            for _ in 0..2 {
+                lim.check(now_ms).unwrap();
+            }
+            assert!(matches!(
+                lim.check(now_ms),
+                Err(TransportError::RateLimited(_))
+            ));
+            assert_eq!(lim.count_in_window(now_ms), 2);
+        }
+    }
+
+    #[test]
+    fn rate_limiter_fractional_refill() {
+        let mut lim = RateLimiter::new(3, 6);
+        for _ in 0..6 {
+            lim.check(0).unwrap();
+        }
+        for _ in 0..3 {
+            lim.check(1000).unwrap();
+        }
+        for now_ms in [1100, 1200, 1300, 1333] {
+            assert!(matches!(
+                lim.check(now_ms),
+                Err(TransportError::RateLimited(_))
+            ));
+        }
+        assert_eq!(lim.count_in_window(1333), 3);
+        assert!(lim.check(1334).is_ok());
+        assert!(matches!(
+            lim.check(1334),
+            Err(TransportError::RateLimited(_))
+        ));
+    }
+
+    #[test]
+    fn rate_limiter_idle_credit_and_burst_ceiling() {
+        let mut lim = RateLimiter::new(2, 4);
+        lim.check(0).unwrap();
+        for _ in 0..4 {
+            lim.check(60_000).unwrap();
+        }
+        for now_ms in [60_000, 60_500] {
+            assert!(matches!(
+                lim.check(now_ms),
+                Err(TransportError::RateLimited(_))
+            ));
+        }
+        for _ in 0..2 {
+            lim.check(61_000).unwrap();
+        }
+        assert!(matches!(
+            lim.check(61_000),
+            Err(TransportError::RateLimited(_))
+        ));
+    }
+
+    #[test]
+    fn rate_limiter_clock_regression() {
+        let mut lim = RateLimiter::new(2, 4);
+        for _ in 0..4 {
+            lim.check(1000).unwrap();
+        }
+        for _ in 0..2 {
+            lim.check(2000).unwrap();
+        }
+        for now_ms in [1500, 2000, 2499] {
+            assert!(matches!(
+                lim.check(now_ms),
+                Err(TransportError::RateLimited(_))
+            ));
+        }
+        assert!(lim.check(2500).is_ok());
+    }
+
+    #[test]
+    fn rate_limiter_zero_limits() {
+        let mut lim = RateLimiter::new(0, 1);
+        lim.check(0).unwrap();
+        assert!(matches!(
+            lim.check(60_000),
+            Err(TransportError::RateLimited(_))
+        ));
+        assert!(matches!(
+            RateLimiter::new(2, 0).check(60_000),
+            Err(TransportError::RateLimited(_))
+        ));
     }
 
     #[test]
