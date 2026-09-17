@@ -10,7 +10,9 @@ use crate::bounds::{
     BUS_BATCH_MAX_BYTES, BUS_BATCH_MAX_EVENTS, BUS_EVENT_MAX_BYTES, CHUNK_BYTES, MAX_TRACE_BYTES,
     MAX_TRACE_DURATION_MS,
 };
+use crate::redaction::redact_value;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TracingError {
@@ -408,18 +410,23 @@ impl TracingClient {
                 BUS_EVENT_MAX_BYTES
             )));
         }
-        if rec.bytes + data.len() > rec.options.max_bytes {
+        let record = redact_value(data.to_string(), "trace.record");
+        let bytes_len = record.len();
+        if bytes_len > BUS_EVENT_MAX_BYTES {
+            return Err(TracingError::Invalid("trace record >8KiB".to_string()));
+        }
+        if rec.bytes + bytes_len > rec.options.max_bytes.min(rec.retention.max_bytes) {
             rec.drops += 1;
             return Ok(());
         }
-        let cur = rec.chunks.last().cloned().unwrap_or_default();
-        if cur.len() + data.len() > CHUNK_BYTES || rec.chunks.is_empty() {
-            rec.chunks.push(data.to_string());
+        let cur_len = rec.chunks.last().map_or(0, String::len);
+        if cur_len + bytes_len > CHUNK_BYTES || rec.chunks.is_empty() {
+            rec.chunks.push(record);
         } else {
             let last = rec.chunks.last_mut().unwrap();
-            last.push_str(data);
+            last.push_str(&record);
         }
-        rec.bytes += data.len();
+        rec.bytes += bytes_len;
         Ok(())
     }
 
@@ -441,10 +448,6 @@ impl TracingClient {
         if event.kind.len() > 64 {
             return Err(TracingError::Invalid("kind >64".to_string()));
         }
-        if rec.bytes + event.payload.len() > rec.options.max_bytes {
-            rec.drops += 1;
-            return Ok(());
-        }
         if let Some(ref filter) = rec.options.filter {
             if let Some(ref kinds) = filter.kinds {
                 if !kinds.contains(&event.kind) {
@@ -459,23 +462,41 @@ impl TracingClient {
                 }
             }
         }
-        let json = format!(
-            "{{\"seq\":{},\"owner\":\"{}\",\"kind\":\"{}\"}}",
-            event.sequence, event.owner, event.kind
-        );
-        if json.len() > BUS_EVENT_MAX_BYTES {
+        let retained = StructuredTraceEvent {
+            owner: redact_value(event.owner, "trace.owner"),
+            kind: redact_value(event.kind, "trace.kind"),
+            payload: redact_value(event.payload, "trace.payload"),
+            ..event
+        };
+        let mut json = format!("{{\"sequence\":{},\"owner\":", retained.sequence);
+        append_json_string(&mut json, &retained.owner);
+        json.push_str(",\"kind\":");
+        append_json_string(&mut json, &retained.kind);
+        json.push_str(",\"payload\":");
+        append_json_string(&mut json, &retained.payload);
+        write!(
+            json,
+            ",\"generation\":{},\"wallClockMs\":{}}}",
+            retained.generation, retained.wall_clock_ms
+        )
+        .unwrap();
+        let json_len = json.len();
+        if json_len > BUS_EVENT_MAX_BYTES {
             return Err(TracingError::Invalid("event json >8KiB".to_string()));
         }
-        let json_len = json.len();
-        let cur = rec.chunks.last().cloned().unwrap_or_default();
-        if cur.len() + json_len > CHUNK_BYTES || rec.chunks.is_empty() {
+        if rec.bytes + json_len > rec.options.max_bytes.min(rec.retention.max_bytes) {
+            rec.drops += 1;
+            return Ok(());
+        }
+        let cur_len = rec.chunks.last().map_or(0, String::len);
+        if cur_len + json_len > CHUNK_BYTES || rec.chunks.is_empty() {
             rec.chunks.push(json);
         } else {
             let last = rec.chunks.last_mut().unwrap();
             last.push_str(&json);
         }
         rec.bytes += json_len;
-        rec.events.push(event);
+        rec.events.push(retained);
         Ok(())
     }
 
@@ -502,6 +523,24 @@ impl TracingClient {
     pub fn list_traces(&self) -> Vec<String> {
         self.traces.keys().cloned().collect()
     }
+}
+
+fn append_json_string(json: &mut String, value: &str) {
+    json.push('"');
+    for ch in value.chars() {
+        match ch {
+            '"' => json.push_str("\\\""),
+            '\\' => json.push_str("\\\\"),
+            '\n' => json.push_str("\\n"),
+            '\r' => json.push_str("\\r"),
+            '\t' => json.push_str("\\t"),
+            '\u{0008}' => json.push_str("\\b"),
+            '\u{000c}' => json.push_str("\\f"),
+            '\u{0000}'..='\u{001f}' => write!(json, "\\u{:04x}", u32::from(ch)).unwrap(),
+            _ => json.push(ch),
+        }
+    }
+    json.push('"');
 }
 
 #[cfg(test)]
@@ -551,6 +590,149 @@ mod tests {
         let expired = c.gc_expired(2000, true).unwrap();
         assert_eq!(expired, vec![id]);
         assert_eq!(c.trace_count(), 0);
+    }
+
+    #[test]
+    fn raw_retention_matches_utf8_model() {
+        for (max_bytes, retention_bytes) in [(24, 48), (48, 24)] {
+            for coalesce in [CoalescePolicy::Budget, CoalescePolicy::None] {
+                for drop_policy in [DropPolicy::DropOldest, DropPolicy::DropNewest] {
+                    let mut c = TracingClient::new();
+                    let id = c
+                        .start_trace(
+                            TraceOptions {
+                                max_bytes,
+                                retention: Some(TraceRetention {
+                                    max_bytes: Some(retention_bytes),
+                                    max_duration_ms: None,
+                                    max_traces: None,
+                                }),
+                                coalesce,
+                                drop_policy,
+                                ..Default::default()
+                            },
+                            true,
+                            0,
+                        )
+                        .unwrap();
+                    let mut retained = String::new();
+                    let mut drops = 0;
+                    for record in ["你好", "café", "こんにちは", "добрый день", "salut"]
+                    {
+                        let before = format!("{:?}", c.traces[&id]);
+                        let rejected = retained.len() + record.len() > 24;
+                        if rejected {
+                            drops += 1;
+                        } else {
+                            retained.push_str(record);
+                        }
+                        c.append_to_trace(&id, record).unwrap();
+                        let state = c.traces.get_mut(&id).unwrap();
+                        assert_eq!(state.chunks.concat(), retained);
+                        assert_eq!(state.bytes, retained.len());
+                        assert_eq!(state.drops, drops);
+                        if rejected {
+                            state.drops -= 1;
+                            assert_eq!(format!("{state:?}"), before);
+                            state.drops += 1;
+                        }
+                    }
+                    assert_eq!(c.stop_trace(&id, true).unwrap(), (retained.len(), drops));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn structured_retention_matches_serialized_bytes() {
+        let event = StructuredTraceEvent {
+            sequence: 1,
+            owner: "面板".into(),
+            kind: "trace.record".into(),
+            payload: "café says \"こんにちは\"\n".into(),
+            generation: 1,
+            wall_clock_ms: 10,
+        };
+        let json = "{\"sequence\":1,\"owner\":\"面板\",\"kind\":\"trace.record\",\"payload\":\"café says \\\"こんにちは\\\"\\n\",\"generation\":1,\"wallClockMs\":10}";
+        for limit in [json.len() - 1, json.len(), json.len() + 1] {
+            for retention_first in [true, false] {
+                let mut c = TracingClient::new();
+                let id = c
+                    .start_trace(
+                        TraceOptions {
+                            max_bytes: if retention_first {
+                                json.len() * 2
+                            } else {
+                                limit
+                            },
+                            retention: Some(TraceRetention {
+                                max_bytes: Some(if retention_first {
+                                    limit
+                                } else {
+                                    json.len() * 2
+                                }),
+                                max_duration_ms: None,
+                                max_traces: None,
+                            }),
+                            ..Default::default()
+                        },
+                        true,
+                        0,
+                    )
+                    .unwrap();
+                let before = format!("{:?}", c.traces[&id]);
+                c.append_structured(&id, event.clone()).unwrap();
+                let state = c.traces.get_mut(&id).unwrap();
+                if limit < json.len() {
+                    assert_eq!(state.drops, 1);
+                    state.drops = 0;
+                    assert_eq!(format!("{state:?}"), before);
+                } else {
+                    assert_eq!(state.chunks.concat(), json);
+                    assert_eq!(state.bytes, json.len());
+                    assert_eq!(state.events.len(), 1);
+                    assert_eq!(state.events[0].payload, event.payload);
+                    let accepted = format!("{state:?}");
+                    c.append_structured(&id, event.clone()).unwrap();
+                    let state = c.traces.get_mut(&id).unwrap();
+                    assert_eq!(state.drops, 1);
+                    state.drops = 0;
+                    assert_eq!(format!("{state:?}"), accepted);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn retained_redaction_is_measured() {
+        let mut c = TracingClient::new();
+        let id = c.start_trace(TraceOptions::default(), true, 0).unwrap();
+        let event = StructuredTraceEvent {
+            sequence: 1,
+            owner: "panel-1".into(),
+            kind: "trace.record".into(),
+            payload: "password=example".into(),
+            generation: 1,
+            wall_clock_ms: 10,
+        };
+        c.append_structured(&id, event).unwrap();
+        let state = &c.traces[&id];
+        assert_eq!(state.events[0].payload, "[REDACTED]");
+        assert!(state.chunks.concat().contains("\"payload\":\"[REDACTED]\""));
+        assert_eq!(state.bytes, state.chunks.concat().len());
+        let raw = c
+            .start_trace(
+                TraceOptions {
+                    max_bytes: 10,
+                    ..Default::default()
+                },
+                true,
+                0,
+            )
+            .unwrap();
+        c.append_to_trace(&raw, "password=example").unwrap();
+        assert_eq!(c.traces[&raw].chunks, vec!["[REDACTED]"]);
+        assert_eq!(c.stop_trace(&raw, true).unwrap(), (10, 0));
     }
 
     #[test]
