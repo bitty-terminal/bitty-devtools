@@ -30,7 +30,7 @@ test:
 # Validate a commit message against commitlint.config.ts.
 # Versions are pinned in package.json / bun.lock; run `bun install` first.
 commit-check message:
-    bunx --bun commitlint --edit {{message}}
+    bun run --bun --no-install commitlint --edit "{{message}}"
 
 # Run the same logical gates as CI. All recipes are read-only.
 check:

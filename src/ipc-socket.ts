@@ -24,13 +24,16 @@
 
 import { DIR_MODE, SOCKET_MODE, resolveSocketPath } from "./auth.js";
 import {
+  Frame,
+  Framer,
   MAX_FRAME_BYTES,
   TransportError,
-  decodeFrame,
   encodeFrame,
 } from "./transport.js";
 
 export const LIVE_SOCKET_TIMEOUT_MS = 5_000 as const;
+
+export const LIVE_SOCKET_MAX_PENDING_FRAMES = 64 as const;
 
 export type LiveSocketConfig = {
   /** Resolved socket path, or advisory discovery inputs. */
@@ -258,10 +261,23 @@ export async function connectLiveSocket(
 
   let handle: BunSocketHandle | null = null;
   let dialError: unknown = null;
-  // Inbound bytes for the single round trip below. The handler is registered
-  // up front at dial time: Bun dispatches to the handler captured at
-  // `connect`, so swapping it later would silently drop the response.
-  const inbound: Uint8Array[] = [];
+  // Retained inbound bytes for the framed response stream. The handler is
+  // registered up front at dial time: Bun dispatches to the handler captured
+  // at `connect`, so swapping it later would silently drop the response.
+  const inbound = new Framer();
+  let framingFailed = false;
+  let framingError: unknown = null;
+  const pending: Frame[] = [];
+  const failFraming = (error: unknown): void => {
+    framingFailed = true;
+    framingError = error;
+    inbound.clear();
+    pending.length = 0;
+    const failed = responseFailed;
+    responseSettled = null;
+    responseFailed = null;
+    failed?.(error);
+  };
   let responseSettled: ((value: Uint8Array) => void) | null = null;
   let responseFailed: ((error: unknown) => void) | null = null;
   const opened = new Promise<BunSocketHandle>((resolve, reject) => {
@@ -278,27 +294,29 @@ export async function connectLiveSocket(
         unix: endpoint.socketPath,
         socket: {
           data(_socket, data) {
+            if (framingFailed) return;
             try {
-              inbound.push(new Uint8Array(data));
-              const total = inbound.reduce((n, c) => n + c.length, 0);
-              if (total < 4) return;
-              const merged = new Uint8Array(total);
-              let off = 0;
-              for (const c of inbound) {
-                merged.set(c, off);
-                off += c.length;
+              const frames = inbound.pushBytes(new Uint8Array(data));
+              for (const frame of frames) {
+                if (pending.length >= LIVE_SOCKET_MAX_PENDING_FRAMES) {
+                  throw new TransportError(
+                    "TransportFull",
+                    `pending frames exceed ${LIVE_SOCKET_MAX_PENDING_FRAMES}`,
+                  );
+                }
+                pending.push(frame);
               }
-              const { frame, consumed } = decodeFrame(merged);
-              void consumed;
-              inbound.length = 0;
-              responseSettled?.(frame.payload.slice());
             } catch (error) {
-              inbound.length = 0;
-              const failed = responseFailed;
-              responseSettled = null;
-              responseFailed = null;
-              failed?.(error);
+              failFraming(error);
+              return;
             }
+            if (responseSettled === null && responseFailed === null) return;
+            const next = pending.shift();
+            if (!next) return;
+            const settled = responseSettled;
+            responseSettled = null;
+            responseFailed = null;
+            settled?.(next.payload.slice());
           },
           error(_socket, error) {
             dialError = error;
@@ -348,11 +366,21 @@ export async function connectLiveSocket(
       if (!open) {
         throw new TransportError("TransportClosed", "live socket is closed");
       }
+      if (framingFailed) {
+        throw framingError instanceof TransportError
+          ? framingError
+          : new TransportError("TransportClosed", "framing failed");
+      }
       if (requestJson.length > MAX_FRAME_BYTES) {
         throw new TransportError(
           "FrameTooLarge",
           `request ${requestJson.length} > ${MAX_FRAME_BYTES}`,
         );
+      }
+      socket.write(encodeFrame(requestJson));
+      socket.flush();
+      if (pending.length > 0) {
+        return Promise.resolve(pending.shift()!.payload.slice());
       }
       return new Promise<Uint8Array>((resolve, reject) => {
         let settled = false;
@@ -384,24 +412,6 @@ export async function connectLiveSocket(
           responseFailed = null;
           reject(error);
         };
-        try {
-          socket.write(encodeFrame(requestJson));
-          socket.flush();
-        } catch (error) {
-          const failed = responseFailed;
-          responseSettled = null;
-          responseFailed = null;
-          clearTimeout(timer);
-          settled = true;
-          failed?.(
-            error instanceof TransportError
-              ? error
-              : new TransportError(
-                  "TransportClosed",
-                  `write to '${endpoint.socketPath}' failed: ${error instanceof Error ? error.message : String(error)}`,
-                ),
-          );
-        }
       });
     },
     close: () => {
