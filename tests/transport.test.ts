@@ -218,6 +218,99 @@ describe("transport framing (phase 2, live runtime, bounded 256 KiB IPC / 1 MiB 
     expect(t.getRateLimiter().countInWindow(0)).toBe(1);
   });
 
+  test("reconnect admission is independent of completed request history", () => {
+    const t = new IpcTransport({
+      runtimeUid: 1000,
+      socketPath: "/unused/headless.sock",
+      peer: peerCredentials(1000, 1000, 1),
+    });
+    for (let cycle = 0; cycle < 2; cycle++) {
+      t.connect();
+      for (let id = 0; id <= RC9_MAX_CONNECTIONS; id++) {
+        t.injectResponsePayload(
+          new TextEncoder().encode(
+            JSON.stringify({ jsonrpc: "2.0", id, result: {}, version: "1.0" }),
+          ),
+        );
+        expect(
+          t.request(
+            { id, method: "bitty.debug/listPlugins", version: "1.0" },
+            0,
+          ).id,
+        ).toBe(id);
+        expect(t.getStub().recvOutgoing()).toBeDefined();
+      }
+      expect(() => t.connect()).not.toThrow();
+      expect(t.isConnected()).toBe(true);
+      t.injectResponsePayload(new TextEncoder().encode("{}"));
+      t.disconnect();
+      t.disconnect();
+      expect(t.isConnected()).toBe(false);
+      expect(t.outgoingLen()).toBe(0);
+      expect(t.incomingLen()).toBe(0);
+      expect(t.getRateLimiter().countInWindow(0)).toBe(
+        (cycle + 1) * (RC9_MAX_CONNECTIONS + 1),
+      );
+    }
+    expect(() => t.connect()).not.toThrow();
+    t.disconnect();
+  });
+
+  test("reconnect preserves rate credit and releases terminally closed ownership", () => {
+    const t = new IpcTransport({
+      runtimeUid: 1000,
+      socketPath: "/unused/headless.sock",
+      peer: peerCredentials(1000, 1000, 1),
+      capacity: 1,
+    });
+    const req = { id: 1, method: "bitty.debug/listPlugins", version: "1.0" };
+    t.connect();
+    t.sendRequest(req, 0);
+    expect(() => t.sendRequest(req, 0)).toThrow("capacity");
+    expect(t.isConnected()).toBe(true);
+    t.disconnect();
+    expect(t.outgoingLen()).toBe(0);
+    t.connect();
+    t.sendRequest(req, 0);
+    expect(t.getRateLimiter().countInWindow(0)).toBe(3);
+    t.getStub().close();
+    expect(() => t.sendRequest(req, 0)).toThrow("closed");
+    expect(t.isConnected()).toBe(false);
+    expect(t.outgoingLen()).toBe(0);
+    expect(() => t.connect()).toThrow("closed");
+    t.disconnect();
+    expect(() => t.connect()).toThrow("closed");
+    expect(t.isConnected()).toBe(false);
+    expect(t.getRateLimiter().countInWindow(0)).toBe(3);
+  });
+
+  test("reconnect failure leaves no ownership and rechecks peer identity", () => {
+    const peer = peerCredentials(1000, 1000, 1);
+    const t = new IpcTransport({
+      runtimeUid: 1000,
+      socketPath: "/unused/headless.sock",
+      peer,
+    });
+    peer.uid = 1001;
+    expect(() => t.connect()).toThrow("peer uid");
+    expect(t.isConnected()).toBe(false);
+    t.disconnect();
+    peer.uid = 1000;
+    t.connect();
+    peer.uid = 1001;
+    expect(() => t.connect()).toThrow("peer uid");
+    expect(() =>
+      t.sendRequest(
+        { id: 1, method: "bitty.debug/listPlugins", version: "1.0" },
+        0,
+      ),
+    ).toThrow("peer uid");
+    t.disconnect();
+    peer.uid = 1000;
+    expect(() => t.connect()).not.toThrow();
+    t.disconnect();
+  });
+
   test("ipc transport rejects foreign user peer", () => {
     const peer = peerCredentials(1001, 1000, 1);
     const t = new IpcTransport({
