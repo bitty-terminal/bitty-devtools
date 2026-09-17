@@ -98,6 +98,221 @@ describe("tracing (debug.trace, opt-in, bounded)", () => {
     c.stopTrace(start.traceId);
   });
 
+  for (const structured of [false, true]) {
+    test(`variable-size ${structured ? "structured" : "raw"} pages match the retained stream`, () => {
+      const c = new TracingClient();
+      const scope = "debug.trace";
+      const start = c.startTrace(scope, { maxBytes: 1024 * 1024 });
+      const records: string[] = [];
+      const chunks: string[] = [];
+      for (let i = 0; i < 100; i++) {
+        const payload = `${i}:` + "abcdef".repeat(900 + (i % 5) * 100);
+        const event = {
+          sequence: i,
+          owner: "panel-1",
+          kind: "sample",
+          payload,
+          generation: 1,
+          wallClockMs: i,
+        };
+        const record = structured ? JSON.stringify(event) : payload;
+        records.push(record);
+        const last = chunks.length - 1;
+        if (
+          last < 0 ||
+          chunks[last]!.length + record.length > start.chunkBytes
+        ) {
+          chunks.push(record);
+        } else {
+          chunks[last] += record;
+        }
+        if (structured) c.appendStructuredEvent(start.traceId, event);
+        else c.appendToTrace(start.traceId, payload);
+      }
+      const reference = records.join("");
+      expect(chunks.length).toBeGreaterThan(2);
+      expect(chunks[0]!.length).toBeLessThan(start.chunkBytes);
+      let startOffset = 0;
+      for (const expectedChunk of chunks) {
+        for (const intraOffset of [0, 1, expectedChunk.length - 1]) {
+          const offset = startOffset + intraOffset;
+          const page = c.fetchTraceChunk(scope, start.traceId, offset);
+          expect(page.offset).toBe(offset);
+          expect(page.chunk).toBe(expectedChunk.slice(intraOffset));
+          expect(page.chunk).toBe(
+            reference.slice(offset, offset + page.chunk.length),
+          );
+          expect(page.preview).toBe(
+            redactPreview(page.chunk.slice(0, 512), "trace.preview").text,
+          );
+          expect(page.chunk.length).toBeLessThanOrEqual(start.chunkBytes);
+          expect(page.continuation).toBe(
+            offset + page.chunk.length < reference.length,
+          );
+        }
+        startOffset += expectedChunk.length;
+      }
+      let offset = 0;
+      let reconstructed = "";
+      for (let i = 0; i < chunks.length; i++) {
+        const page = c.fetchTraceChunk(scope, start.traceId, offset);
+        expect(page.chunk.length).toBeGreaterThan(0);
+        reconstructed += page.chunk;
+        offset += page.chunk.length;
+        expect(page.continuation).toBe(i < chunks.length - 1);
+      }
+      expect(reconstructed).toBe(reference);
+      const end = c.fetchTraceChunk(scope, start.traceId, reference.length);
+      expect(end.chunk).toBe("");
+      expect(end.continuation).toBe(false);
+    });
+  }
+
+  test("fetch offsets use UTF-8 boundaries and preserve text", () => {
+    const c = new TracingClient();
+    const scope = "debug.trace";
+    const start = c.startTrace(scope, {});
+    const source = "aé中🙂\uFEFFz";
+    c.appendToTrace(start.traceId, source);
+    const encoder = new TextEncoder();
+    let offset = 0;
+    let charOffset = 0;
+    for (const char of source) {
+      const page = c.fetchTraceChunk(scope, start.traceId, offset);
+      expect(page.offset).toBe(offset);
+      expect(page.chunk).toBe(source.slice(charOffset));
+      expect(encoder.encode(page.chunk).length).toBe(
+        encoder.encode(source).length - offset,
+      );
+      expect(page.continuation).toBe(false);
+      offset += encoder.encode(char).length;
+      charOffset += char.length;
+    }
+    expect(c.fetchTraceChunk(scope, start.traceId, offset).chunk).toBe("");
+    expect(() => c.fetchTraceChunk(scope, start.traceId, 2)).toThrow();
+  });
+
+  test("normalized raw fragments paginate within retained byte budgets", () => {
+    const scalar = "𐐷";
+    const fragments = [scalar.slice(0, 1), scalar.slice(1), "\uFEFF", "é", "z"];
+    const expected = "\uFFFD\uFFFD\uFEFFéz";
+    const encoder = new TextEncoder();
+    const bytes = encoder.encode(expected).length;
+    for (const retentionFirst of [true, false]) {
+      const c = new TracingClient();
+      const { traceId } = c.startTrace("debug.trace", {
+        maxBytes: retentionFirst ? bytes * 2 : bytes,
+        retention: { maxBytes: retentionFirst ? bytes : bytes * 2 },
+      });
+      for (const fragment of fragments) c.appendToTrace(traceId, fragment);
+      const before = c.fetchTraceChunk("debug.trace", traceId, 0);
+      expect(before.chunk).toBe(expected);
+      c.appendToTrace(traceId, "extra");
+      expect(c.fetchTraceChunk("debug.trace", traceId, 0)).toEqual(before);
+      let offset = 0;
+      let charOffset = 0;
+      for (const char of expected) {
+        const page = c.fetchTraceChunk("debug.trace", traceId, offset);
+        expect(page.chunk).toBe(expected.slice(charOffset));
+        expect(encoder.encode(page.chunk)).toEqual(
+          encoder.encode(expected).slice(offset),
+        );
+        expect(page.continuation).toBe(false);
+        offset += encoder.encode(char).length;
+        charOffset += char.length;
+      }
+      const end = c.fetchTraceChunk("debug.trace", traceId, bytes);
+      expect(end.chunk).toBe("");
+      expect(end.continuation).toBe(false);
+      const stopped = c.stopTrace("debug.trace", traceId);
+      expect(stopped.byteCount).toBe(bytes);
+      expect(stopped.dropCount).toBe(1);
+    }
+  });
+
+  for (const structured of [false, true]) {
+    test(`multilingual ${structured ? "structured" : "raw"} pages preserve retained bytes across chunks`, () => {
+      const c = new TracingClient();
+      const { traceId, chunkBytes } = c.startTrace("debug.trace", {
+        maxBytes: 1024 * 1024,
+      });
+      const encoder = new TextEncoder();
+      const chunks: string[] = [];
+      const records: string[] = [];
+      for (let i = 0; i < 100; i++) {
+        const payload = "\uFEFF" + "é中𐐷".repeat(600 + (i % 4) * 50) + "z";
+        const event: StructuredTraceEvent = {
+          sequence: i,
+          owner: "panel-1",
+          kind: "sample",
+          payload,
+          generation: 1,
+          wallClockMs: i,
+        };
+        const record = structured ? JSON.stringify(event) : payload;
+        records.push(record);
+        const last = chunks.length - 1;
+        if (
+          last < 0 ||
+          encoder.encode(chunks[last]! + record).length > chunkBytes
+        )
+          chunks.push(record);
+        else chunks[last] += record;
+        if (structured) c.appendStructuredEvent(traceId, event);
+        else c.appendToTrace(traceId, payload);
+      }
+      const reference = records.join("");
+      const referenceBytes = encoder.encode(reference);
+      expect(chunks.length).toBeGreaterThan(2);
+      let offset = 0;
+      let reconstructed = "";
+      for (const expectedChunk of chunks) {
+        const page = c.fetchTraceChunk("debug.trace", traceId, offset);
+        const length = encoder.encode(expectedChunk).length;
+        expect(page.chunk).toBe(expectedChunk);
+        expect(encoder.encode(page.chunk)).toEqual(
+          referenceBytes.slice(offset, offset + length),
+        );
+        expect(length).toBeLessThanOrEqual(chunkBytes);
+        expect(page.continuation).toBe(offset + length < referenceBytes.length);
+        const lastByte = c.fetchTraceChunk(
+          "debug.trace",
+          traceId,
+          offset + length - 1,
+        );
+        expect(lastByte.chunk).toBe(expectedChunk.slice(-1));
+        expect(lastByte.continuation).toBe(page.continuation);
+        reconstructed += page.chunk;
+        offset += length;
+      }
+      expect(reconstructed).toBe(reference);
+      expect(c.fetchTraceChunk("debug.trace", traceId, offset).chunk).toBe("");
+      expect(
+        c.fetchTraceChunk("debug.trace", traceId, offset).continuation,
+      ).toBe(false);
+      expect(c.stopTrace("debug.trace", traceId).byteCount).toBe(offset);
+    });
+  }
+
+  test("empty, end and appended-tail offsets have explicit continuation", () => {
+    const c = new TracingClient();
+    const scope = "debug.trace";
+    const start = c.startTrace(scope, {});
+    expect(c.fetchTraceChunk(scope, start.traceId, 0).chunk).toBe("");
+    expect(c.fetchTraceChunk(scope, start.traceId, 0).continuation).toBe(false);
+    c.appendToTrace(start.traceId, "hello");
+    const first = c.fetchTraceChunk(scope, start.traceId, 0);
+    expect(first.continuation).toBe(false);
+    c.appendToTrace(start.traceId, " world");
+    const tail = c.fetchTraceChunk(scope, start.traceId, first.chunk.length);
+    expect(tail.chunk).toBe(" world");
+    expect(tail.continuation).toBe(false);
+    expect(c.fetchTraceChunk(scope, start.traceId, 11).chunk).toBe("");
+    for (const offset of [-1, 0.5, 12, NaN, Infinity]) {
+      expect(() => c.fetchTraceChunk(scope, start.traceId, offset)).toThrow();
+    }
+  });
+
   test("H-DEV-02: tampered export bytes fail the preview check (no tautology)", () => {
     // Before the fix both call sites compared the preview to itself, so this
     // tampered export passed silently. The honest check throws PreviewMismatch.
