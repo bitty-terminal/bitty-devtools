@@ -137,6 +137,29 @@ describe("auth peer-creds (phase 2, live runtime)", () => {
     expect(store.size).toBe(0);
   });
 
+  test("child token rejection diagnostics contain only fixed categories", () => {
+    const marker = "benign-marker";
+    const store = new ChildTokenStore();
+    const check = (message: string) => {
+      try {
+        store.verify(marker, "terminal.inspect", "t:4", 60_000);
+        expect.unreachable("rejected token must throw");
+      } catch (err) {
+        expect(err).toBeInstanceOf(AuthError);
+        expect((err as AuthError).code).toBe("Unauthenticated");
+        expect((err as AuthError).message).toBe(message);
+        expect(String(err)).not.toContain(marker);
+        expect(JSON.stringify(err)).not.toContain(marker);
+      }
+    };
+    check("unknown child token");
+    store.insert(newChildToken(marker, "terminal.inspect", "t:4", 0, 60_000));
+    expect(() =>
+      store.verify(marker, "terminal.inspect", "t:4", 59_999),
+    ).not.toThrow();
+    check("child token expired");
+  });
+
   test("BITTY_SOCKET without peer cred still fails (advisory only)", () => {
     const peer = peerCredentials(2000, 2000, 99);
     const runtimeUid = 1000;

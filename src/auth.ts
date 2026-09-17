@@ -339,16 +339,10 @@ export class ChildTokenStore {
     }
     const tok = matches === 1 ? matched : undefined;
     if (tok === undefined) {
-      throw new AuthError(
-        "Unauthenticated",
-        `unknown child token '${tokenStr}'`,
-      );
+      throw new AuthError("Unauthenticated", "unknown child token");
     }
     if (childTokenIsExpired(tok, nowMs)) {
-      throw new AuthError(
-        "Unauthenticated",
-        `child token '${tokenStr}' expired`,
-      );
+      throw new AuthError("Unauthenticated", "child token expired");
     }
     if (
       !timingSafeTokenEqual(tok.scope, scope) ||
