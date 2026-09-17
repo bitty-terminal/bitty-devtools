@@ -199,30 +199,67 @@ export class RateLimiter {
   // entry) instead of Array.shift() (O(K) memmove per entry).
   private timestamps: number[] = [];
   private head = 0;
+  private credit: number;
+  private lastRefillMs: number | undefined;
 
   constructor(
     private readonly limitPerSec: number = RC9_REQ_PER_SEC,
     private readonly burst: number = RC9_BURST_PER_SEC,
-  ) {}
+  ) {
+    for (const value of [limitPerSec, burst]) {
+      if (!Number.isInteger(value) || value < 0 || value > 2 ** 32 - 1) {
+        throw new RangeError("rate and burst must be unsigned 32-bit integers");
+      }
+    }
+    this.credit = burst * RC9_WINDOW_MS;
+  }
 
   static rc9Default(): RateLimiter {
     return new RateLimiter(RC9_REQ_PER_SEC, RC9_BURST_PER_SEC);
   }
 
   countInWindow(nowMs: number): number {
-    this.evictOld(nowMs);
+    this.observeTime(nowMs);
     return this.timestamps.length - this.head;
   }
 
   check(nowMs: number): void {
-    this.evictOld(nowMs);
+    nowMs = this.observeTime(nowMs);
     if (this.timestamps.length - this.head >= this.burst) {
       throw new TransportError(
         "RateLimited",
         `rate limited: ${this.timestamps.length - this.head} requests in ${RC9_WINDOW_MS}ms exceeds burst ${this.burst}`,
       );
     }
+    if (this.credit < RC9_WINDOW_MS) {
+      throw new TransportError(
+        "RateLimited",
+        `rate limited: sustained limit ${this.limitPerSec} requests per ${RC9_WINDOW_MS}ms exhausted`,
+      );
+    }
+    this.credit -= RC9_WINDOW_MS;
     this.timestamps.push(nowMs);
+  }
+
+  private observeTime(nowMs: number): number {
+    if (!Number.isSafeInteger(nowMs) || nowMs < 0) {
+      throw new RangeError(
+        "time must be nonnegative safe-integer milliseconds",
+      );
+    }
+    nowMs = Math.max(nowMs, this.lastRefillMs ?? nowMs);
+    const elapsedMs = nowMs - (this.lastRefillMs ?? nowMs);
+    const capacity = this.burst * RC9_WINDOW_MS;
+    if (this.limitPerSec > 0) {
+      const refillMs = Math.ceil((capacity - this.credit) / this.limitPerSec);
+      this.credit =
+        elapsedMs >= refillMs
+          ? capacity
+          : this.credit + elapsedMs * this.limitPerSec;
+    }
+    this.lastRefillMs = nowMs;
+    this.evictOld(nowMs);
+    return nowMs;
   }
 
   private evictOld(nowMs: number): void {
