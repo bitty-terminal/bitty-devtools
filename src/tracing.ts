@@ -15,7 +15,11 @@
  */
 
 import { BOUNDS, assertBounded, assertStringBounded } from "./bounds.js";
-import { redactPreview, previewEqualsExport } from "./redaction.js";
+import {
+  redactPreview,
+  redactValue,
+  previewEqualsExport,
+} from "./redaction.js";
 
 export type TraceOptions = {
   durationMs?: number;
@@ -427,41 +431,41 @@ export class TracingClient {
     if (rec === undefined)
       throw new TracingError("NotFound", `trace ${traceId} not found`);
     assertStringBounded("trace record", data, BOUNDS.BUS_EVENT_MAX_BYTES);
-    if (rec.bytes + data.length > rec.options.maxBytes!) {
+    const record = new TextDecoder("utf-8", { ignoreBOM: true }).decode(
+      new TextEncoder().encode(redactValue(data, "trace.record")),
+    );
+    const bytesLen = new TextEncoder().encode(record).length;
+    assertBounded("trace record", bytesLen, BOUNDS.BUS_EVENT_MAX_BYTES);
+    if (
+      rec.bytes + bytesLen >
+      Math.min(rec.options.maxBytes!, rec.retention.maxBytes)
+    ) {
       rec.drops += 1;
       return;
     }
-    // Coalescing for budget records when enabled
-    if (rec.coalesce === "budget" && rec.events.length > 0) {
-      const last = rec.events[rec.events.length - 1];
-      if (last !== undefined && data.includes(last.kind)) {
-        // Coalesce: replace last with latest (DropOldest semantics for budget)
-        last.payload = data;
-        return;
-      }
-    }
     const currentChunk = rec.chunks[rec.chunks.length - 1] ?? "";
-    if (
-      new TextEncoder().encode(currentChunk).length + data.length >
-      BOUNDS.CHUNK_BYTES
-    ) {
-      rec.chunks.push(data);
-    } else {
-      if (rec.chunks.length === 0) rec.chunks.push(data);
-      else rec.chunks[rec.chunks.length - 1] += data;
-    }
-    rec.bytes += data.length;
-    rec.events.push({
-      sequence: rec.sequence++,
+    const event = {
+      sequence: rec.sequence,
       owner: "panel-1",
       kind: "trace.record",
-      payload: data,
+      payload: record,
       generation: 1,
       wallClockMs: Date.now(),
-    });
+    };
+    if (
+      new TextEncoder().encode(currentChunk).length + bytesLen >
+      BOUNDS.CHUNK_BYTES
+    ) {
+      rec.chunks.push(record);
+    } else {
+      if (rec.chunks.length === 0) rec.chunks.push(record);
+      else rec.chunks[rec.chunks.length - 1] += record;
+    }
+    rec.bytes += bytesLen;
+    rec.sequence++;
+    rec.events.push(event);
     if (rec.previewCache.length < 4) {
-      const { text } = redactPreview(data.slice(0, 512), "trace.preview");
-      rec.previewCache.push(text);
+      rec.previewCache.push(record.slice(0, 512));
     }
   }
 
@@ -481,10 +485,6 @@ export class TracingClient {
       event.generation,
       Number.MAX_SAFE_INTEGER,
     );
-    if (rec.bytes + event.payload.length > rec.options.maxBytes!) {
-      rec.drops += 1;
-      return;
-    }
     // Filter enforcement
     if (
       rec.filter?.kinds !== undefined &&
@@ -500,14 +500,30 @@ export class TracingClient {
       rec.drops += 1;
       return;
     }
-    const json = JSON.stringify(event);
+    const retained: StructuredTraceEvent = {
+      sequence: event.sequence,
+      owner: redactValue(event.owner, "trace.owner"),
+      kind: redactValue(event.kind, "trace.kind"),
+      payload: redactValue(event.payload, "trace.payload"),
+      generation: event.generation,
+      wallClockMs: event.wallClockMs,
+      ...(event.coalesced === undefined ? {} : { coalesced: event.coalesced }),
+    };
+    const json = JSON.stringify(retained);
     const bytesLen = new TextEncoder().encode(json).length;
     if (bytesLen > BOUNDS.BUS_EVENT_MAX_BYTES) {
       throw new TracingError("TooLarge", "structured event exceeds 8 KiB");
     }
+    if (
+      rec.bytes + bytesLen >
+      Math.min(rec.options.maxBytes!, rec.retention.maxBytes)
+    ) {
+      rec.drops += 1;
+      return;
+    }
     const currentChunk = rec.chunks[rec.chunks.length - 1] ?? "";
     if (
-      new TextEncoder().encode(currentChunk).length + json.length >
+      new TextEncoder().encode(currentChunk).length + bytesLen >
       BOUNDS.CHUNK_BYTES
     ) {
       rec.chunks.push(json);
@@ -515,8 +531,8 @@ export class TracingClient {
       if (rec.chunks.length === 0) rec.chunks.push(json);
       else rec.chunks[rec.chunks.length - 1] += json;
     }
-    rec.bytes += json.length;
-    rec.events.push(event);
+    rec.bytes += bytesLen;
+    rec.events.push(retained);
   }
 
   /** Phase 2: retention and GC. */
