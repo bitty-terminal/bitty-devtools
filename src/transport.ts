@@ -472,7 +472,7 @@ export type IpcResponse = {
 export class IpcTransport {
   private readonly stub: StdioTransportStub;
   private readonly limiter: RateLimiter;
-  private connected = false;
+  private activeConnections = 0;
   private requests = 0;
   private readonly peer: PeerCredentials | null;
   private readonly config: Required<
@@ -509,7 +509,7 @@ export class IpcTransport {
   }
 
   isConnected(): boolean {
-    return this.connected;
+    return this.activeConnections === 1;
   }
 
   getSocketPath(): string {
@@ -525,6 +525,10 @@ export class IpcTransport {
   }
 
   connect(nowMs?: number): void {
+    if (this.stub.isClosed()) {
+      this.disconnect();
+      throw new TransportError("TransportClosed", "stdio transport is closed");
+    }
     if (this.isWindowsPipe()) {
       // CTX-0043: named-pipe peers carry SIDs, not Unix modes/owners.
       this.checkWindowsPipe(
@@ -566,15 +570,17 @@ export class IpcTransport {
         );
       }
     }
-    checkConnectionCap(this.requests);
-    this.connected = true;
+    if (!this.isConnected()) {
+      checkConnectionCap(this.activeConnections);
+      this.activeConnections += 1;
+    }
     if (nowMs !== undefined) {
       void nowMs;
     }
   }
 
   disconnect(): void {
-    this.connected = false;
+    this.activeConnections = 0;
     this.stub.clear();
   }
 
@@ -619,7 +625,11 @@ export class IpcTransport {
   }
 
   sendRequest(req: IpcRequest, nowMs: number): void {
-    if (!this.connected)
+    if (this.stub.isClosed()) {
+      this.disconnect();
+      throw new TransportError("TransportClosed", "stdio transport is closed");
+    }
+    if (!this.isConnected())
       throw new TransportError("TransportClosed", "not connected");
     this.verifyPeerForPrivilegedAction();
     this.limiter.check(nowMs);

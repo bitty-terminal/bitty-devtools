@@ -480,7 +480,7 @@ impl Default for StdioTransportStub {
 pub struct IpcTransport {
     stub: StdioTransportStub,
     limiter: RateLimiter,
-    connected: bool,
+    active_connections: usize,
     requests: usize,
     peer: Option<PeerCredentials>,
     runtime_uid: u32,
@@ -512,7 +512,7 @@ impl IpcTransport {
         Self {
             stub: StdioTransportStub::new(capacity),
             limiter: RateLimiter::rc9_default(),
-            connected: false,
+            active_connections: 0,
             requests: 0,
             peer,
             runtime_uid,
@@ -571,7 +571,7 @@ impl IpcTransport {
 
     #[must_use]
     pub fn is_connected(&self) -> bool {
-        self.connected
+        self.active_connections == 1
     }
 
     #[must_use]
@@ -580,6 +580,10 @@ impl IpcTransport {
     }
 
     pub fn connect(&mut self) -> Result<(), TransportError> {
+        if self.stub.is_closed() {
+            self.disconnect();
+            return Err(TransportError::TransportClosed);
+        }
         if let (Some(peer_sid), Some(runtime_sid)) =
             (self.windows_peer_sid, self.windows_runtime_sid)
         {
@@ -621,13 +625,15 @@ impl IpcTransport {
                 )));
             }
         }
-        check_connection_cap(self.requests)?;
-        self.connected = true;
+        if !self.is_connected() {
+            check_connection_cap(self.active_connections)?;
+            self.active_connections += 1;
+        }
         Ok(())
     }
 
     pub fn disconnect(&mut self) {
-        self.connected = false;
+        self.active_connections = 0;
         self.stub.clear();
     }
 
@@ -664,7 +670,11 @@ impl IpcTransport {
     }
 
     pub fn send_request(&mut self, json: &str, now_ms: u64) -> Result<(), TransportError> {
-        if !self.connected {
+        if self.stub.is_closed() {
+            self.disconnect();
+            return Err(TransportError::TransportClosed);
+        }
+        if !self.is_connected() {
             return Err(TransportError::TransportClosed);
         }
         self.verify_peer_for_privileged()?;
@@ -922,6 +932,112 @@ mod tests {
         );
         assert!(t.connect().is_ok());
         assert!(t.is_connected());
+    }
+
+    #[test]
+    fn reconnect_admission_ignores_completed_request_history() {
+        let mut t = IpcTransport::with_defaults(
+            1000,
+            "/unused/headless.sock".into(),
+            Some(PeerCredentials::new(1000, 1000, 1)),
+        );
+        for cycle in 0..2 {
+            t.connect().unwrap();
+            for _ in 0..=RC9_MAX_CONNECTIONS {
+                t.send_request("{}", 0).unwrap();
+                assert!(t.stub_mut().recv_outgoing().is_some());
+            }
+            assert!(t.connect().is_ok());
+            assert!(t.is_connected());
+            t.stub_mut().inject_incoming_payload(b"{}").unwrap();
+            t.disconnect();
+            t.disconnect();
+            assert!(!t.is_connected());
+            assert_eq!(t.outgoing_len(), 0);
+            assert_eq!(t.incoming_len(), 0);
+            assert_eq!(t.requests, (cycle + 1) * (RC9_MAX_CONNECTIONS + 1));
+            assert_eq!(t.limiter_mut().count_in_window(0), t.requests);
+        }
+        assert!(t.connect().is_ok());
+        t.disconnect();
+    }
+
+    #[test]
+    fn reconnect_preserves_rate_credit_and_releases_closed_ownership() {
+        let mut t = IpcTransport::new(
+            1000,
+            "/unused/headless.sock".into(),
+            Some(PeerCredentials::new(1000, 1000, 1)),
+            0o700,
+            0o600,
+            1000,
+            1000,
+            1,
+        );
+        t.limiter = RateLimiter::new(0, 3);
+        t.connect().unwrap();
+        t.send_request("{}", 0).unwrap();
+        assert!(matches!(
+            t.send_request("{}", 0),
+            Err(TransportError::TransportFull { .. })
+        ));
+        assert!(t.is_connected());
+        t.disconnect();
+        assert_eq!(t.outgoing_len(), 0);
+        t.connect().unwrap();
+        t.send_request("{}", 0).unwrap();
+        assert_eq!(t.requests, 2);
+        assert_eq!(t.limiter_mut().count_in_window(0), 3);
+        t.disconnect();
+        t.connect().unwrap();
+        assert!(matches!(
+            t.send_request("{}", 0),
+            Err(TransportError::RateLimited(_))
+        ));
+        assert!(t.is_connected());
+        t.stub_mut().close();
+        assert!(matches!(
+            t.send_request("{}", 0),
+            Err(TransportError::TransportClosed)
+        ));
+        assert!(!t.is_connected());
+        assert_eq!(t.outgoing_len(), 0);
+        assert!(matches!(t.connect(), Err(TransportError::TransportClosed)));
+        t.disconnect();
+        assert!(matches!(t.connect(), Err(TransportError::TransportClosed)));
+        assert!(!t.is_connected());
+        assert_eq!(t.requests, 2);
+        assert_eq!(t.limiter_mut().count_in_window(0), 3);
+    }
+
+    #[test]
+    fn reconnect_failure_preserves_ownership_and_rechecks_peer() {
+        let mut t = IpcTransport::with_defaults(
+            1000,
+            "/unused/headless.sock".into(),
+            Some(PeerCredentials::new(1001, 1000, 1)),
+        );
+        assert!(matches!(
+            t.connect(),
+            Err(TransportError::Unauthenticated(_))
+        ));
+        assert!(!t.is_connected());
+        t.disconnect();
+        t.peer = Some(PeerCredentials::new(1000, 1000, 1));
+        t.connect().unwrap();
+        t.peer = Some(PeerCredentials::new(1001, 1000, 1));
+        assert!(matches!(
+            t.connect(),
+            Err(TransportError::Unauthenticated(_))
+        ));
+        assert!(matches!(
+            t.send_request("{}", 0),
+            Err(TransportError::Unauthenticated(_))
+        ));
+        t.disconnect();
+        t.peer = Some(PeerCredentials::new(1000, 1000, 1));
+        assert!(t.connect().is_ok());
+        t.disconnect();
     }
 
     #[test]
