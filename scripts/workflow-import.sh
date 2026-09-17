@@ -104,8 +104,26 @@ have timeout || fail "timeout not on PATH"
 PROJECT="$(cd "$PROJECT" && pwd)" || fail "project directory $PROJECT not found"
 TRACK_REF="refs/remotes/$REMOTE/carryctx-snapshots"
 TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/workflow-import.XXXXXX")"
+CFG="$PROJECT/.carryctx/config.toml"
+CFG_BACKUP=""
+RESTORE_FAILED=0
+restore_config() {
+	if [[ -n "$CFG_BACKUP" ]] && ! cmp -s "$CFG_BACKUP" "$CFG"; then
+		if ! mkdir -p "$PROJECT/.carryctx" || ! cp -p "$CFG_BACKUP" "$CFG"; then
+			RESTORE_FAILED=1
+			warn "cannot restore $CFG; recovery backup retained at $CFG_BACKUP"
+			return 1
+		fi
+		log "restored pre-existing .carryctx/config.toml (import rewrites local config defaults)"
+	fi
+}
 cleanup() {
+	local status=$?
+	if [[ "$RESTORE_FAILED" == 1 ]] || ! restore_config; then
+		exit 1
+	fi
 	rm -rf "$TMP_ROOT"
+	exit "$status"
 }
 trap cleanup EXIT
 
@@ -180,11 +198,9 @@ if [[ "$DRY_RUN" == 1 ]]; then
 	exit 0
 fi
 
-CFG="$PROJECT/.carryctx/config.toml"
-CFG_BACKUP=""
 if [[ -f "$CFG" ]]; then
+	cp -p "$CFG" "$TMP_ROOT/config.toml.before" || fail "cannot back up $CFG"
 	CFG_BACKUP="$TMP_ROOT/config.toml.before"
-	cp -p "$CFG" "$CFG_BACKUP" || fail "cannot back up $CFG"
 fi
 
 # Fresh clone / no project row: initialize CarryCtx state explicitly so the
@@ -210,10 +226,7 @@ if ! timeout "$GIT_TIMEOUT" carryctx import --from-git "$TRACK_REF" \
 	fail "carryctx import failed; local DB is left in the state carryctx reports above"
 fi
 
-if [[ -n "$CFG_BACKUP" && -f "$CFG" ]] && ! cmp -s "$CFG_BACKUP" "$CFG"; then
-	cp -p "$CFG_BACKUP" "$CFG" || fail "cannot restore $CFG after import"
-	log "restored pre-existing .carryctx/config.toml (import rewrites local config defaults)"
-fi
+restore_config || exit 1
 
 print_provenance
 log "restore complete; local counts:"
