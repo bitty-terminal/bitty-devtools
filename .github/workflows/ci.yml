@@ -48,7 +48,6 @@ jobs:
     permissions:
       contents: read
     env:
-      CARGO_NET_OFFLINE: "true"
       RUST_TEST_THREADS: "1"
     steps:
       - name: Checkout repository
@@ -66,4 +65,6 @@ jobs:
       - name: Fetch locked Rust dependencies (setup only)
         run: cargo fetch --locked
       - name: Rust fuzz smoke (locked, offline, single-threaded)
+        env:
+          CARGO_NET_OFFLINE: "true"
         run: cargo test -p bitty-devtools-client --test framer_fuzz_smoke --locked --offline -- --test-threads=1
