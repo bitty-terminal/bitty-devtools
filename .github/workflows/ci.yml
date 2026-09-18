@@ -40,3 +40,31 @@ jobs:
         uses: docker://rhysd/actionlint:1.7.12
         with:
           args: -color
+
+  fuzz-smoke:
+    name: Fuzz smoke (pinned, read-only, offline)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    env:
+      RUST_TEST_THREADS: "1"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.2
+      - name: Set up Rust 1.98.1
+        run: rustup toolchain install 1.98.1 --profile minimal --no-self-update
+      - name: Reject seed mirror drift
+        run: diff -r tests/fixtures/fuzz/framer-seeds crates/devtools-client/tests/fixtures/fuzz/framer-seeds
+      - name: TypeScript fuzz smoke (no install)
+        run: bun test tests/framer-fuzz-smoke.test.ts
+      - name: Fetch locked Rust dependencies (setup only)
+        run: cargo fetch --locked
+      - name: Rust fuzz smoke (locked, offline, single-threaded)
+        env:
+          CARGO_NET_OFFLINE: "true"
+        run: cargo test -p bitty-devtools-client --test framer_fuzz_smoke --locked --offline -- --test-threads=1

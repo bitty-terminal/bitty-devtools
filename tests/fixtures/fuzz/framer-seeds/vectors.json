@@ -1,0 +1,333 @@
+{
+  "constants": {
+    "framerLimitBytes": 524296,
+    "maxBufferedBytes": 262152,
+    "maxFrameBytes": 262144,
+    "rc10ChunkBytes": 262144,
+    "rc9PayloadCapBytes": 1048576
+  },
+  "manifestVersion": 1,
+  "provenance": {
+    "issue": "https://github.com/bitty-terminal/bitty-devtools/issues/124",
+    "mode": "checked-in benign seeds only; large vectors are built in memory from sizes below, never stored",
+    "option": "B thin-duplicate harness, devtools-side only; no core edits, no live socket, no credentials",
+    "task": "CTX-0074"
+  },
+  "vectors": [
+    {
+      "expect": {
+        "disposition": "accept",
+        "framesHex": []
+      },
+      "id": "V01",
+      "inputHex": "",
+      "kind": "empty-push",
+      "target": "T1"
+    },
+    {
+      "expect": {
+        "disposition": "accept",
+        "framesHex": [""]
+      },
+      "id": "V02",
+      "inputHex": "00000000",
+      "kind": "zero-len-frame",
+      "target": "T1"
+    },
+    {
+      "expect": {
+        "disposition": "accept",
+        "framesHex": ["68656c6c6f"],
+        "retainedAfterFirstPush": 1
+      },
+      "feed": {
+        "splits": [1]
+      },
+      "id": "V03",
+      "kind": "header-split-1B",
+      "target": "T1",
+      "wireHex": "0000000568656c6c6f"
+    },
+    {
+      "expect": {
+        "disposition": "accept",
+        "framesHex": ["68656c6c6f"],
+        "retainedAfterFirstPush": 2
+      },
+      "feed": {
+        "splits": [2]
+      },
+      "id": "V04",
+      "kind": "header-split-2B",
+      "target": "T1",
+      "wireHex": "0000000568656c6c6f"
+    },
+    {
+      "expect": {
+        "disposition": "accept",
+        "framesHex": ["68656c6c6f"],
+        "retainedAfterFirstPush": 3
+      },
+      "feed": {
+        "splits": [3]
+      },
+      "id": "V05",
+      "kind": "header-split-3B",
+      "target": "T1",
+      "wireHex": "0000000568656c6c6f"
+    },
+    {
+      "expect": {
+        "disposition": "accept",
+        "framesHex": ["6869"]
+      },
+      "feed": {
+        "trickleBytes": 1
+      },
+      "id": "V06",
+      "kind": "trickle-1B",
+      "target": "T1",
+      "wireHex": "000000026869"
+    },
+    {
+      "expect": {
+        "disposition": "accept",
+        "framesHex": ["61", "6262", "636363"]
+      },
+      "id": "V07",
+      "inputHex": "000000016100000002626200000003636363",
+      "kind": "coalesced-3",
+      "target": "T1"
+    },
+    {
+      "expect": {
+        "disposition": "accept",
+        "framesHex": [],
+        "retainedAfterFirstPush": 2
+      },
+      "feed": {
+        "splits": [2]
+      },
+      "id": "V08",
+      "kind": "truncated-header-2B",
+      "target": "T1",
+      "wireHex": "0000000568656c6c6f"
+    },
+    {
+      "expect": {
+        "disposition": "accept",
+        "framesHex": ["68656c6c6f4141414141414141414141"],
+        "retainedAfterFirstPush": 9
+      },
+      "feed": {
+        "splits": [9]
+      },
+      "id": "V09",
+      "kind": "body-short-then-complete",
+      "target": "T1",
+      "wireHex": "0000001068656c6c6f4141414141414141414141"
+    },
+    {
+      "expect": {
+        "cleared": true,
+        "code": "FrameTooLarge",
+        "disposition": "reject",
+        "recoversWith": "6f6b"
+      },
+      "id": "V10",
+      "inputHex": "00040001",
+      "kind": "declared-256k-plus1",
+      "target": "T1"
+    },
+    {
+      "expect": {
+        "cleared": true,
+        "code": "FrameTooLarge",
+        "disposition": "reject",
+        "recoversWith": "6f6b"
+      },
+      "id": "V11",
+      "inputHex": "ffffffff",
+      "kind": "declared-u32max",
+      "target": "T1"
+    },
+    {
+      "build": {
+        "fillByte": 0,
+        "payloadLen": 524297
+      },
+      "expect": {
+        "cleared": true,
+        "code": "PayloadTooLarge",
+        "disposition": "reject",
+        "recoversWith": "6f6b"
+      },
+      "id": "V12",
+      "kind": "over-buffer-limit-plus1",
+      "target": "T1"
+    },
+    {
+      "expect": {
+        "cleared": true,
+        "code": "FrameTooLarge",
+        "disposition": "reject",
+        "recoversWith": "6f6b"
+      },
+      "id": "V13",
+      "inputHex": "0000000568656c6c6fffffffff",
+      "kind": "mixed-valid-then-oversize",
+      "target": "T1"
+    },
+    {
+      "expect": {
+        "disposition": "accept",
+        "framesHex": ["f09f9880"]
+      },
+      "feed": {
+        "splits": [6]
+      },
+      "id": "V14",
+      "kind": "emoji-body-split",
+      "target": "T1",
+      "wireHex": "00000004f09f9880"
+    },
+    {
+      "expect": {
+        "disposition": "accept",
+        "framesHex": ["e697a5e69cace8aa9e"]
+      },
+      "feed": {
+        "splits": [5]
+      },
+      "id": "V15",
+      "kind": "cjk-body-split",
+      "target": "T1",
+      "wireHex": "00000009e697a5e69cace8aa9e"
+    },
+    {
+      "build": {
+        "fillByte": 65,
+        "payloadLen": 262143
+      },
+      "expect": {
+        "disposition": "accept",
+        "frameCount": 1,
+        "payloadLen": 262143
+      },
+      "id": "V16",
+      "kind": "payload-256k-minus1",
+      "target": "T1"
+    },
+    {
+      "build": {
+        "fillByte": 65,
+        "payloadLen": 262144
+      },
+      "expect": {
+        "disposition": "accept",
+        "frameCount": 1,
+        "payloadLen": 262144
+      },
+      "id": "V17",
+      "kind": "payload-256k-exact",
+      "target": "T1"
+    },
+    {
+      "expect": {
+        "chunks": ["a", "😀", "b"]
+      },
+      "id": "C01",
+      "input": "a😀b",
+      "kind": "chunk-emoji",
+      "target": "T3",
+      "limitBytes": 4
+    },
+    {
+      "expect": {
+        "chunks": ["日", "本", "語"]
+      },
+      "id": "C02",
+      "input": "日本語",
+      "kind": "chunk-cjk",
+      "target": "T3",
+      "limitBytes": 4
+    },
+    {
+      "expect": {
+        "chunks": ["é", "x"]
+      },
+      "id": "C03",
+      "input": "éx",
+      "kind": "chunk-combining",
+      "target": "T3",
+      "limitBytes": 3
+    },
+    {
+      "expect": {
+        "disposition": "error"
+      },
+      "id": "C04",
+      "input": "a😀b",
+      "kind": "chunk-too-narrow",
+      "limitBytes": 2,
+      "target": "T3"
+    },
+    {
+      "build": {
+        "jsonLen": 262144
+      },
+      "expect": {
+        "chunks": 1
+      },
+      "id": "Q01",
+      "kind": "req-256k-exact",
+      "target": "T4"
+    },
+    {
+      "build": {
+        "jsonLen": 262145
+      },
+      "expect": {
+        "chunks": 2
+      },
+      "id": "Q02",
+      "kind": "req-256k-plus1",
+      "target": "T4"
+    },
+    {
+      "build": {
+        "jsonLen": 1048576
+      },
+      "expect": {
+        "chunks": 4
+      },
+      "id": "Q03",
+      "kind": "req-1mib-exact",
+      "target": "T4"
+    },
+    {
+      "build": {
+        "jsonLen": 1048577
+      },
+      "expect": {
+        "code": "PayloadTooLarge",
+        "disposition": "reject"
+      },
+      "id": "Q04",
+      "kind": "req-1mib-plus1",
+      "target": "T4"
+    },
+    {
+      "expect": {
+        "cleared": true,
+        "disposition": "reject",
+        "pendingDropped": true
+      },
+      "id": "Q05",
+      "inputHex": "ffffffff",
+      "kind": "inbound-failframing-model",
+      "note": "mock bytes only, no dial",
+      "target": "T4"
+    }
+  ]
+}
