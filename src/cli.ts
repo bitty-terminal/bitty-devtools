@@ -59,6 +59,21 @@ export const MAX_JSON_DEPTH = 8 as const;
 /** Generation used by `inspect --budgets` when the caller omits one. */
 export const DEFAULT_GENERATION = 1 as const;
 
+/** Default `inspect --watch` interval in milliseconds. */
+export const DEFAULT_WATCH_INTERVAL_MS = 2000 as const;
+
+/** Floor for `--interval-ms`: 10x the accepted sampling floor (CTX-0189). */
+export const WATCH_FLOOR_MS = 1000 as const;
+
+/** Ceiling for `--interval-ms`. */
+export const WATCH_CEILING_MS = 60000 as const;
+
+/** Per-tick jitter fraction (+-10%, anti-thundering-herd only). */
+export const WATCH_JITTER_FRACTION = 0.1 as const;
+
+/** Cap for `--max-ticks` (tests use a bounded value at or below this). */
+export const WATCH_MAX_TICKS = 1000 as const;
+
 export const DEFAULT_TRACE_DURATION_MS = 10000 as const;
 export const DEFAULT_TRACE_MAX_BYTES = 524288 as const;
 export const TRACE_ID_MAX_BYTES = 128 as const;
@@ -72,6 +87,9 @@ export type InspectOptions = {
   json: boolean;
   socket: string | null;
   instance: string | null;
+  watch: boolean;
+  intervalMs: number | null;
+  maxTicks: number | null;
 };
 
 export type TraceStartOptions = {
@@ -139,6 +157,7 @@ Usage:
   bitty-devtools inspect --plugins [--generation <n>] [options]
   bitty-devtools inspect --subscriptions --plugin <id> [options]
   bitty-devtools inspect --budgets --plugin <id> [--generation <n>] [options]
+  bitty-devtools inspect (--plugins|--subscriptions --plugin <id>|--budgets --plugin <id>) [--watch] [--interval-ms <n>] [--max-ticks <n>] [options]
   bitty-devtools trace start --wire-trace [--duration-ms <n>] [--max-bytes <n>] [--include-input] [options]
   bitty-devtools trace stop --wire-trace --trace-id <id> [options]
   bitty-devtools trace fetch-chunk --wire-trace --trace-id <id> --offset <n> [options]
@@ -157,6 +176,9 @@ Trace (requires --wire-trace, live socket, debug.trace):
 Options:
   --plugin <id>       Plugin id required by --subscriptions and --budgets.
   --generation <n>    Target plugin generation (default ${DEFAULT_GENERATION} for --budgets).
+  --watch             Re-dispatch the inspect selector until cancelled or --max-ticks.
+  --interval-ms <n>   Watch interval ${WATCH_FLOOR_MS}..${WATCH_CEILING_MS}, default ${DEFAULT_WATCH_INTERVAL_MS}.
+  --max-ticks <n>     Watch frame cap 1..${WATCH_MAX_TICKS} (required bounded in tests).
   --wire-trace        Presence-only opt-in for trace verbs, default off.
   --duration-ms <n>   Trace duration 1..300000, default 10000.
   --max-bytes <n>     Trace bytes 1..4194304, default 524288.
@@ -197,6 +219,40 @@ function takeValue(
   return value;
 }
 
+function parseWatchIntervalMs(raw: string): number {
+  if (!/^\d+$/.test(raw)) {
+    throw new CliUsageError(
+      `--interval-ms must be an integer in ${WATCH_FLOOR_MS}..${WATCH_CEILING_MS} (saw '${raw}')`,
+    );
+  }
+  const value = Number(raw);
+  if (
+    !Number.isSafeInteger(value) ||
+    value < WATCH_FLOOR_MS ||
+    value > WATCH_CEILING_MS
+  ) {
+    throw new CliUsageError(
+      `--interval-ms must be an integer in ${WATCH_FLOOR_MS}..${WATCH_CEILING_MS} (saw '${raw}')`,
+    );
+  }
+  return value;
+}
+
+function parseWatchMaxTicks(raw: string): number {
+  if (!/^\d+$/.test(raw)) {
+    throw new CliUsageError(
+      `--max-ticks must be an integer in 1..${WATCH_MAX_TICKS} (saw '${raw}')`,
+    );
+  }
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value < 1 || value > WATCH_MAX_TICKS) {
+    throw new CliUsageError(
+      `--max-ticks must be an integer in 1..${WATCH_MAX_TICKS} (saw '${raw}')`,
+    );
+  }
+  return value;
+}
+
 function parseInspect(argv: readonly string[]): CliCommand {
   let selector: InspectSelector | null = null;
   let plugin: string | null = null;
@@ -204,6 +260,9 @@ function parseInspect(argv: readonly string[]): CliCommand {
   let json = false;
   let socket: string | null = null;
   let instance: string | null = null;
+  let watch = false;
+  let intervalRaw: string | null = null;
+  let maxTicksRaw: string | null = null;
 
   const setSelector = (next: InspectSelector, flag: string): void => {
     if (selector !== null) {
@@ -245,6 +304,17 @@ function parseInspect(argv: readonly string[]): CliCommand {
       case "--json":
         json = true;
         break;
+      case "--watch":
+        watch = true;
+        break;
+      case "--interval-ms":
+        intervalRaw = takeValue(argv, i + 1, arg);
+        i += 1;
+        break;
+      case "--max-ticks":
+        maxTicksRaw = takeValue(argv, i + 1, arg);
+        i += 1;
+        break;
       case "-h":
       case "--help":
         return { kind: "help" };
@@ -275,6 +345,20 @@ function parseInspect(argv: readonly string[]): CliCommand {
     parsedGeneration = value;
   }
 
+  let intervalMs: number | null = null;
+  if (intervalRaw !== null) {
+    intervalMs = parseWatchIntervalMs(intervalRaw);
+  }
+  let maxTicks: number | null = null;
+  if (maxTicksRaw !== null) {
+    maxTicks = parseWatchMaxTicks(maxTicksRaw);
+  }
+  if ((intervalMs !== null || maxTicks !== null) && !watch) {
+    throw new CliUsageError(
+      "--interval-ms/--max-ticks require --watch (single-shot inspect takes no watch flags)",
+    );
+  }
+
   return {
     kind: "inspect",
     options: {
@@ -284,6 +368,9 @@ function parseInspect(argv: readonly string[]): CliCommand {
       json,
       socket,
       instance,
+      watch,
+      intervalMs,
+      maxTicks,
     },
   };
 }
@@ -565,6 +652,12 @@ export type CliDeps = {
    * one from flags/environment.
    */
   transport?: IpcTransport;
+  /**
+   * Watch-loop hooks (CTX-0072, A4 sections 3-4). Tests inject a bounded
+   * clock, deterministic jitter, a no-op sleep, and an abort bridge; the
+   * production binary entry wires one `AbortController` to SIGINT.
+   */
+  watch?: WatchHooks;
 };
 
 /**
@@ -827,6 +920,252 @@ function dispatchTraceFetch(
 }
 
 /**
+ * Effective per-tick sleep for `inspect --watch` (A4 section 3).
+ *
+ * `intervalMs * (1 + U)` with U uniform in [-0.10, +0.10] drawn per tick
+ * from a non-crypto PRNG. Jitter is anti-thundering-herd only, never a
+ * security boundary. Pure function of `(intervalMs, random01)` so tests can
+ * assert the clamp without real timers.
+ */
+export function watchTickDelayMs(intervalMs: number, random01: number): number {
+  const clamped =
+    random01 < 0
+      ? 0
+      : random01 > 1
+        ? 1
+        : Number.isFinite(random01)
+          ? random01
+          : 0;
+  const uniform = clamped * 2 - 1;
+  return intervalMs * (1 + WATCH_JITTER_FRACTION * uniform);
+}
+
+export type WatchHooks = {
+  now?: () => number;
+  random01?: () => number;
+  onTick?: (frames: number, delayMs: number) => void;
+  shouldContinue?: () => boolean;
+  sleep?: (delayMs: number) => Promise<void>;
+  signal?: AbortSignal;
+  onSignal?: (abort: () => void) => () => void;
+};
+
+export type WatchTickOutcome =
+  | { kind: "frame"; output: string }
+  | { kind: "rateLimited"; error: unknown }
+  | { kind: "denied"; error: unknown }
+  | { kind: "failed"; error: unknown }
+  | { kind: "cancelled" };
+
+/**
+ * One watch tick over the already-connected client (A4 sections 2-5).
+ *
+ * Exactly one inspect dispatch via the existing `dispatch` path, pinned to
+ * the already-granted `debug.inspect` scope. Per-tick peer re-verification
+ * runs up front (fail-closed); the dispatch itself enforces RC-9 admission
+ * plus peer verification per request, so a `RateLimited` verdict (typed
+ * server budget error or client limiter) skips emission for this tick and
+ * defers to the next scheduled tick, never a tight retry loop. A
+ * `ScopeDenied` verdict terminates the loop with zero further ticks. The
+ * partial frame of a cancelled tick is discarded, never rendered, never
+ * spooled, never retained. No cross-tick retention: only the returned output
+ * string leaves this function.
+ */
+export function runWatchTick(
+  client: DevtoolsClient,
+  transport: IpcTransport,
+  options: InspectOptions,
+  signal?: AbortSignal,
+): WatchTickOutcome {
+  if (signal?.aborted) return { kind: "cancelled" };
+  if (!client.isIpcConnected()) return { kind: "cancelled" };
+  try {
+    transport.verifyPeerForPrivilegedAction();
+  } catch (error) {
+    if (error instanceof TransportError && error.code === "TransportClosed") {
+      return { kind: "cancelled" };
+    }
+    if (error instanceof AuthError) return { kind: "denied", error };
+    return { kind: "failed", error };
+  }
+  if (signal?.aborted) return { kind: "cancelled" };
+  let output: string;
+  try {
+    output = dispatch(client, options);
+  } catch (error) {
+    if (signal?.aborted) return { kind: "cancelled" };
+    if (error instanceof InspectionError && error.code === "ScopeDenied") {
+      return { kind: "denied", error };
+    }
+    if (error instanceof InspectionError && error.code === "RateLimited") {
+      return { kind: "rateLimited", error };
+    }
+    if (error instanceof AuthError) {
+      return { kind: "denied", error };
+    }
+    if (error instanceof TransportError) {
+      if (error.code === "RateLimited" || error.code === "TransportFull") {
+        return { kind: "rateLimited", error };
+      }
+      if (error.code === "TransportClosed") return { kind: "cancelled" };
+    }
+    if (
+      error instanceof Error &&
+      (error.message.includes("scope denied") ||
+        error.message.includes("scope required") ||
+        error.message.includes("ScopeDenied"))
+    ) {
+      return { kind: "denied", error };
+    }
+    return { kind: "failed", error };
+  }
+  if (signal?.aborted) return { kind: "cancelled" };
+  return { kind: "frame", output };
+}
+
+async function runWatchTickLive(
+  client: DevtoolsClient,
+  options: InspectOptions,
+  nowMs: number,
+  signal?: AbortSignal,
+): Promise<WatchTickOutcome> {
+  if (signal?.aborted) return { kind: "cancelled" };
+  if (!client.isIpcConnected()) return { kind: "cancelled" };
+  try {
+    const output = await dispatchLive(client, options, nowMs);
+    if (signal?.aborted) return { kind: "cancelled" };
+    return { kind: "frame", output };
+  } catch (error) {
+    if (signal?.aborted) return { kind: "cancelled" };
+    if (
+      error instanceof InspectionError &&
+      (error.code === "ScopeDenied" || error.message.includes("scope"))
+    ) {
+      return { kind: "denied", error };
+    }
+    if (error instanceof AuthError) {
+      return { kind: "denied", error };
+    }
+    if (error instanceof TransportError) {
+      if (error.code === "RateLimited" || error.code === "TransportFull") {
+        return { kind: "rateLimited", error };
+      }
+      if (error.code === "TransportClosed") return { kind: "cancelled" };
+    }
+    if (
+      error instanceof Error &&
+      (error.message.includes("scope denied") ||
+        error.message.includes("scope required") ||
+        error.message.includes("ScopeDenied"))
+    ) {
+      return { kind: "denied", error };
+    }
+    return { kind: "failed", error };
+  }
+}
+
+/**
+ * Inspect-only watch loop for the headless entry (A4 sections 2-5).
+ *
+ * Owns one `AbortController` bridged to `hooks.signal` (SIGINT/close in
+ * production) and to client disconnect. Exactly one `dispatch` per tick;
+ * `--max-ticks` caps total frames; per-tick bounds reuse the single-shot
+ * render path; no history buffer is retained. Returns the terminal exit code:
+ * 0 when cancelled after >=1 complete frame, otherwise the pending typed
+ * verdict (6 TransportClosed/RateLimited, 7 ScopeDenied, 1 InvalidResult).
+ */
+async function runWatchLoopWith(
+  options: InspectOptions,
+  runtime: CliRuntime,
+  hooks: WatchHooks,
+  tick: (signal: AbortSignal) => WatchTickOutcome | Promise<WatchTickOutcome>,
+): Promise<number> {
+  const intervalMs = options.intervalMs ?? DEFAULT_WATCH_INTERVAL_MS;
+  const maxTicks = options.maxTicks ?? null;
+  const random01 = hooks.random01 ?? Math.random;
+  const shouldContinue = hooks.shouldContinue ?? (() => true);
+  const sleep =
+    hooks.sleep ??
+    ((delayMs: number) => new Promise<void>((r) => setTimeout(r, delayMs)));
+  const controller = new AbortController();
+  const detach =
+    hooks.onSignal !== undefined
+      ? hooks.onSignal(() => controller.abort())
+      : undefined;
+  const external = hooks.signal;
+  const onExternalAbort = (): void => controller.abort();
+  if (external !== undefined) {
+    if (external.aborted) controller.abort();
+    else external.addEventListener("abort", onExternalAbort, { once: true });
+  }
+  let frames = 0;
+  let pending: unknown = null;
+  const settle = (): number => {
+    if (frames >= 1) return EXIT_OK;
+    if (pending !== null) {
+      runtime.stderr(`bitty-devtools: ${formatCliError(pending)}\n`);
+      return exitCodeForError(pending);
+    }
+    return EXIT_RUNTIME;
+  };
+  try {
+    for (;;) {
+      if (controller.signal.aborted || !shouldContinue()) return settle();
+      if (maxTicks !== null && frames >= maxTicks) return EXIT_OK;
+      const delay = watchTickDelayMs(intervalMs, random01());
+      hooks.onTick?.(frames, delay);
+      const outcome = await tick(controller.signal);
+      if (outcome.kind === "frame") {
+        runtime.stdout(`${outcome.output}\n`);
+        frames += 1;
+        if (maxTicks !== null && frames >= maxTicks) return EXIT_OK;
+        await sleep(delay);
+      } else if (outcome.kind === "rateLimited") {
+        pending = outcome.error;
+        await sleep(delay);
+      } else if (outcome.kind === "denied") {
+        runtime.stderr(`bitty-devtools: ${formatCliError(outcome.error)}\n`);
+        return exitCodeForError(outcome.error);
+      } else if (outcome.kind === "cancelled") {
+        return settle();
+      } else {
+        runtime.stderr(`bitty-devtools: ${formatCliError(outcome.error)}\n`);
+        return exitCodeForError(outcome.error);
+      }
+    }
+  } finally {
+    if (external !== undefined) {
+      external.removeEventListener("abort", onExternalAbort);
+    }
+    detach?.();
+  }
+}
+
+export async function runWatchLoop(
+  client: DevtoolsClient,
+  transport: IpcTransport,
+  options: InspectOptions,
+  runtime: CliRuntime,
+  hooks: WatchHooks = {},
+): Promise<number> {
+  return runWatchLoopWith(options, runtime, hooks, (signal) =>
+    runWatchTick(client, transport, options, signal),
+  );
+}
+
+async function runWatchLoopLive(
+  client: DevtoolsClient,
+  options: InspectOptions,
+  runtime: CliRuntime,
+  hooks: WatchHooks = {},
+): Promise<number> {
+  const now = hooks.now ?? runtime.now;
+  return runWatchLoopWith(options, runtime, hooks, (signal) =>
+    runWatchTickLive(client, options, now(), signal),
+  );
+}
+
+/**
  * Live dispatch for `runCliLive`: same selectors as `dispatch`, but each
  * inspection call goes over the socket via `client.requestLive` instead of
  * the headless stub. Request ids start at 1 per invocation.
@@ -974,6 +1313,11 @@ export function exitCodeForError(error: unknown): number {
  *
  * The live-socket path (`deps.liveSocket === true`, CTX-0036) is async via
  * `runCliLiveAsync`; use that entry directly when dialing is wanted.
+ *
+ * With `inspect --watch` this entry is intentionally sync-fail-closed: the
+ * watch loop needs an async sleep, so use {@link runCliWatch} (or the async
+ * live entry) instead. A sync caller that passes `--watch` gets exit 2 and a
+ * diagnostic, never a half-run loop.
  */
 export function runCli(argv: readonly string[], deps: CliDeps): number {
   const { runtime } = deps;
@@ -1039,6 +1383,107 @@ export function runCli(argv: readonly string[], deps: CliDeps): number {
   try {
     client.connectWithTransport(transport);
     client.grantScope("debug.inspect");
+    if (options.watch) {
+      runtime.stderr(
+        "bitty-devtools: inspect --watch requires the async entry (runCliWatch/runCliLive)\n",
+      );
+      return EXIT_USAGE;
+    }
+    const output = dispatch(client, options);
+    runtime.stdout(`${output}\n`);
+    return EXIT_OK;
+  } catch (error) {
+    runtime.stderr(`bitty-devtools: ${formatCliError(error)}\n`);
+    return exitCodeForError(error);
+  } finally {
+    try {
+      client.disconnect();
+    } catch {
+      // Disconnect is best-effort; a closed transport must not mask the result.
+    }
+  }
+}
+
+/**
+ * Headless inspect-only watch entry for programmatic callers (CTX-0072).
+ *
+ * Same contract as the `--watch` branch of `runCli`, but async: callers that
+ * need to await tick sleeps use this instead of the sync `runCli`.
+ */
+export async function runCliWatch(
+  argv: readonly string[],
+  deps: CliDeps,
+): Promise<number> {
+  const { runtime } = deps;
+
+  let command: CliCommand;
+  try {
+    command = parseCliArgs(argv);
+  } catch (error) {
+    runtime.stderr(`bitty-devtools: ${formatCliError(error)}\n\n${USAGE}\n`);
+    return EXIT_USAGE;
+  }
+
+  if (command.kind === "help") {
+    runtime.stdout(`${USAGE}\n`);
+    return EXIT_OK;
+  }
+
+  if (
+    command.kind === "trace-start" ||
+    command.kind === "trace-stop" ||
+    command.kind === "trace-fetch"
+  ) {
+    runtime.stderr(
+      "bitty-devtools: no connected Bitty instance; trace requires live socket, pass --socket <path> or " +
+        "--instance <id> via live entry\n",
+    );
+    return EXIT_RUNTIME;
+  }
+
+  const options = command.options;
+  let transport = deps.transport ?? null;
+  if (transport === null) {
+    let socketPath: string | null;
+    try {
+      socketPath = resolveSocket(options, runtime);
+    } catch (error) {
+      runtime.stderr(`bitty-devtools: ${formatCliError(error)}\n`);
+      return exitCodeForError(error);
+    }
+    if (socketPath === null) {
+      runtime.stderr(
+        "bitty-devtools: no connected Bitty instance; pass --socket <path> or " +
+          "--instance <id>, or set BITTY_SOCKET / BITTY_INSTANCE_ID with " +
+          "XDG_RUNTIME_DIR\n",
+      );
+      return EXIT_RUNTIME;
+    }
+    try {
+      transport = new IpcTransport({
+        runtimeUid: runtime.uid,
+        socketPath,
+        peer: peerCredentials(runtime.uid, runtime.gid, runtime.pid),
+      });
+    } catch (error) {
+      runtime.stderr(`bitty-devtools: ${formatCliError(error)}\n`);
+      return exitCodeForError(error);
+    }
+  }
+
+  const client = new DevtoolsClient();
+  try {
+    client.connectWithTransport(transport);
+    client.grantScope("debug.inspect");
+    if (options.watch) {
+      return await runWatchLoop(
+        client,
+        transport,
+        options,
+        runtime,
+        deps.watch ?? {},
+      );
+    }
     const output = dispatch(client, options);
     runtime.stdout(`${output}\n`);
     return EXIT_OK;
@@ -1153,16 +1598,33 @@ export async function runCliLive(
     return EXIT_RUNTIME;
   }
 
+  const injected = deps.transport ?? null;
   const client = new DevtoolsClient();
   try {
-    await client.connectLiveSocket(
-      runtime.uid,
-      peerCredentials(runtime.uid, runtime.gid, runtime.pid),
-      runtime.env["XDG_RUNTIME_DIR"],
-      options.instance ?? undefined,
-      socketPath,
-    );
+    if (injected !== null) {
+      client.connectWithTransport(injected);
+    } else {
+      await client.connectLiveSocket(
+        runtime.uid,
+        peerCredentials(runtime.uid, runtime.gid, runtime.pid),
+        runtime.env["XDG_RUNTIME_DIR"],
+        options.instance ?? undefined,
+        socketPath,
+      );
+    }
     client.grantScope("debug.inspect");
+    if (options.watch) {
+      if (injected !== null) {
+        return await runWatchLoop(
+          client,
+          injected,
+          options,
+          runtime,
+          deps.watch ?? {},
+        );
+      }
+      return await runWatchLoopLive(client, options, runtime, deps.watch ?? {});
+    }
     const output = await dispatchLive(client, options, runtime.now());
     runtime.stdout(`${output}\n`);
     return EXIT_OK;
