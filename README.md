@@ -159,6 +159,36 @@ Rust counterpart at `crates/devtools-client` mirrors the same contracts:
 `cargo test` `37` tests pass; `just check` green; `bun test` `62` tests
 pass. No `unsafe`, no PTY/GPU/window handle, no TCP, no ambient credential.
 
+## Trace accounting semantics (Implemented, CTX-0053 / CTX-0054)
+
+The trace helpers account **retained, redacted, logical UTF-8 export bytes** —
+the bytes that would be retained after typed redaction (serialized JSON for
+structured events, per-record UTF-8 normalization for raw records) — never heap
+or filesystem occupancy. This mirrors the client trace helper note in the
+accepted
+[DevTools RFC](https://github.com/bitty-terminal/bitty-docs/blob/main/docs/specifications/devtools-rfc.md)
+(bitty-docs CTX-0026) and remains `Implemented` only.
+
+- **Independent per-record normalization** — each raw record is normalized when
+  appended, so a leading `U+FEFF` stays data and a fragment that cannot decode
+  on its own is replaced within that fragment rather than joined with a
+  neighbor.
+- **Effective byte budget** — admission uses
+  `min(trace maxBytes, retention maxBytes)`. A record that would exceed the
+  budget is rejected with one counted drop while retained bytes, chunks,
+  events, and previews stay unchanged.
+- **Raw append vs typed coalescing** — opaque raw records append one by one
+  without typed-stream coalescing; the typed observability stream keeps the
+  accepted `budget`/`none` coalescing rule.
+- **Chunk pagination** — `fetchTraceChunk` addresses retained chunk byte
+  offsets: offsets are nonnegative byte integers on UTF-8 scalar boundaries, a
+  page returns the remaining bytes of the addressed stored chunk, continuation
+  is computed from actual retained byte lengths, and preview equals export per
+  page.
+
+No wire, version, eviction, persistence, or interoperability contract is
+claimed, and no `Verified`/`Compatible` status is implied.
+
 ## Test-automation drivers (candidate, CTX-0024)
 
 `src/automation.ts` adds typed, fail-closed client bindings for the headless
