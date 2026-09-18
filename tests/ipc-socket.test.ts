@@ -1,5 +1,4 @@
 import { describe, expect, spyOn, test } from "bun:test";
-import * as fs from "node:fs";
 import {
   MAX_FRAME_BYTES,
   TransportError,
@@ -11,92 +10,13 @@ import {
   isLiveSocketSupported,
   LIVE_SOCKET_MAX_PENDING_FRAMES,
 } from "../src/ipc-socket.js";
-
-type MemorySocket = {
-  write(data: Uint8Array): number;
-  flush(): void;
-  end(): void;
-  close(): void;
-};
-
-type MemoryHandlers = {
-  data(socket: MemorySocket, data: Uint8Array): void;
-  open(socket: MemorySocket): void;
-};
-
-async function withMemoryConnection(
-  run: (
-    connection: Awaited<ReturnType<typeof connectLiveSocket>>,
-    receive: (bytes: Uint8Array) => void,
-    writes: number[],
-    flushes: number[],
-  ) => Promise<void>,
-  transmission: {
-    write?: () => void;
-    flush?: (count: number) => void;
-  } = {},
-): Promise<void> {
-  const runtime = Bun as unknown as {
-    file(path: string): {
-      stat(): Promise<{ mode: number; uid: number; isSocket(): boolean }>;
-    };
-    connect(options: { socket: MemoryHandlers }): Promise<MemorySocket>;
-  };
-  const stat = spyOn(fs, "lstatSync").mockReturnValue({
-    isSymbolicLink: () => false,
-  } as ReturnType<typeof fs.lstatSync>);
-  let handlers: MemoryHandlers | undefined;
-  const writes: number[] = [];
-  const flushes: number[] = [];
-  const socket: MemorySocket = {
-    write: (data) => {
-      writes.push(data.length);
-      transmission.write?.();
-      return data.length;
-    },
-    flush() {
-      flushes.push(writes.length);
-      transmission.flush?.(flushes.length);
-    },
-    end() {},
-    close() {},
-  };
-  const file = spyOn(runtime, "file").mockImplementation((path) => ({
-    stat: async () => ({
-      mode: path.endsWith(".sock") ? 0o600 : 0o700,
-      uid: 1000,
-      isSocket: () => path.endsWith(".sock"),
-    }),
-  }));
-  const connect = spyOn(runtime, "connect").mockImplementation(
-    async (options) => {
-      handlers = options.socket;
-      handlers.open(socket);
-      return socket;
-    },
-  );
-  try {
-    const connection = await connectLiveSocket({
-      socketPath: "/memory/bitty/fixture.sock",
-      runtimeUid: 1000,
-      timeoutMs: 100,
-    });
-    try {
-      await run(
-        connection,
-        (bytes) => handlers!.data(socket, bytes),
-        writes,
-        flushes,
-      );
-    } finally {
-      connection.close();
-    }
-  } finally {
-    connect.mockRestore();
-    file.mockRestore();
-    stat.mockRestore();
-  }
-}
+import {
+  assertScratchSocketPath,
+  createScratchLoopback,
+  localUid,
+  scratchDir,
+  withMemoryConnection,
+} from "./helpers/fake-live-socket.js";
 
 const firstPayload = new TextEncoder().encode('{"id":1,"result":"ready"}');
 const secondPayload = new TextEncoder().encode('{"id":2,"result":"done"}');
@@ -320,34 +240,9 @@ describe("in-memory physical stream frames (#97)", () => {
   }
 });
 
-/** Process UID for attestation: the real local UID, never a constant. */
-function localUid(): number {
-  const proc = globalThis.process as unknown as {
-    getuid?: () => number;
-  };
-  return typeof proc.getuid === "function" ? proc.getuid() : 1000;
-}
-
-/**
- * TDD failing-first proof for CTX-0036 (H-DEV-06): the Unix IPC socket
- * seam must dial a live OS socket and complete a framed request/response
- * round trip, not just flip a connected flag.
- */
 describe("live Unix IPC socket (CTX-0036)", () => {
   test("connect -> request -> response round trip over a loopback socket", async () => {
     if (!isLiveSocketSupported()) return;
-    const proc = globalThis.process as unknown as {
-      getBuiltinModule(id: string): {
-        mkdirSync(p: string, o: unknown): void;
-        chmodSync(p: string, m: number): void;
-        rmSync(p: string, o: unknown): void;
-      };
-    };
-    const fs = proc.getBuiltinModule("node:fs");
-    const dir = `${process.env["XDG_RUNTIME_DIR"] ?? "/tmp"}/bitty-devtools-ctx0036-${process.pid}`;
-    fs.mkdirSync(dir, { recursive: true });
-    fs.chmodSync(dir, 0o700);
-    const socketPath = `${dir}/loopback.sock`;
     const payload = new TextEncoder().encode(
       JSON.stringify({
         jsonrpc: "2.0",
@@ -356,24 +251,16 @@ describe("live Unix IPC socket (CTX-0036)", () => {
         version: "1.0",
       }),
     );
-    const wire = new Uint8Array(4 + payload.length);
-    new DataView(wire.buffer).setUint32(0, payload.length, false);
-    wire.set(payload, 4);
-
-    const server = Bun.listen({
-      unix: socketPath,
-      socket: {
-        data(sock, _data) {
-          sock.write(wire);
-        },
-        error() {},
-      },
+    const loopback = createScratchLoopback({
+      prefix: "bitty-devtools-ctx0036",
+      responsePayload: payload,
+      timeoutMs: 1000,
     });
-    fs.chmodSync(socketPath, 0o600);
     try {
       const conn = await connectLiveSocket({
-        socketPath,
-        runtimeUid: localUid(),
+        socketPath: loopback.socketPath,
+        runtimeUid: loopback.runtimeUid,
+        timeoutMs: loopback.timeoutMs,
       });
       try {
         const request = new TextEncoder().encode(
@@ -395,8 +282,7 @@ describe("live Unix IPC socket (CTX-0036)", () => {
         conn.close();
       }
     } finally {
-      server.stop(true);
-      fs.rmSync(dir, { recursive: true, force: true });
+      loopback.stop();
     }
   });
 
@@ -410,12 +296,13 @@ describe("live Unix IPC socket (CTX-0036)", () => {
         symlinkSync(t: string, p: string): void;
       };
     };
-    const fs = proc.getBuiltinModule("node:fs");
-    const dir = `${process.env["XDG_RUNTIME_DIR"] ?? "/tmp"}/bitty-devtools-ctx0036-link-${process.pid}`;
-    fs.mkdirSync(dir, { recursive: true });
-    fs.chmodSync(dir, 0o700);
+    const nodeFs = proc.getBuiltinModule("node:fs");
+    const dir = scratchDir("bitty-devtools-ctx0036-link");
     const target = `${dir}/real.sock`;
     const link = `${dir}/loopback.sock`;
+    assertScratchSocketPath(link);
+    nodeFs.mkdirSync(dir, { recursive: true });
+    nodeFs.chmodSync(dir, 0o700);
     const server = Bun.listen({
       unix: target,
       socket: {
@@ -423,8 +310,12 @@ describe("live Unix IPC socket (CTX-0036)", () => {
         error() {},
       },
     });
-    fs.chmodSync(target, 0o600);
-    fs.symlinkSync(target, link);
+    nodeFs.chmodSync(target, 0o600);
+    nodeFs.symlinkSync(target, link);
+    const runtime = Bun as unknown as {
+      connect(options: unknown): Promise<unknown>;
+    };
+    const connectSpy = spyOn(runtime, "connect");
     try {
       let caught: unknown = null;
       try {
@@ -437,9 +328,24 @@ describe("live Unix IPC socket (CTX-0036)", () => {
       }
       expect(caught).not.toBeNull();
       expect(String(caught)).toContain("symlink");
+      expect(connectSpy.mock.calls.length).toBe(0);
+      let dialCaught: unknown = null;
+      try {
+        await connectLiveSocket({
+          socketPath: link,
+          runtimeUid: localUid(),
+          timeoutMs: 1000,
+        });
+      } catch (error) {
+        dialCaught = error;
+      }
+      expect(dialCaught).not.toBeNull();
+      expect(String(dialCaught)).toContain("symlink");
+      expect(connectSpy.mock.calls.length).toBe(0);
     } finally {
+      connectSpy.mockRestore();
       server.stop(true);
-      fs.rmSync(dir, { recursive: true, force: true });
+      nodeFs.rmSync(dir, { recursive: true, force: true });
     }
   });
 });
