@@ -3,6 +3,8 @@ import {
   CliConfigError,
   CliUsageError,
   DEFAULT_GENERATION,
+  DEFAULT_TRACE_DURATION_MS,
+  DEFAULT_TRACE_MAX_BYTES,
   MAX_CELL_CHARS,
   exitCodeForError,
   parseCliArgs,
@@ -10,7 +12,7 @@ import {
   runCliLive,
 } from "../src/cli.js";
 import type { CliRuntime } from "../src/cli.js";
-import { peerCredentials } from "../src/auth.js";
+import { DIR_MODE, SOCKET_MODE, peerCredentials } from "../src/auth.js";
 import { IpcTransport } from "../src/transport.js";
 import type { IpcRequest } from "../src/transport.js";
 import {
@@ -21,6 +23,9 @@ import {
   EXIT_RUNTIME,
   EXIT_USAGE,
 } from "../src/campaign.js";
+import { TracingError } from "../src/tracing.js";
+import { BoundError } from "../src/bounds.js";
+import { DevtoolsClient } from "../src/client.js";
 
 type Harness = {
   out: string[];
@@ -489,5 +494,411 @@ describe("exitCodeForError", () => {
       EXIT_USAGE,
     );
     expect(exitCodeForError(new Error("boom"))).toBe(EXIT_GENERIC);
+  });
+});
+
+describe("wire-trace flag contract N1-N15", () => {
+  test("N1 trace verbs without --wire-trace exit 2", () => {
+    expect(() => parseCliArgs(["trace", "start"])).toThrow(CliUsageError);
+    expect(() =>
+      parseCliArgs(["trace", "stop", "--trace-id", "trace-1"]),
+    ).toThrow(CliUsageError);
+    expect(() =>
+      parseCliArgs([
+        "trace",
+        "fetch-chunk",
+        "--trace-id",
+        "trace-1",
+        "--offset",
+        "0",
+      ]),
+    ).toThrow(CliUsageError);
+    const h1 = makeHarness();
+    expect(runCli(["trace", "start"], h1.deps)).toBe(EXIT_USAGE);
+    expect(h1.err.join("")).toContain("Usage:");
+    expect(h1.out).toEqual([]);
+    const h2 = makeHarness();
+    expect(runCli(["trace", "stop", "--trace-id", "trace-1"], h2.deps)).toBe(
+      EXIT_USAGE,
+    );
+    expect(h2.err.join("")).toContain("Usage:");
+    expect(h2.out).toEqual([]);
+  });
+
+  test("N1 live trace without --wire-trace exits 2", async () => {
+    const h = makeHarness();
+    expect(
+      await runCliLive(
+        ["trace", "start", "--duration-ms", "100", "--max-bytes", "1024"],
+        h.deps,
+      ),
+    ).toBe(EXIT_USAGE);
+    expect(h.err.join("")).toContain("Usage:");
+    expect(h.out).toEqual([]);
+  });
+
+  test("N2 inspect with --wire-trace and trace companions exits 2", () => {
+    expect(() =>
+      parseCliArgs(["inspect", "--plugins", "--wire-trace"]),
+    ).toThrow(CliUsageError);
+    expect(() =>
+      parseCliArgs(["inspect", "--plugins", "--duration-ms", "100"]),
+    ).toThrow(CliUsageError);
+    expect(() =>
+      parseCliArgs(["inspect", "--plugins", "--max-bytes", "1024"]),
+    ).toThrow(CliUsageError);
+    expect(() =>
+      parseCliArgs(["inspect", "--plugins", "--include-input"]),
+    ).toThrow(CliUsageError);
+    expect(() =>
+      parseCliArgs(["inspect", "--plugins", "--trace-id", "trace-1"]),
+    ).toThrow(CliUsageError);
+    expect(() =>
+      parseCliArgs(["inspect", "--plugins", "--offset", "0"]),
+    ).toThrow(CliUsageError);
+    const h = makeHarness();
+    expect(runCli(["inspect", "--plugins", "--wire-trace"], h.deps)).toBe(
+      EXIT_USAGE,
+    );
+    expect(h.err.join("")).toContain("Usage:");
+    expect(h.out).toEqual([]);
+  });
+
+  test("N3 --wire-trace value forms exit 2", () => {
+    expect(() =>
+      parseCliArgs(["trace", "start", "--wire-trace=false"]),
+    ).toThrow(CliUsageError);
+    expect(() => parseCliArgs(["trace", "start", "--wire-trace=0"])).toThrow(
+      CliUsageError,
+    );
+    expect(() => parseCliArgs(["trace", "start", "--wire-trace=1"])).toThrow(
+      CliUsageError,
+    );
+    expect(() =>
+      parseCliArgs(["trace", "start", "--wire-trace", "false"]),
+    ).toThrow(CliUsageError);
+    expect(() =>
+      parseCliArgs(["trace", "stop", "--wire-trace=false", "--trace-id", "t"]),
+    ).toThrow(CliUsageError);
+    const h = makeHarness();
+    expect(runCli(["trace", "start", "--wire-trace=false"], h.deps)).toBe(
+      EXIT_USAGE,
+    );
+    expect(h.err.join("")).toContain("Usage:");
+  });
+
+  test("N4 flag-as-value for trace companions exits 2", () => {
+    expect(() =>
+      parseCliArgs([
+        "trace",
+        "start",
+        "--wire-trace",
+        "--duration-ms",
+        "--json",
+      ]),
+    ).toThrow(CliUsageError);
+    expect(() =>
+      parseCliArgs(["trace", "start", "--wire-trace", "--max-bytes", "--json"]),
+    ).toThrow(CliUsageError);
+    expect(() =>
+      parseCliArgs(["trace", "stop", "--wire-trace", "--trace-id", "--json"]),
+    ).toThrow(CliUsageError);
+    expect(() =>
+      parseCliArgs([
+        "trace",
+        "fetch-chunk",
+        "--wire-trace",
+        "--trace-id",
+        "t",
+        "--offset",
+        "--json",
+      ]),
+    ).toThrow(CliUsageError);
+  });
+
+  test("N5 inspect scope cannot use trace methods exit 7", () => {
+    const c = new DevtoolsClient();
+    c.connect();
+    c.grantScope("debug.inspect");
+    expect(() => c.startTrace({})).toThrow("debug.trace scope required");
+    let code: number | null = null;
+    try {
+      c.startTrace({});
+    } catch (e) {
+      code = exitCodeForError(e);
+    }
+    expect(code).toBe(EXIT_PERM);
+    expect(exitCodeForError(new TracingError("ScopeDenied", "denied"))).toBe(
+      EXIT_PERM,
+    );
+    expect(exitCodeForError(new BoundError("offset", 10, 5))).toBe(
+      EXIT_GENERIC,
+    );
+    c.disconnect();
+  });
+
+  test("N6 bad --duration-ms exits 2", () => {
+    for (const bad of ["0", "1.5", "abc", "300001", "1000000", ""]) {
+      expect(() =>
+        parseCliArgs(["trace", "start", "--wire-trace", "--duration-ms", bad]),
+      ).toThrow(CliUsageError);
+    }
+    expect(() =>
+      parseCliArgs([
+        "trace",
+        "start",
+        "--wire-trace",
+        "--duration-ms",
+        "--json",
+      ]),
+    ).toThrow(CliUsageError);
+    const h = makeHarness();
+    expect(
+      runCli(["trace", "start", "--wire-trace", "--duration-ms", "0"], h.deps),
+    ).toBe(EXIT_USAGE);
+    expect(h.err.join("")).toContain("Usage:");
+  });
+
+  test("N7 bad --max-bytes exits 2", () => {
+    for (const bad of ["0", "abc", "1.5", "4194305", "10000000"]) {
+      expect(() =>
+        parseCliArgs(["trace", "start", "--wire-trace", "--max-bytes", bad]),
+      ).toThrow(CliUsageError);
+    }
+    const h = makeHarness();
+    expect(
+      runCli(["trace", "start", "--wire-trace", "--max-bytes", "0"], h.deps),
+    ).toBe(EXIT_USAGE);
+    expect(h.err.join("")).toContain("Usage:");
+  });
+
+  test("N8 bad --offset exits 2 at parse", () => {
+    for (const bad of ["abc", "1.5", "NaN"]) {
+      expect(() =>
+        parseCliArgs([
+          "trace",
+          "fetch-chunk",
+          "--wire-trace",
+          "--trace-id",
+          "trace-1",
+          "--offset",
+          bad,
+        ]),
+      ).toThrow(CliUsageError);
+    }
+    expect(() =>
+      parseCliArgs([
+        "trace",
+        "fetch-chunk",
+        "--wire-trace",
+        "--trace-id",
+        "trace-1",
+        "--offset",
+        "--json",
+      ]),
+    ).toThrow(CliUsageError);
+    const h = makeHarness();
+    expect(
+      runCli(
+        [
+          "trace",
+          "fetch-chunk",
+          "--wire-trace",
+          "--trace-id",
+          "trace-1",
+          "--offset",
+          "abc",
+        ],
+        h.deps,
+      ),
+    ).toBe(EXIT_USAGE);
+  });
+
+  test("N9 includeInput defaults false and redaction still applies", () => {
+    const parsed = parseCliArgs(["trace", "start", "--wire-trace"]);
+    expect(parsed).toEqual({
+      kind: "trace-start",
+      options: {
+        durationMs: DEFAULT_TRACE_DURATION_MS,
+        maxBytes: DEFAULT_TRACE_MAX_BYTES,
+        includeInput: false,
+        json: false,
+        socket: null,
+        instance: null,
+      },
+    });
+    const withInput = parseCliArgs([
+      "trace",
+      "start",
+      "--wire-trace",
+      "--include-input",
+    ]);
+    expect(withInput).toEqual({
+      kind: "trace-start",
+      options: {
+        durationMs: DEFAULT_TRACE_DURATION_MS,
+        maxBytes: DEFAULT_TRACE_MAX_BYTES,
+        includeInput: true,
+        json: false,
+        socket: null,
+        instance: null,
+      },
+    });
+    const c = new DevtoolsClient();
+    c.connect();
+    c.grantScope("debug.trace");
+    const s = c.startTrace({ maxBytes: 1024, includeInput: true });
+    c.appendToTrace(s.traceId, "password=example");
+    const chunk = c.fetchTraceChunk(s.traceId, 0);
+    expect(chunk.chunk).toBe("[REDACTED]");
+    expect(chunk.chunk).not.toContain("example");
+    c.stopTrace(s.traceId);
+    c.disconnect();
+  });
+
+  test("N10 secret absent spool 0600 and tampered export fails", async () => {
+    expect(DIR_MODE).toBe(0o700);
+    expect(SOCKET_MODE).toBe(0o600);
+    const c = new DevtoolsClient();
+    c.connect();
+    c.grantScope("debug.trace");
+    const s = c.startTrace({ maxBytes: 4096 });
+    c.appendToTrace(s.traceId, "password=example-secret-value");
+    const fetched = c.fetchTraceChunk(s.traceId, 0);
+    expect(fetched.chunk).not.toContain("example-secret-value");
+    expect(fetched.preview).not.toContain("example-secret-value");
+    const stopped = c.stopTrace(s.traceId);
+    expect(stopped.spoolMode).toBe("0600");
+    expect(stopped.previews.join("")).not.toContain("example-secret-value");
+    const s2 = c.startTrace({ maxBytes: 1024 });
+    c.appendToTrace(s2.traceId, "hello");
+    const preview = c.exportTracePreview(s2.traceId);
+    expect(preview.spoolMode).toBe("0600");
+    let tampered: string | null = null;
+    try {
+      const { assertPreviewMatchesExport } = await import("../src/tracing.js");
+      assertPreviewMatchesExport(preview.preview, "tampered-bytes");
+    } catch (e) {
+      tampered = e instanceof TracingError ? e.code : "threw";
+    }
+    expect(tampered).toBe("PreviewMismatch");
+    c.stopTrace(s2.traceId);
+    c.disconnect();
+  });
+
+  test("N11 UTF-8 byte bounds stay scalar safe", () => {
+    const enc = new TextEncoder();
+    expect("é".length).toBe(1);
+    expect(enc.encode("é").length).toBe(2);
+    expect("中".length).toBe(1);
+    expect(enc.encode("中").length).toBe(3);
+    const c = new DevtoolsClient();
+    c.connect();
+    c.grantScope("debug.trace");
+    const s = c.startTrace({ maxBytes: 1024 });
+    c.appendToTrace(s.traceId, "aé中");
+    expect(enc.encode("aé中").length).toBe(6);
+    const p0 = c.fetchTraceChunk(s.traceId, 0);
+    expect(p0.chunk).toBe("aé中");
+    const p1 = c.fetchTraceChunk(s.traceId, 1);
+    expect(p1.chunk).toBe("é中");
+    expect(() => c.fetchTraceChunk(s.traceId, 2)).toThrow();
+    c.stopTrace(s.traceId);
+    c.disconnect();
+  });
+
+  test("N12 env and bearer do not enable wire trace", () => {
+    const h1 = makeHarness();
+    h1.deps.runtime.env = { BITTY_WIRE_TRACE: "1" };
+    expect(runCli(["trace", "start"], h1.deps)).toBe(EXIT_USAGE);
+    expect(h1.out).toEqual([]);
+    const h2 = makeHarness();
+    h2.deps.runtime.env = { BITTY_CTL_ELEVATE: "1" };
+    expect(runCli(["trace", "start"], h2.deps)).toBe(EXIT_USAGE);
+    expect(h2.out).toEqual([]);
+    expect(() =>
+      parseCliArgs(["trace", "start", "--wire-trace", "--bearer", "x"]),
+    ).toThrow(CliUsageError);
+    expect(() =>
+      parseCliArgs(["inspect", "--plugins", "--wire-trace"]),
+    ).toThrow(CliUsageError);
+  });
+
+  test("N13 trace with no socket exits 6 never mock", () => {
+    const h1 = makeHarness();
+    expect(runCli(["trace", "start", "--wire-trace"], h1.deps)).toBe(
+      EXIT_RUNTIME,
+    );
+    expect(h1.out).toEqual([]);
+    expect(h1.err.join("")).toContain("no connected Bitty instance");
+    const h2 = makeHarness();
+    const t = makeTransport();
+    h2.deps.transport = t;
+    expect(
+      runCli(["trace", "start", "--wire-trace", "--socket", "/tmp/x.sock"], {
+        runtime: h2.deps.runtime,
+        transport: t,
+      }),
+    ).toBe(EXIT_RUNTIME);
+    expect(h2.out).toEqual([]);
+  });
+
+  test("N13 live trace with no socket exits 6", async () => {
+    const h = makeHarness();
+    expect(await runCliLive(["trace", "start", "--wire-trace"], h.deps)).toBe(
+      EXIT_RUNTIME,
+    );
+    expect(h.out).toEqual([]);
+    expect(h.err.join("")).toContain("no connected Bitty instance");
+  });
+
+  test("N14 rate and frame shedding fail closed with counted drops", () => {
+    const c = new DevtoolsClient();
+    c.connect();
+    c.grantScope("debug.trace");
+    const s = c.startTrace({ maxBytes: 10 });
+    c.appendToTrace(s.traceId, "hello");
+    c.appendToTrace(s.traceId, "world!");
+    const stopped = c.stopTrace(s.traceId);
+    expect(stopped.byteCount).toBe(5);
+    expect(stopped.dropCount).toBe(1);
+    expect(stopped.truncated).toBe(true);
+    c.disconnect();
+  });
+
+  test("N15 missing trace-id unknown verb and flag exit 2", () => {
+    expect(() => parseCliArgs(["trace", "stop", "--wire-trace"])).toThrow(
+      CliUsageError,
+    );
+    expect(() =>
+      parseCliArgs(["trace", "fetch-chunk", "--wire-trace", "--trace-id", "t"]),
+    ).toThrow(CliUsageError);
+    expect(() => parseCliArgs(["trace", "bogus", "--wire-trace"])).toThrow(
+      CliUsageError,
+    );
+    expect(() => parseCliArgs(["trace"])).toThrow(CliUsageError);
+    expect(() =>
+      parseCliArgs(["trace", "start", "--wire-trace", "--bogus"]),
+    ).toThrow(CliUsageError);
+    expect(() =>
+      parseCliArgs(["trace", "start", "--wire-trace", "--retention-ms", "100"]),
+    ).toThrow(CliUsageError);
+    const h = makeHarness();
+    expect(runCli(["trace", "stop", "--wire-trace"], h.deps)).toBe(EXIT_USAGE);
+    expect(h.err.join("")).toContain("Usage:");
+    expect(h.out).toEqual([]);
+  });
+
+  test("trace start live with fake transport succeeds without mock rows", async () => {
+    const transport = makeTransport();
+    const h = makeHarness(transport);
+    const code = await runCliLive(
+      ["trace", "start", "--wire-trace", "--socket", "/tmp/fake-trace.sock"],
+      h.deps,
+    );
+    expect(code).toBe(EXIT_OK);
+    expect(h.err).toEqual([]);
+    expect(h.out.join("")).toContain("trace-");
+    expect(h.out.join("")).toContain("262144");
   });
 });

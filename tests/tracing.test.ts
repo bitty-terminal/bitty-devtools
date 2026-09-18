@@ -8,6 +8,15 @@ import {
   type StructuredTraceEvent,
 } from "../src/tracing.js";
 import type { PanelRuntimeSnapshot } from "../src/panel-runtime.js";
+import { BOUNDS } from "../src/bounds.js";
+import { DIR_MODE, SOCKET_MODE } from "../src/auth.js";
+import {
+  RateLimiter,
+  checkConnectionCap,
+  checkPayloadCap,
+} from "../src/transport.js";
+import { exitCodeForError } from "../src/cli.js";
+import { EXIT_GENERIC, EXIT_PERM } from "../src/campaign.js";
 
 function snap(): PanelRuntimeSnapshot {
   return {
@@ -554,5 +563,129 @@ describe("tracing (debug.trace, opt-in, bounded)", () => {
         ac.signal,
       ),
     ).toThrow("cancelled");
+  });
+});
+
+describe("wire-trace negatives N5-N14", () => {
+  test("N5 inspect scope denies stop and fetch chunk exit 7", () => {
+    const c = new DevtoolsClient();
+    c.connect();
+    c.grantScope("debug.inspect");
+    const t = new TracingClient();
+    const started = t.startTrace("debug.trace", { maxBytes: 1024 });
+    expect(() => t.stopTrace("debug.inspect", started.traceId)).toThrow(
+      "debug.trace scope required",
+    );
+    expect(() =>
+      t.fetchTraceChunk("debug.inspect", started.traceId, 0),
+    ).toThrow("debug.trace scope required");
+    expect(() => c.startTrace({})).toThrow("debug.trace scope required");
+    expect(exitCodeForError(new TracingError("ScopeDenied", "x"))).toBe(
+      EXIT_PERM,
+    );
+    c.disconnect();
+  });
+
+  test("N6 direct duration rejects zero float and over max", () => {
+    const t = new TracingClient();
+    expect(() => t.startTrace("debug.trace", { durationMs: 0 })).toThrow();
+    expect(() => t.startTrace("debug.trace", { durationMs: 1.5 })).toThrow();
+    expect(() =>
+      t.startTrace("debug.trace", {
+        durationMs: BOUNDS.MAX_TRACE_DURATION_MS + 1,
+      }),
+    ).toThrow();
+    expect(() =>
+      t.startTrace("debug.trace", { durationMs: Number.NaN }),
+    ).toThrow();
+  });
+
+  test("N7 direct maxBytes rejects zero float and over max", () => {
+    const t = new TracingClient();
+    expect(() => t.startTrace("debug.trace", { maxBytes: 0 })).toThrow();
+    expect(() => t.startTrace("debug.trace", { maxBytes: 1.5 })).toThrow();
+    expect(() =>
+      t.startTrace("debug.trace", { maxBytes: BOUNDS.MAX_TRACE_BYTES + 1 }),
+    ).toThrow();
+  });
+
+  test("N8 direct offset rejects negative noninteger and over bytes", () => {
+    const t = new TracingClient();
+    const s = t.startTrace("debug.trace", { maxBytes: 1024 });
+    t.appendToTrace(s.traceId, "hello");
+    expect(() => t.fetchTraceChunk("debug.trace", s.traceId, -1)).toThrow();
+    expect(() => t.fetchTraceChunk("debug.trace", s.traceId, 1.5)).toThrow();
+    expect(() => t.fetchTraceChunk("debug.trace", s.traceId, 6)).toThrow();
+    expect(exitCodeForError(new TracingError("InvalidOffset", "x"))).toBe(
+      EXIT_GENERIC,
+    );
+    const ok = t.fetchTraceChunk("debug.trace", s.traceId, 5);
+    expect(ok.chunk).toBe("");
+    expect(ok.continuation).toBe(false);
+    t.stopTrace("debug.trace", s.traceId);
+  });
+
+  test("N9 input default off with redaction on opt in", () => {
+    const t = new TracingClient();
+    const s = t.startTrace("debug.trace", { maxBytes: 1024 });
+    t.appendToTrace(s.traceId, "clipboard=top-secret-value password=hide");
+    const page = t.fetchTraceChunk("debug.trace", s.traceId, 0);
+    expect(page.chunk).not.toContain("hide");
+    expect(page.chunk).toBe("[REDACTED]");
+    t.stopTrace("debug.trace", s.traceId);
+    const s2 = t.startTrace("debug.trace", {
+      maxBytes: 1024,
+      includeInput: true,
+    });
+    t.appendToTrace(s2.traceId, "password=hide-me");
+    const page2 = t.fetchTraceChunk("debug.trace", s2.traceId, 0);
+    expect(page2.chunk).toBe("[REDACTED]");
+    t.stopTrace("debug.trace", s2.traceId);
+  });
+
+  test("N10 spool 0600 dir 0700 and preview mismatch", () => {
+    expect(DIR_MODE).toBe(0o700);
+    expect(SOCKET_MODE).toBe(0o600);
+    const t = new TracingClient();
+    const s = t.startTrace("debug.trace", { maxBytes: 2048 });
+    t.appendToTrace(s.traceId, "token=sk-live-abcdefgh12345678");
+    const stopped = t.stopTrace("debug.trace", s.traceId);
+    expect(stopped.spoolMode).toBe("0600");
+    expect(stopped.previews.join("")).not.toContain("sk-live");
+    expect(() => assertPreviewMatchesExport("hello", "hello-tampered")).toThrow(
+      "preview must equal export",
+    );
+  });
+
+  test("N11 byte counts use UTF-8 not length", () => {
+    const enc = new TextEncoder();
+    expect(enc.encode("aé中").length).toBe(6);
+    expect("aé中".length).toBe(3);
+    const t = new TracingClient();
+    const s = t.startTrace("debug.trace", { maxBytes: 1024 });
+    t.appendToTrace(s.traceId, "é");
+    const state = t.listTraces();
+    expect(state).toContain(s.traceId);
+    expect(() => t.fetchTraceChunk("debug.trace", s.traceId, 1)).toThrow();
+    const p0 = t.fetchTraceChunk("debug.trace", s.traceId, 0);
+    expect(enc.encode(p0.chunk).length).toBe(2);
+    t.stopTrace("debug.trace", s.traceId);
+  });
+
+  test("N14 RC-9 payload connection and drop shedding", () => {
+    const limiter = RateLimiter.rc9Default();
+    for (let i = 0; i < 200; i += 1) {
+      limiter.check(i);
+    }
+    expect(() => limiter.check(200)).toThrow("rate limited");
+    expect(() => checkPayloadCap(2 * 1024 * 1024)).toThrow();
+    expect(() => checkConnectionCap(16)).toThrow("shed newest");
+    const t = new TracingClient();
+    const s = t.startTrace("debug.trace", { maxBytes: 5 });
+    t.appendToTrace(s.traceId, "hello");
+    t.appendToTrace(s.traceId, "extra-bytes");
+    const stopped = t.stopTrace("debug.trace", s.traceId);
+    expect(stopped.dropCount).toBe(1);
+    expect(stopped.truncated).toBe(true);
   });
 });

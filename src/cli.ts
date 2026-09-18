@@ -22,7 +22,7 @@
  * untrusted observation data, never instructions.
  */
 
-import { truncateToChars } from "./bounds.js";
+import { BOUNDS, BoundError, truncateToChars } from "./bounds.js";
 import { generation } from "./panel-runtime.js";
 import { DevtoolsClient } from "./client.js";
 import { InspectionError } from "./inspection.js";
@@ -31,6 +31,12 @@ import type {
   PluginSummary,
   SubscriptionInfo,
 } from "./inspection.js";
+import { TracingError } from "./tracing.js";
+import type {
+  TraceChunk,
+  TraceStartResult,
+  TraceStopResult,
+} from "./tracing.js";
 import { AuthError, peerCredentials, resolveSocketPath } from "./auth.js";
 import { IpcTransport, TransportError } from "./transport.js";
 import { connectLiveSocket } from "./ipc-socket.js";
@@ -53,6 +59,10 @@ export const MAX_JSON_DEPTH = 8 as const;
 /** Generation used by `inspect --budgets` when the caller omits one. */
 export const DEFAULT_GENERATION = 1 as const;
 
+export const DEFAULT_TRACE_DURATION_MS = 10000 as const;
+export const DEFAULT_TRACE_MAX_BYTES = 524288 as const;
+export const TRACE_ID_MAX_BYTES = 128 as const;
+
 export type InspectSelector = "plugins" | "budgets" | "subscriptions";
 
 export type InspectOptions = {
@@ -64,8 +74,41 @@ export type InspectOptions = {
   instance: string | null;
 };
 
+export type TraceStartOptions = {
+  durationMs: number;
+  maxBytes: number;
+  includeInput: boolean;
+  json: boolean;
+  socket: string | null;
+  instance: string | null;
+};
+
+export type TraceStopOptions = {
+  traceId: string;
+  json: boolean;
+  socket: string | null;
+  instance: string | null;
+};
+
+export type TraceFetchOptions = {
+  traceId: string;
+  offset: number;
+  json: boolean;
+  socket: string | null;
+  instance: string | null;
+};
+
+export type ConnectionOptions = {
+  socket: string | null;
+  instance: string | null;
+};
+
 export type CliCommand =
-  { kind: "help" } | { kind: "inspect"; options: InspectOptions };
+  | { kind: "help" }
+  | { kind: "inspect"; options: InspectOptions }
+  | { kind: "trace-start"; options: TraceStartOptions }
+  | { kind: "trace-stop"; options: TraceStopOptions }
+  | { kind: "trace-fetch"; options: TraceFetchOptions };
 
 export class CliUsageError extends Error {
   constructor(message: string) {
@@ -96,6 +139,9 @@ Usage:
   bitty-devtools inspect --plugins [--generation <n>] [options]
   bitty-devtools inspect --subscriptions --plugin <id> [options]
   bitty-devtools inspect --budgets --plugin <id> [--generation <n>] [options]
+  bitty-devtools trace start --wire-trace [--duration-ms <n>] [--max-bytes <n>] [--include-input] [options]
+  bitty-devtools trace stop --wire-trace --trace-id <id> [options]
+  bitty-devtools trace fetch-chunk --wire-trace --trace-id <id> --offset <n> [options]
   bitty-devtools --help
 
 Selectors (exactly one):
@@ -103,9 +149,20 @@ Selectors (exactly one):
   --subscriptions     List event subscriptions for --plugin.
   --budgets           Show RC-1/RC-2/RC-4/RC-5 budgets for --plugin.
 
+Trace (requires --wire-trace, live socket, debug.trace):
+  start               Start a wire trace with bounded duration and bytes.
+  stop                Stop a wire trace and show redacted previews.
+  fetch-chunk         Fetch one 262144-byte chunk with continuation.
+
 Options:
   --plugin <id>       Plugin id required by --subscriptions and --budgets.
   --generation <n>    Target plugin generation (default ${DEFAULT_GENERATION} for --budgets).
+  --wire-trace        Presence-only opt-in for trace verbs, default off.
+  --duration-ms <n>   Trace duration 1..300000, default 10000.
+  --max-bytes <n>     Trace bytes 1..4194304, default 524288.
+  --include-input     Presence-only input capture opt-in, default off.
+  --trace-id <id>     Trace id for stop and fetch-chunk.
+  --offset <n>        Byte offset for fetch-chunk.
   --socket <path>     Explicit Bitty IPC socket path (advisory).
   --instance <id>     Instance id under $XDG_RUNTIME_DIR/bitty/<id>.sock.
   --json              Emit bounded, pretty-printed JSON instead of a table.
@@ -118,8 +175,9 @@ Connection:
   With no --socket/--instance, the CLI reads BITTY_SOCKET, then
   BITTY_INSTANCE_ID with XDG_RUNTIME_DIR. It fails closed when no instance is
   selected. Read-only; requires the debug.inspect scope and never fabricates
-  data for a server method the core has not implemented. Methods and fields
-  follow the accepted devtools-rfc v1.`;
+  data for a server method the core has not implemented. Trace verbs use the
+  live socket only, require debug.trace, spool 0600, and never read
+  BITTY_WIRE_TRACE. Methods and fields follow the accepted devtools-rfc v1.`;
 
 function takeValue(
   argv: readonly string[],
@@ -230,6 +288,251 @@ function parseInspect(argv: readonly string[]): CliCommand {
   };
 }
 
+function parseTraceDurationMs(raw: string): number {
+  if (!/^\d+$/.test(raw)) {
+    throw new CliUsageError(
+      `--duration-ms must be an integer in 1..${BOUNDS.MAX_TRACE_DURATION_MS} (saw '${raw}')`,
+    );
+  }
+  const value = Number(raw);
+  if (
+    !Number.isSafeInteger(value) ||
+    value < 1 ||
+    value > BOUNDS.MAX_TRACE_DURATION_MS
+  ) {
+    throw new CliUsageError(
+      `--duration-ms must be an integer in 1..${BOUNDS.MAX_TRACE_DURATION_MS} (saw '${raw}')`,
+    );
+  }
+  return value;
+}
+
+function parseTraceMaxBytes(raw: string): number {
+  if (!/^\d+$/.test(raw)) {
+    throw new CliUsageError(
+      `--max-bytes must be an integer in 1..${BOUNDS.MAX_TRACE_BYTES} (saw '${raw}')`,
+    );
+  }
+  const value = Number(raw);
+  if (
+    !Number.isSafeInteger(value) ||
+    value < 1 ||
+    value > BOUNDS.MAX_TRACE_BYTES
+  ) {
+    throw new CliUsageError(
+      `--max-bytes must be an integer in 1..${BOUNDS.MAX_TRACE_BYTES} (saw '${raw}')`,
+    );
+  }
+  return value;
+}
+
+function parseTraceOffset(raw: string): number {
+  if (!/^\d+$/.test(raw)) {
+    throw new CliUsageError(
+      `--offset must be a nonnegative byte integer (saw '${raw}')`,
+    );
+  }
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new CliUsageError(
+      `--offset must be a nonnegative byte integer (saw '${raw}')`,
+    );
+  }
+  return value;
+}
+
+function parseTraceId(raw: string): string {
+  const bytes = new TextEncoder().encode(raw).length;
+  if (raw.length === 0 || bytes < 1 || bytes > TRACE_ID_MAX_BYTES) {
+    throw new CliUsageError(
+      `--trace-id must be 1..${TRACE_ID_MAX_BYTES} UTF-8 bytes`,
+    );
+  }
+  return raw;
+}
+
+function parseTraceStart(argv: readonly string[]): CliCommand {
+  let wireTrace = false;
+  let durationRaw: string | null = null;
+  let maxBytesRaw: string | null = null;
+  let includeInput = false;
+  let json = false;
+  let socket: string | null = null;
+  let instance: string | null = null;
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i];
+    switch (arg) {
+      case "--wire-trace":
+        wireTrace = true;
+        break;
+      case "--duration-ms":
+        durationRaw = takeValue(argv, i + 1, arg);
+        i += 1;
+        break;
+      case "--max-bytes":
+        maxBytesRaw = takeValue(argv, i + 1, arg);
+        i += 1;
+        break;
+      case "--include-input":
+        includeInput = true;
+        break;
+      case "--socket":
+        socket = takeValue(argv, i + 1, arg);
+        i += 1;
+        break;
+      case "--instance":
+        instance = takeValue(argv, i + 1, arg);
+        i += 1;
+        break;
+      case "--json":
+        json = true;
+        break;
+      case "-h":
+      case "--help":
+        return { kind: "help" };
+      default:
+        throw new CliUsageError(`unknown argument '${arg ?? ""}'`);
+    }
+  }
+  if (!wireTrace) {
+    throw new CliUsageError(`trace start requires --wire-trace`);
+  }
+  const durationMs =
+    durationRaw === null
+      ? DEFAULT_TRACE_DURATION_MS
+      : parseTraceDurationMs(durationRaw);
+  const maxBytes =
+    maxBytesRaw === null
+      ? DEFAULT_TRACE_MAX_BYTES
+      : parseTraceMaxBytes(maxBytesRaw);
+  return {
+    kind: "trace-start",
+    options: { durationMs, maxBytes, includeInput, json, socket, instance },
+  };
+}
+
+function parseTraceStop(argv: readonly string[]): CliCommand {
+  let wireTrace = false;
+  let traceIdRaw: string | null = null;
+  let json = false;
+  let socket: string | null = null;
+  let instance: string | null = null;
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i];
+    switch (arg) {
+      case "--wire-trace":
+        wireTrace = true;
+        break;
+      case "--trace-id":
+        traceIdRaw = takeValue(argv, i + 1, arg);
+        i += 1;
+        break;
+      case "--socket":
+        socket = takeValue(argv, i + 1, arg);
+        i += 1;
+        break;
+      case "--instance":
+        instance = takeValue(argv, i + 1, arg);
+        i += 1;
+        break;
+      case "--json":
+        json = true;
+        break;
+      case "-h":
+      case "--help":
+        return { kind: "help" };
+      default:
+        throw new CliUsageError(`unknown argument '${arg ?? ""}'`);
+    }
+  }
+  if (!wireTrace) {
+    throw new CliUsageError(`trace stop requires --wire-trace`);
+  }
+  if (traceIdRaw === null) {
+    throw new CliUsageError(`trace stop requires --trace-id <id>`);
+  }
+  const traceId = parseTraceId(traceIdRaw);
+  return { kind: "trace-stop", options: { traceId, json, socket, instance } };
+}
+
+function parseTraceFetch(argv: readonly string[]): CliCommand {
+  let wireTrace = false;
+  let traceIdRaw: string | null = null;
+  let offsetRaw: string | null = null;
+  let json = false;
+  let socket: string | null = null;
+  let instance: string | null = null;
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i];
+    switch (arg) {
+      case "--wire-trace":
+        wireTrace = true;
+        break;
+      case "--trace-id":
+        traceIdRaw = takeValue(argv, i + 1, arg);
+        i += 1;
+        break;
+      case "--offset":
+        offsetRaw = takeValue(argv, i + 1, arg);
+        i += 1;
+        break;
+      case "--socket":
+        socket = takeValue(argv, i + 1, arg);
+        i += 1;
+        break;
+      case "--instance":
+        instance = takeValue(argv, i + 1, arg);
+        i += 1;
+        break;
+      case "--json":
+        json = true;
+        break;
+      case "-h":
+      case "--help":
+        return { kind: "help" };
+      default:
+        throw new CliUsageError(`unknown argument '${arg ?? ""}'`);
+    }
+  }
+  if (!wireTrace) {
+    throw new CliUsageError(`trace fetch-chunk requires --wire-trace`);
+  }
+  if (traceIdRaw === null) {
+    throw new CliUsageError(`trace fetch-chunk requires --trace-id <id>`);
+  }
+  if (offsetRaw === null) {
+    throw new CliUsageError(`trace fetch-chunk requires --offset <n>`);
+  }
+  const traceId = parseTraceId(traceIdRaw);
+  const offset = parseTraceOffset(offsetRaw);
+  return {
+    kind: "trace-fetch",
+    options: { traceId, offset, json, socket, instance },
+  };
+}
+
+function parseTrace(argv: readonly string[]): CliCommand {
+  const verb = argv[0];
+  if (verb === "-h" || verb === "--help") {
+    return { kind: "help" };
+  }
+  if (verb === undefined) {
+    throw new CliUsageError("no trace verb: use start|stop|fetch-chunk");
+  }
+  if (verb === "start") {
+    return parseTraceStart(argv.slice(1));
+  }
+  if (verb === "stop") {
+    return parseTraceStop(argv.slice(1));
+  }
+  if (verb === "fetch-chunk") {
+    return parseTraceFetch(argv.slice(1));
+  }
+  throw new CliUsageError(
+    `unknown trace verb '${verb}' (want start|stop|fetch-chunk)`,
+  );
+}
+
 export function parseCliArgs(argv: readonly string[]): CliCommand {
   const command = argv[0];
   if (command === undefined || command === "-h" || command === "--help") {
@@ -237,6 +540,9 @@ export function parseCliArgs(argv: readonly string[]): CliCommand {
   }
   if (command === "inspect") {
     return parseInspect(argv.slice(1));
+  }
+  if (command === "trace") {
+    return parseTrace(argv.slice(1));
   }
   throw new CliUsageError(`unknown command '${command}'`);
 }
@@ -271,7 +577,7 @@ export type CliDeps = {
  * environment) so callers report it instead of crashing with a stack trace.
  */
 function resolveSocket(
-  options: InspectOptions,
+  options: ConnectionOptions,
   runtime: CliRuntime,
 ): string | null {
   const optionSocket = options.socket;
@@ -408,6 +714,56 @@ function toJson(value: unknown): string {
   return JSON.stringify(boundJsonValue(value), null, 2);
 }
 
+function renderTraceStart(result: TraceStartResult, json: boolean): string {
+  if (json) {
+    return toJson(result);
+  }
+  return renderTable(
+    ["FIELD", "VALUE"],
+    [
+      ["traceId", result.traceId],
+      ["spoolPath", result.spoolPath],
+      ["chunkBytes", String(result.chunkBytes)],
+      ["startWallClockMs", String(result.startWallClockMs)],
+    ],
+  );
+}
+
+function renderTraceStop(result: TraceStopResult, json: boolean): string {
+  if (json) {
+    return toJson(result);
+  }
+  return renderTable(
+    ["FIELD", "VALUE"],
+    [
+      ["traceId", result.traceId],
+      ["byteCount", String(result.byteCount)],
+      ["dropCount", String(result.dropCount)],
+      ["exportBytesEstimate", String(result.exportBytesEstimate)],
+      ["truncated", String(result.truncated)],
+      ["spoolMode", result.spoolMode],
+      ["previews", result.previews.join("|")],
+    ],
+  );
+}
+
+function renderTraceChunk(result: TraceChunk, json: boolean): string {
+  if (json) {
+    return toJson(result);
+  }
+  return renderTable(
+    ["FIELD", "VALUE"],
+    [
+      ["traceId", result.traceId],
+      ["offset", String(result.offset)],
+      ["continuation", String(result.continuation)],
+      ["sequence", String(result.sequence)],
+      ["chunk", result.chunk],
+      ["preview", result.preview],
+    ],
+  );
+}
+
 function requirePlugin(options: InspectOptions): string {
   // parseCliArgs guarantees a non-empty plugin for non-plugin selectors.
   if (options.plugin === null || options.plugin.length === 0) {
@@ -440,6 +796,34 @@ function dispatch(client: DevtoolsClient, options: InspectOptions): string {
     default:
       throw new CliUsageError("no inspect selector");
   }
+}
+
+function dispatchTraceStart(
+  client: DevtoolsClient,
+  options: TraceStartOptions,
+): string {
+  const result = client.startTrace({
+    durationMs: options.durationMs,
+    maxBytes: options.maxBytes,
+    includeInput: options.includeInput,
+  });
+  return renderTraceStart(result, options.json);
+}
+
+function dispatchTraceStop(
+  client: DevtoolsClient,
+  options: TraceStopOptions,
+): string {
+  const result = client.stopTrace(options.traceId);
+  return renderTraceStop(result, options.json);
+}
+
+function dispatchTraceFetch(
+  client: DevtoolsClient,
+  options: TraceFetchOptions,
+): string {
+  const result = client.fetchTraceChunk(options.traceId, options.offset);
+  return renderTraceChunk(result, options.json);
 }
 
 /**
@@ -543,6 +927,12 @@ export function formatCliError(error: unknown): string {
   if (error instanceof InspectionError) {
     return `${error.code}: ${error.message}`;
   }
+  if (error instanceof TracingError) {
+    return `${error.code}: ${error.message}`;
+  }
+  if (error instanceof BoundError) {
+    return `${error.bound}: ${error.message}`;
+  }
   if (error instanceof AuthError) return `${error.code}: ${error.message}`;
   if (error instanceof TransportError) {
     return `${error.code}: ${error.message}`;
@@ -559,6 +949,12 @@ export function exitCodeForError(error: unknown): number {
   if (error instanceof CliConfigError) return error.exitCode;
   if (error instanceof InspectionError) {
     return expectedExitForError("Error", error.code);
+  }
+  if (error instanceof TracingError) {
+    return expectedExitForError("Error", error.code);
+  }
+  if (error instanceof BoundError) {
+    return EXIT_GENERIC;
   }
   if (error instanceof AuthError) {
     return expectedExitForError("Denied", error.code);
@@ -593,6 +989,18 @@ export function runCli(argv: readonly string[], deps: CliDeps): number {
   if (command.kind === "help") {
     runtime.stdout(`${USAGE}\n`);
     return EXIT_OK;
+  }
+
+  if (
+    command.kind === "trace-start" ||
+    command.kind === "trace-stop" ||
+    command.kind === "trace-fetch"
+  ) {
+    runtime.stderr(
+      "bitty-devtools: no connected Bitty instance; trace requires live socket, pass --socket <path> or " +
+        "--instance <id> via live entry\n",
+    );
+    return EXIT_RUNTIME;
   }
 
   const options = command.options;
@@ -670,6 +1078,62 @@ export async function runCliLive(
   if (command.kind === "help") {
     runtime.stdout(`${USAGE}\n`);
     return EXIT_OK;
+  }
+
+  if (
+    command.kind === "trace-start" ||
+    command.kind === "trace-stop" ||
+    command.kind === "trace-fetch"
+  ) {
+    const traceOptions = command.options;
+    let traceSocketPath: string | null;
+    try {
+      traceSocketPath = resolveSocket(traceOptions, runtime);
+    } catch (error) {
+      runtime.stderr(`bitty-devtools: ${formatCliError(error)}\n`);
+      return exitCodeForError(error);
+    }
+    if (traceSocketPath === null) {
+      runtime.stderr(
+        "bitty-devtools: no connected Bitty instance; pass --socket <path> or " +
+          "--instance <id>, or set BITTY_SOCKET / BITTY_INSTANCE_ID with " +
+          "XDG_RUNTIME_DIR\n",
+      );
+      return EXIT_RUNTIME;
+    }
+    const injected = deps.transport ?? null;
+    const traceClient = new DevtoolsClient();
+    try {
+      if (injected !== null) {
+        traceClient.connectWithTransport(injected);
+      } else {
+        await traceClient.connectLiveSocket(
+          runtime.uid,
+          peerCredentials(runtime.uid, runtime.gid, runtime.pid),
+          runtime.env["XDG_RUNTIME_DIR"],
+          traceOptions.instance ?? undefined,
+          traceSocketPath,
+        );
+      }
+      traceClient.grantScope("debug.trace");
+      let traceOutput: string;
+      if (command.kind === "trace-start") {
+        traceOutput = dispatchTraceStart(traceClient, command.options);
+      } else if (command.kind === "trace-stop") {
+        traceOutput = dispatchTraceStop(traceClient, command.options);
+      } else {
+        traceOutput = dispatchTraceFetch(traceClient, command.options);
+      }
+      runtime.stdout(`${traceOutput}\n`);
+      return EXIT_OK;
+    } catch (error) {
+      runtime.stderr(`bitty-devtools: ${formatCliError(error)}\n`);
+      return exitCodeForError(error);
+    } finally {
+      try {
+        traceClient.disconnect();
+      } catch {}
+    }
   }
 
   const options = command.options;

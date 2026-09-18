@@ -178,8 +178,10 @@ export class TracingClient {
       maxTraces: opts.retention?.maxTraces ?? DEFAULT_RETENTION.maxTraces,
     };
     assertBounded("durationMs", durationMs, BOUNDS.MAX_TRACE_DURATION_MS);
-    if (durationMs <= 0)
+    if (!Number.isSafeInteger(durationMs) || durationMs <= 0)
       throw new TracingError("InvalidDuration", "durationMs must be >0");
+    if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0)
+      throw new TracingError("InvalidBytes", "maxBytes must be >0");
     assertBounded("maxBytes", maxBytes, BOUNDS.MAX_TRACE_BYTES);
     assertBounded(
       "retention.maxBytes",
