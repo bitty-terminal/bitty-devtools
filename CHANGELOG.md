@@ -89,3 +89,16 @@ and this project adheres to no released version yet.
   Changelog entries, commitlint configuration
   ([commitlint.config.ts](./commitlint.config.ts)), and markdownlint-cli2
   configuration ([.markdownlint-cli2.jsonc](./.markdownlint-cli2.jsonc)).
+
+### Changed
+
+- **Trace accounting semantics documentation (CTX-0075, docs-only)**: README
+  now records the trace-helper semantics already implemented by CTX-0053/#117
+  and CTX-0054/#119 and clarified in `bitty-terminal-docs`
+  `specifications/devtools-rfc.md` (CTX-0026): retained redacted logical UTF-8
+  export-byte accounting (not heap/filesystem occupancy), independent
+  per-record normalization with a leading `U+FEFF` preserved as data, effective
+  `min(trace maxBytes, retention maxBytes)` rejection with one counted drop and
+  unchanged retained state, opaque raw append distinct from typed stream
+  coalescing, and `fetchTraceChunk` pagination on retained UTF-8 byte offsets.
+  No code behavior changed.

@@ -42,7 +42,7 @@ Core protocol contracts belong to
 `bitty-ui`). Canonical architecture, security, compatibility, and public
 behavior belong to
 [bitty-docs](https://github.com/bitty-terminal/bitty-docs) (accepted
-[DevTools RFC](https://github.com/bitty-terminal/bitty-docs/blob/main/docs/specifications/devtools-rfc.md)
+[DevTools RFC](https://github.com/bitty-terminal/bitty-terminal-docs/blob/main/specifications/devtools-rfc.md)
 OQ-019 and Performance Budgets OQ-001). Any future protocol change requires
 coordinated, explicitly ordered work in each owning repository.
 
@@ -159,6 +159,36 @@ Rust counterpart at `crates/devtools-client` mirrors the same contracts:
 `cargo test` `37` tests pass; `just check` green; `bun test` `62` tests
 pass. No `unsafe`, no PTY/GPU/window handle, no TCP, no ambient credential.
 
+## Trace accounting semantics (Implemented, CTX-0053 / CTX-0054)
+
+The trace helpers account **retained, redacted, logical UTF-8 export bytes** —
+the bytes that would be retained after typed redaction (serialized JSON for
+structured events, per-record UTF-8 normalization for raw records) — never heap
+or filesystem occupancy. This mirrors the client trace helper note in the
+accepted
+[DevTools RFC](https://github.com/bitty-terminal/bitty-terminal-docs/blob/main/specifications/devtools-rfc.md)
+(bitty-terminal-docs CTX-0026) and remains `Implemented` only.
+
+- **Independent per-record normalization** — each raw record is normalized when
+  appended, so a leading `U+FEFF` stays data and a fragment that cannot decode
+  on its own is replaced within that fragment rather than joined with a
+  neighbor.
+- **Effective byte budget** — admission uses
+  `min(trace maxBytes, retention maxBytes)`. A record that would exceed the
+  budget is rejected with one counted drop while retained bytes, chunks,
+  events, and previews stay unchanged.
+- **Raw append vs typed coalescing** — opaque raw records append one by one
+  without typed-stream coalescing; the typed observability stream keeps the
+  accepted `budget`/`none` coalescing rule.
+- **Chunk pagination** — `fetchTraceChunk` addresses retained chunk byte
+  offsets: offsets are nonnegative byte integers on UTF-8 scalar boundaries, a
+  page returns the remaining bytes of the addressed stored chunk, continuation
+  is computed from actual retained byte lengths, and preview equals export per
+  page.
+
+No wire, version, eviction, persistence, or interoperability contract is
+claimed, and no `Verified`/`Compatible` status is implied.
+
 ## Test-automation drivers (candidate, CTX-0024)
 
 `src/automation.ts` adds typed, fail-closed client bindings for the headless
@@ -168,7 +198,7 @@ split integration testing. The bindings target the `bitty` candidate methods
 `bitty.debug/frameHash` (serving dispatcher
 `crates/bitty-ipc/src/devtools.rs`, CTX-0188/CTX-0244); they remain
 `Candidate` here because the accepted
-[DevTools RFC](https://github.com/bitty-terminal/bitty-docs/blob/main/docs/specifications/devtools-rfc.md)
+[DevTools RFC](https://github.com/bitty-terminal/bitty-terminal-docs/blob/main/specifications/devtools-rfc.md)
 does not yet name these methods.
 
 - Bounded keyboard `keyDown`/`keyUp` and mouse `clickTrajectory` /
@@ -421,8 +451,8 @@ technical record remains
 
 Phase 2 extends phase 1 with live IPC and advanced tracing/control as
 experimental evidence for
-[DevTools RFC](https://github.com/bitty-terminal/bitty-docs/blob/main/docs/specifications/devtools-rfc.md)
-(OQ-019), [IPC and Agent RFC](https://github.com/bitty-terminal/bitty-docs/blob/main/docs/specifications/ipc-agent-rfc.md)
+[DevTools RFC](https://github.com/bitty-terminal/bitty-terminal-docs/blob/main/specifications/devtools-rfc.md)
+(OQ-019), [IPC and Agent RFC](https://github.com/bitty-terminal/bitty-ai-docs/blob/main/specifications/ipc-agent-rfc.md)
 (OQ-018), and budgets OQ-001. No installation procedure, supported API,
 compatibility guarantee, release, or distributable artifact is claimed until
 independent review and `Verified` lifecycle.

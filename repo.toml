@@ -4,7 +4,7 @@ name = "bitty-devtools"
 kind = "tooling"
 lang = "ts/rust"
 role = "devtools protocol, automation, campaigns"
-owner = "TBD"
+owner = "bitty-core"
 docs = "bitty-docs"
 
 [contracts.consumes]

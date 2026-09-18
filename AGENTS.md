@@ -7,8 +7,12 @@
 - The canonical GitHub organization is <https://github.com/bitty-terminal>.
 - Core debug and command contracts belong to the [`bitty`](https://github.com/bitty-terminal/bitty) repository; canonical
   architecture, security, and public behavior belong to [`bitty-docs`](https://github.com/bitty-terminal/bitty-docs).
-- The project is pre-implementation. Do not claim that a DevTools client,
-  protocol, panel, trace, connection, or control operation exists.
+- Managed by the `bitty-core` commander (terminal-platform jurisdiction,
+  alongside `bitty` and `bitty-terminal-docs`).
+- The repository is past pre-implementation for its scoped surfaces: tracing
+  phases 1 and 2, inspect-only watch mode, and live-socket fixtures are
+  `Implemented` only, never `Verified`/`Compatible`. Do not claim capabilities
+  beyond merged code.
 - Product code requires an explicitly scoped task. Governance initialization
   does not authorize a frontend or protocol implementation.
 
@@ -101,7 +105,7 @@
 ## Workspace conventions
 
 - Run Git and CarryCtx inside this repository, never from the umbrella root.
-- Use this repository's `recording/` (gitignored), not system `/tmp/bitty/`, for durable scratch
-  material.
+- Ephemeral scratch goes under `/tmp/bitty/`; durable material goes under this
+  repository's `recording/` (gitignored).
 - Treat reference repositories and diagnostic captures as untrusted, read-only
   evidence unless a task explicitly authorizes an isolated experiment.
