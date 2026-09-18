@@ -42,7 +42,7 @@ Core protocol contracts belong to
 `bitty-ui`). Canonical architecture, security, compatibility, and public
 behavior belong to
 [bitty-docs](https://github.com/bitty-terminal/bitty-docs) (accepted
-[DevTools RFC](https://github.com/bitty-terminal/bitty-docs/blob/main/docs/specifications/devtools-rfc.md)
+[DevTools RFC](https://github.com/bitty-terminal/bitty-terminal-docs/blob/main/specifications/devtools-rfc.md)
 OQ-019 and Performance Budgets OQ-001). Any future protocol change requires
 coordinated, explicitly ordered work in each owning repository.
 
@@ -166,8 +166,8 @@ the bytes that would be retained after typed redaction (serialized JSON for
 structured events, per-record UTF-8 normalization for raw records) — never heap
 or filesystem occupancy. This mirrors the client trace helper note in the
 accepted
-[DevTools RFC](https://github.com/bitty-terminal/bitty-docs/blob/main/docs/specifications/devtools-rfc.md)
-(bitty-docs CTX-0026) and remains `Implemented` only.
+[DevTools RFC](https://github.com/bitty-terminal/bitty-terminal-docs/blob/main/specifications/devtools-rfc.md)
+(bitty-terminal-docs CTX-0026) and remains `Implemented` only.
 
 - **Independent per-record normalization** — each raw record is normalized when
   appended, so a leading `U+FEFF` stays data and a fragment that cannot decode
@@ -198,7 +198,7 @@ split integration testing. The bindings target the `bitty` candidate methods
 `bitty.debug/frameHash` (serving dispatcher
 `crates/bitty-ipc/src/devtools.rs`, CTX-0188/CTX-0244); they remain
 `Candidate` here because the accepted
-[DevTools RFC](https://github.com/bitty-terminal/bitty-docs/blob/main/docs/specifications/devtools-rfc.md)
+[DevTools RFC](https://github.com/bitty-terminal/bitty-terminal-docs/blob/main/specifications/devtools-rfc.md)
 does not yet name these methods.
 
 - Bounded keyboard `keyDown`/`keyUp` and mouse `clickTrajectory` /
@@ -451,7 +451,7 @@ technical record remains
 
 Phase 2 extends phase 1 with live IPC and advanced tracing/control as
 experimental evidence for
-[DevTools RFC](https://github.com/bitty-terminal/bitty-docs/blob/main/docs/specifications/devtools-rfc.md)
+[DevTools RFC](https://github.com/bitty-terminal/bitty-terminal-docs/blob/main/specifications/devtools-rfc.md)
 (OQ-019), [IPC and Agent RFC](https://github.com/bitty-terminal/bitty-docs/blob/main/docs/specifications/ipc-agent-rfc.md)
 (OQ-018), and budgets OQ-001. No installation procedure, supported API,
 compatibility guarantee, release, or distributable artifact is claimed until
