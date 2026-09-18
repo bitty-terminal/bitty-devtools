@@ -668,11 +668,7 @@ export class InspectionClient {
   }
 
   private requireInspect(scope: string): void {
-    if (
-      scope !== "debug.inspect" &&
-      scope !== "debug.trace" &&
-      scope !== "debug.control"
-    ) {
+    if (scope !== "debug.inspect") {
       throw new InspectionError("ScopeDenied", "debug.inspect scope required");
     }
   }

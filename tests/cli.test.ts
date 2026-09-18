@@ -5,15 +5,22 @@ import {
   DEFAULT_GENERATION,
   DEFAULT_TRACE_DURATION_MS,
   DEFAULT_TRACE_MAX_BYTES,
+  DEFAULT_WATCH_INTERVAL_MS,
   MAX_CELL_CHARS,
+  WATCH_CEILING_MS,
+  WATCH_FLOOR_MS,
+  WATCH_JITTER_FRACTION,
+  WATCH_MAX_TICKS,
   exitCodeForError,
   parseCliArgs,
   runCli,
   runCliLive,
+  runCliWatch,
+  watchTickDelayMs,
 } from "../src/cli.js";
 import type { CliRuntime } from "../src/cli.js";
 import { DIR_MODE, SOCKET_MODE, peerCredentials } from "../src/auth.js";
-import { IpcTransport } from "../src/transport.js";
+import { IpcTransport, TransportError } from "../src/transport.js";
 import type { IpcRequest } from "../src/transport.js";
 import {
   EXIT_CONFIG,
@@ -148,6 +155,9 @@ describe("parseCliArgs", () => {
         json: false,
         socket: null,
         instance: null,
+        watch: false,
+        intervalMs: null,
+        maxTicks: null,
       },
     });
   });
@@ -176,6 +186,9 @@ describe("parseCliArgs", () => {
         json: true,
         socket: "/tmp/bitty.sock",
         instance: "dev",
+        watch: false,
+        intervalMs: null,
+        maxTicks: null,
       },
     });
   });
@@ -900,5 +913,756 @@ describe("wire-trace flag contract N1-N15", () => {
     expect(h.err).toEqual([]);
     expect(h.out.join("")).toContain("trace-");
     expect(h.out.join("")).toContain("262144");
+  });
+});
+
+describe("inspect --watch mode per accepted design A4 (CTX-0072)", () => {
+  test("W1 parses --watch with defaults (interval null, max-ticks null)", () => {
+    expect(parseCliArgs(["inspect", "--plugins", "--watch"])).toEqual({
+      kind: "inspect",
+      options: {
+        selector: "plugins",
+        plugin: null,
+        generation: null,
+        json: false,
+        socket: null,
+        instance: null,
+        watch: true,
+        intervalMs: null,
+        maxTicks: null,
+      },
+    });
+    expect(DEFAULT_WATCH_INTERVAL_MS).toBe(2000);
+    expect(WATCH_FLOOR_MS).toBe(1000);
+    expect(WATCH_CEILING_MS).toBe(60000);
+    expect(WATCH_JITTER_FRACTION).toBe(0.1);
+    expect(WATCH_MAX_TICKS).toBe(1000);
+  });
+
+  test("W1 parses --watch with explicit interval and max-ticks", () => {
+    expect(
+      parseCliArgs([
+        "inspect",
+        "--budgets",
+        "--plugin",
+        "plugin-a",
+        "--watch",
+        "--interval-ms",
+        "3000",
+        "--max-ticks",
+        "4",
+      ]),
+    ).toEqual({
+      kind: "inspect",
+      options: {
+        selector: "budgets",
+        plugin: "plugin-a",
+        generation: null,
+        json: false,
+        socket: null,
+        instance: null,
+        watch: true,
+        intervalMs: 3000,
+        maxTicks: 4,
+      },
+    });
+  });
+
+  test("W2 --watch without a selector, with unknown flags, or flag-as-value exits 2", () => {
+    expect(() => parseCliArgs(["--watch"])).toThrow(CliUsageError);
+    expect(() => parseCliArgs(["inspect", "--watch"])).toThrow(CliUsageError);
+    expect(() =>
+      parseCliArgs(["inspect", "--plugins", "--watch", "--wire-trace"]),
+    ).toThrow(CliUsageError);
+    expect(() =>
+      parseCliArgs(["inspect", "--plugins", "--watch", "--duration-ms", "100"]),
+    ).toThrow(CliUsageError);
+    expect(() =>
+      parseCliArgs(["inspect", "--plugins", "--watch", "--max-bytes", "1024"]),
+    ).toThrow(CliUsageError);
+    expect(() =>
+      parseCliArgs(["inspect", "--plugins", "--watch", "--include-input"]),
+    ).toThrow(CliUsageError);
+    expect(() =>
+      parseCliArgs(["inspect", "--plugins", "--watch", "--trace-id", "t"]),
+    ).toThrow(CliUsageError);
+    expect(() =>
+      parseCliArgs(["inspect", "--plugins", "--watch", "--offset", "0"]),
+    ).toThrow(CliUsageError);
+    expect(() =>
+      parseCliArgs(["inspect", "--plugins", "--watch", "--bearer", "x"]),
+    ).toThrow(CliUsageError);
+    expect(() =>
+      parseCliArgs([
+        "inspect",
+        "--plugins",
+        "--watch",
+        "--interval-ms",
+        "--json",
+      ]),
+    ).toThrow(CliUsageError);
+    expect(() =>
+      parseCliArgs([
+        "inspect",
+        "--plugins",
+        "--watch",
+        "--max-ticks",
+        "--json",
+      ]),
+    ).toThrow(CliUsageError);
+    const h = makeHarness();
+    expect(runCli(["inspect", "--watch"], h.deps)).toBe(EXIT_USAGE);
+    expect(h.err.join("")).toContain("Usage:");
+    expect(h.out).toEqual([]);
+  });
+
+  test("W2 interval/max-ticks without --watch exits 2 (single-shot takes no watch flags)", () => {
+    expect(() =>
+      parseCliArgs(["inspect", "--plugins", "--interval-ms", "2000"]),
+    ).toThrow(CliUsageError);
+    expect(() =>
+      parseCliArgs(["inspect", "--plugins", "--max-ticks", "3"]),
+    ).toThrow(CliUsageError);
+    const h = makeHarness();
+    expect(
+      runCli(["inspect", "--plugins", "--interval-ms", "2000"], h.deps),
+    ).toBe(EXIT_USAGE);
+    expect(h.err.join("")).toContain("Usage:");
+    expect(h.out).toEqual([]);
+  });
+
+  test("W3 bad --interval-ms exits 2 (floor 1000, ceiling 60000)", () => {
+    for (const bad of ["0", "999", "60001", "abc", "1.5", "2000ms", ""]) {
+      expect(() =>
+        parseCliArgs(["inspect", "--plugins", "--watch", "--interval-ms", bad]),
+      ).toThrow(CliUsageError);
+    }
+    expect(() =>
+      parseCliArgs([
+        "inspect",
+        "--plugins",
+        "--watch",
+        "--interval-ms",
+        "--json",
+      ]),
+    ).toThrow(CliUsageError);
+    expect(
+      parseCliArgs([
+        "inspect",
+        "--plugins",
+        "--watch",
+        "--interval-ms",
+        "1000",
+      ]),
+    ).toEqual(
+      expect.objectContaining({
+        kind: "inspect",
+        options: expect.objectContaining({ intervalMs: 1000 }),
+      }),
+    );
+    expect(
+      parseCliArgs([
+        "inspect",
+        "--plugins",
+        "--watch",
+        "--interval-ms",
+        "60000",
+      ]),
+    ).toEqual(
+      expect.objectContaining({
+        kind: "inspect",
+        options: expect.objectContaining({ intervalMs: 60000 }),
+      }),
+    );
+    const h = makeHarness();
+    expect(
+      runCli(
+        ["inspect", "--plugins", "--watch", "--interval-ms", "500"],
+        h.deps,
+      ),
+    ).toBe(EXIT_USAGE);
+    expect(h.err.join("")).toContain("Usage:");
+    expect(h.out).toEqual([]);
+  });
+
+  test("W3 bad --max-ticks exits 2 (1..1000)", () => {
+    for (const bad of ["0", "1001", "abc", "1.5", "-3", ""]) {
+      expect(() =>
+        parseCliArgs(["inspect", "--plugins", "--watch", "--max-ticks", bad]),
+      ).toThrow(CliUsageError);
+    }
+    const h = makeHarness();
+    expect(
+      runCli(["inspect", "--plugins", "--watch", "--max-ticks", "0"], h.deps),
+    ).toBe(EXIT_USAGE);
+    expect(h.err.join("")).toContain("Usage:");
+    expect(h.out).toEqual([]);
+  });
+
+  test("W3 jitter clamps to +-10% of the interval", () => {
+    expect(watchTickDelayMs(2000, 0)).toBeCloseTo(1800);
+    expect(watchTickDelayMs(2000, 0.5)).toBeCloseTo(2000);
+    expect(watchTickDelayMs(2000, 1)).toBeCloseTo(2200);
+    expect(watchTickDelayMs(1000, 0)).toBe(900);
+    expect(watchTickDelayMs(60000, 1)).toBe(66000);
+    for (const r of [0, 0.13, 0.5, 0.87, 1]) {
+      const delay = watchTickDelayMs(2000, r);
+      expect(delay).toBeGreaterThanOrEqual(1800);
+      expect(delay).toBeLessThanOrEqual(2200);
+    }
+  });
+
+  test("W4 sync runCli with --watch exits 2 (async entry required), single-shot unchanged", () => {
+    const transport = makeTransport();
+    transport.injectResponsePayload(
+      responsePayload(1, { plugins: [pluginPayload()] }),
+    );
+    const harness = makeHarness(transport);
+    const code = runCli(["inspect", "--plugins", "--watch"], harness.deps);
+    expect(code).toBe(EXIT_USAGE);
+    expect(harness.out).toEqual([]);
+    expect(harness.err.join("")).toContain("async entry");
+    expect(transport.calls).toEqual([]);
+
+    const single = makeTransport();
+    single.injectResponsePayload(
+      responsePayload(1, { plugins: [pluginPayload()] }),
+    );
+    const singleHarness = makeHarness(single);
+    expect(runCli(["inspect", "--plugins"], singleHarness.deps)).toBe(EXIT_OK);
+    expect(single.calls.length).toBe(1);
+    expect(single.calls[0]!.method).toBe("bitty.debug/listPlugins");
+  });
+
+  test("W5 watch emits one inspect dispatch per tick via the existing path", async () => {
+    const transport = makeTransport();
+    transport.injectResponsePayload(
+      responsePayload(1, { plugins: [pluginPayload()] }),
+    );
+    transport.injectResponsePayload(
+      responsePayload(2, { plugins: [pluginPayload({ id: "plugin-b" })] }),
+    );
+    const harness = makeHarness(transport);
+    const delays: number[] = [];
+    const code = await runCliWatch(
+      ["inspect", "--plugins", "--watch", "--max-ticks", "2"],
+      {
+        runtime: harness.deps.runtime,
+        transport,
+        watch: {
+          random01: () => 0.5,
+          sleep: async () => {},
+          onTick: (_tick, delayMs) => delays.push(delayMs),
+        },
+      },
+    );
+    expect(code).toBe(EXIT_OK);
+    expect(harness.err).toEqual([]);
+    expect(transport.calls.length).toBe(2);
+    expect(transport.calls[0]!.method).toBe("bitty.debug/listPlugins");
+    expect(transport.calls[0]!.params).toEqual({ generation: null });
+    expect(transport.calls[1]!.method).toBe("bitty.debug/listPlugins");
+    expect(transport.calls[1]!.params).toEqual({ generation: null });
+    const output = harness.out.join("");
+    expect(output).toContain("plugin-a");
+    expect(output).toContain("plugin-b");
+    expect(delays.length).toBe(2);
+    expect(delays[0]).toBeCloseTo(DEFAULT_WATCH_INTERVAL_MS);
+  });
+
+  test("W5 watch --subscriptions dispatches the exact method and params per tick", async () => {
+    const transport = makeTransport();
+    transport.injectResponsePayload(
+      responsePayload(1, [subscriptionPayload()]),
+    );
+    const harness = makeHarness(transport);
+    const code = await runCliWatch(
+      [
+        "inspect",
+        "--subscriptions",
+        "--plugin",
+        "plugin-a",
+        "--watch",
+        "--max-ticks",
+        "1",
+      ],
+      {
+        runtime: harness.deps.runtime,
+        transport,
+        watch: { random01: () => 0.5, sleep: async () => {} },
+      },
+    );
+    expect(code).toBe(EXIT_OK);
+    expect(transport.calls.length).toBe(1);
+    expect(transport.calls[0]!.method).toBe("bitty.debug/listSubscriptions");
+    expect(transport.calls[0]!.params).toEqual({ pluginId: "plugin-a" });
+    expect(harness.out.join("")).toContain("bitty.panel:mounted");
+  });
+
+  test("W5 watch --budgets uses the default generation per tick", async () => {
+    const transport = makeTransport();
+    transport.injectResponsePayload(responsePayload(1, budgetPayload()));
+    const harness = makeHarness(transport);
+    const code = await runCliWatch(
+      [
+        "inspect",
+        "--budgets",
+        "--plugin",
+        "plugin-a",
+        "--watch",
+        "--max-ticks",
+        "1",
+      ],
+      {
+        runtime: harness.deps.runtime,
+        transport,
+        watch: { random01: () => 0.5, sleep: async () => {} },
+      },
+    );
+    expect(code).toBe(EXIT_OK);
+    expect(transport.calls[0]!.method).toBe("bitty.debug/getBudgets");
+    expect(transport.calls[0]!.params).toEqual({
+      pluginId: "plugin-a",
+      generation: DEFAULT_GENERATION,
+    });
+  });
+
+  test("W6 server ScopeDenied terminates the loop with exit 7 and zero further ticks", async () => {
+    const transport = makeTransport();
+    transport.injectResponsePayload(
+      responsePayload(1, { plugins: [pluginPayload()] }),
+    );
+    transport.injectResponsePayload(
+      errorPayload(2, "scope", "ScopeDenied", "scope denied"),
+    );
+    const harness = makeHarness(transport);
+    const code = await runCliWatch(
+      ["inspect", "--plugins", "--watch", "--max-ticks", "5"],
+      {
+        runtime: harness.deps.runtime,
+        transport,
+        watch: { random01: () => 0.5, sleep: async () => {} },
+      },
+    );
+    expect(code).toBe(EXIT_PERM);
+    expect(harness.err.join("")).toContain("ScopeDenied");
+    expect(transport.calls.length).toBe(2);
+    expect(harness.out.length).toBe(1);
+    expect(harness.out.join("")).toContain("plugin-a");
+  });
+
+  test("W7 server RateLimited skips emission for that tick and defers to the next", async () => {
+    const transport = makeTransport();
+    transport.injectResponsePayload(
+      errorPayload(1, "budget", "RateLimited", "slow down"),
+    );
+    transport.injectResponsePayload(
+      responsePayload(2, { plugins: [pluginPayload()] }),
+    );
+    const harness = makeHarness(transport);
+    let sleeps = 0;
+    const code = await runCliWatch(
+      ["inspect", "--plugins", "--watch", "--max-ticks", "1"],
+      {
+        runtime: harness.deps.runtime,
+        transport,
+        watch: {
+          random01: () => 0.5,
+          sleep: async () => {
+            sleeps += 1;
+          },
+        },
+      },
+    );
+    expect(code).toBe(EXIT_OK);
+    expect(harness.err).toEqual([]);
+    expect(transport.calls.length).toBe(2);
+    expect(transport.calls[0]!.method).toBe("bitty.debug/listPlugins");
+    expect(transport.calls[1]!.method).toBe("bitty.debug/listPlugins");
+    expect(harness.out.length).toBe(1);
+    expect(harness.out.join("")).toContain("plugin-a");
+    expect(sleeps).toBe(1);
+  });
+
+  test("W7 RateLimited with zero frames settles on the pending exit 6", async () => {
+    const transport = makeTransport();
+    transport.injectResponsePayload(
+      errorPayload(1, "budget", "RateLimited", "slow down"),
+    );
+    const harness = makeHarness(transport);
+    const controller = new AbortController();
+    const code = await runCliWatch(["inspect", "--plugins", "--watch"], {
+      runtime: harness.deps.runtime,
+      transport,
+      watch: {
+        random01: () => 0.5,
+        sleep: async () => {
+          controller.abort();
+        },
+        signal: controller.signal,
+      },
+    });
+    expect(code).toBe(EXIT_RUNTIME);
+    expect(harness.err.join("")).toContain("RateLimited");
+    expect(harness.out).toEqual([]);
+    expect(transport.calls.length).toBe(1);
+    expect(transport.calls[0]!.method).toBe("bitty.debug/listPlugins");
+  });
+
+  test("W7 client-side RC-9 RateLimited skips the tick without emitting", async () => {
+    const transport = makeTransport();
+    transport.injectResponsePayload(
+      responsePayload(2, { plugins: [pluginPayload()] }),
+    );
+    const limiter = transport.getRateLimiter();
+    const original = limiter.check.bind(limiter);
+    let throwOnce = true;
+    limiter.check = (nowMs: number): void => {
+      if (throwOnce) {
+        throwOnce = false;
+        throw new TransportError("RateLimited", "rate limited");
+      }
+      original(nowMs);
+    };
+    const harness = makeHarness(transport);
+    const code = await runCliWatch(
+      ["inspect", "--plugins", "--watch", "--max-ticks", "1"],
+      {
+        runtime: harness.deps.runtime,
+        transport,
+        watch: { random01: () => 0.5, sleep: async () => {} },
+      },
+    );
+    expect(code).toBe(EXIT_OK);
+    expect(harness.err).toEqual([]);
+    expect(transport.calls.length).toBe(2);
+    expect(transport.calls[0]!.id).toBe(1);
+    expect(transport.calls[1]!.id).toBe(2);
+    expect(harness.out.length).toBe(1);
+    expect(harness.out.join("")).toContain("plugin-a");
+  });
+
+  test("W8 abort before any frame exits 6 with no partial output", async () => {
+    const transport = makeTransport();
+    transport.injectResponsePayload(
+      responsePayload(1, { plugins: [pluginPayload()] }),
+    );
+    const harness = makeHarness(transport);
+    const controller = new AbortController();
+    controller.abort();
+    const code = await runCliWatch(["inspect", "--plugins", "--watch"], {
+      runtime: harness.deps.runtime,
+      transport,
+      watch: {
+        random01: () => 0.5,
+        sleep: async () => {},
+        signal: controller.signal,
+      },
+    });
+    expect(code).toBe(EXIT_RUNTIME);
+    expect(harness.out).toEqual([]);
+    expect(transport.calls).toEqual([]);
+  });
+
+  test("W8 abort after one frame exits 0 and keeps the complete frame", async () => {
+    const transport = makeTransport();
+    transport.injectResponsePayload(
+      responsePayload(1, { plugins: [pluginPayload()] }),
+    );
+    transport.injectResponsePayload(
+      responsePayload(2, { plugins: [pluginPayload({ id: "plugin-b" })] }),
+    );
+    const harness = makeHarness(transport);
+    const controller = new AbortController();
+    let seen = 0;
+    const code = await runCliWatch(
+      ["inspect", "--plugins", "--watch", "--max-ticks", "5"],
+      {
+        runtime: harness.deps.runtime,
+        transport,
+        watch: {
+          random01: () => 0.5,
+          sleep: async () => {
+            seen += 1;
+            if (seen >= 1) controller.abort();
+          },
+          signal: controller.signal,
+        },
+      },
+    );
+    expect(code).toBe(EXIT_OK);
+    expect(harness.out.length).toBe(1);
+    expect(harness.out.join("")).toContain("plugin-a");
+    expect(harness.out.join("")).not.toContain("plugin-b");
+    expect(transport.calls.length).toBe(1);
+  });
+
+  test("W8 transport close before any frame exits 6 with no partial output", async () => {
+    const transport = makeTransport();
+    transport.injectResponsePayload(
+      responsePayload(1, { plugins: [pluginPayload()] }),
+    );
+    const harness = makeHarness(transport);
+    const code = await runCliWatch(["inspect", "--plugins", "--watch"], {
+      runtime: harness.deps.runtime,
+      transport,
+      watch: {
+        random01: () => 0.5,
+        sleep: async () => {},
+        onTick: () => {
+          transport.disconnect();
+        },
+      },
+    });
+    expect(code).toBe(EXIT_RUNTIME);
+    expect(harness.out).toEqual([]);
+    expect(transport.calls).toEqual([]);
+  });
+
+  test("W8 transport close after one frame exits 0 and discards the in-flight tick", async () => {
+    const transport = makeTransport();
+    transport.injectResponsePayload(
+      responsePayload(1, { plugins: [pluginPayload()] }),
+    );
+    transport.injectResponsePayload(
+      responsePayload(2, { plugins: [pluginPayload({ id: "plugin-b" })] }),
+    );
+    const harness = makeHarness(transport);
+    const code = await runCliWatch(["inspect", "--plugins", "--watch"], {
+      runtime: harness.deps.runtime,
+      transport,
+      watch: {
+        random01: () => 0.5,
+        sleep: async () => {
+          transport.disconnect();
+        },
+      },
+    });
+    expect(code).toBe(EXIT_OK);
+    expect(harness.err).toEqual([]);
+    expect(harness.out.length).toBe(1);
+    expect(harness.out.join("")).toContain("plugin-a");
+    expect(harness.out.join("")).not.toContain("plugin-b");
+    expect(transport.calls.length).toBe(1);
+  });
+
+  test("W8 onSignal bridge aborts the loop and detaches once", async () => {
+    const transport = makeTransport();
+    transport.injectResponsePayload(
+      responsePayload(1, { plugins: [pluginPayload()] }),
+    );
+    transport.injectResponsePayload(
+      responsePayload(2, { plugins: [pluginPayload({ id: "plugin-b" })] }),
+    );
+    const harness = makeHarness(transport);
+    let abortLoop: (() => void) | null = null;
+    let detached = 0;
+    const code = await runCliWatch(["inspect", "--plugins", "--watch"], {
+      runtime: harness.deps.runtime,
+      transport,
+      watch: {
+        random01: () => 0.5,
+        sleep: async () => {
+          abortLoop?.();
+        },
+        onSignal: (abort) => {
+          abortLoop = abort;
+          return () => {
+            detached += 1;
+          };
+        },
+      },
+    });
+    expect(code).toBe(EXIT_OK);
+    expect(harness.out.length).toBe(1);
+    expect(harness.out.join("")).toContain("plugin-a");
+    expect(detached).toBe(1);
+  });
+
+  test("W9 per-tick bounds apply and no frames are retained across ticks", async () => {
+    const huge = "x".repeat(MAX_CELL_CHARS + 50);
+    const transport = makeTransport();
+    transport.injectResponsePayload(
+      responsePayload(1, { plugins: [pluginPayload({ id: huge })] }),
+    );
+    transport.injectResponsePayload(
+      responsePayload(2, { plugins: [pluginPayload({ id: "plugin-b" })] }),
+    );
+    const harness = makeHarness(transport);
+    const code = await runCliWatch(
+      ["inspect", "--plugins", "--watch", "--max-ticks", "2"],
+      {
+        runtime: harness.deps.runtime,
+        transport,
+        watch: { random01: () => 0.5, sleep: async () => {} },
+      },
+    );
+    expect(code).toBe(EXIT_OK);
+    expect(harness.out.length).toBe(2);
+    expect(harness.out[0]).toContain(`${"x".repeat(MAX_CELL_CHARS)}...`);
+    expect(harness.out[0]).not.toContain(huge);
+    expect(harness.out[1]).toContain("plugin-b");
+    expect(harness.out[1]).not.toContain("x".repeat(10));
+  });
+
+  test("W9 strict InvalidResult fails closed with exit 1 and no partial row", async () => {
+    const transport = makeTransport();
+    transport.injectResponsePayload(responsePayload(1, [pluginPayload()]));
+    const harness = makeHarness(transport);
+    const code = await runCliWatch(
+      ["inspect", "--plugins", "--watch", "--max-ticks", "3"],
+      {
+        runtime: harness.deps.runtime,
+        transport,
+        watch: { random01: () => 0.5, sleep: async () => {} },
+      },
+    );
+    expect(code).toBe(EXIT_GENERIC);
+    expect(harness.err.join("")).toContain("InvalidResult");
+    expect(harness.out).toEqual([]);
+  });
+
+  test("W9 MAX_PLUGINS fail-closed: the 257th plugin exits 1 with no rows", async () => {
+    const transport = makeTransport();
+    const plugins = Array.from({ length: 257 }, (_, i) =>
+      pluginPayload({ id: `plugin-${i}` }),
+    );
+    transport.injectResponsePayload(responsePayload(1, { plugins }));
+    const harness = makeHarness(transport);
+    const code = await runCliWatch(
+      ["inspect", "--plugins", "--watch", "--max-ticks", "2"],
+      {
+        runtime: harness.deps.runtime,
+        transport,
+        watch: { random01: () => 0.5, sleep: async () => {} },
+      },
+    );
+    expect(code).toBe(EXIT_GENERIC);
+    expect(harness.err.join("")).toContain("MAX_PLUGINS");
+    expect(harness.out).toEqual([]);
+  });
+
+  test("W9 MAX_SUBSCRIPTIONS fail-closed: the 33rd subscription exits 1 with no rows", async () => {
+    const transport = makeTransport();
+    const subs = Array.from({ length: 33 }, () => subscriptionPayload());
+    transport.injectResponsePayload(responsePayload(1, subs));
+    const harness = makeHarness(transport);
+    const code = await runCliWatch(
+      [
+        "inspect",
+        "--subscriptions",
+        "--plugin",
+        "plugin-a",
+        "--watch",
+        "--max-ticks",
+        "2",
+      ],
+      {
+        runtime: harness.deps.runtime,
+        transport,
+        watch: { random01: () => 0.5, sleep: async () => {} },
+      },
+    );
+    expect(code).toBe(EXIT_GENERIC);
+    expect(harness.err.join("")).toContain("MAX_SUBSCRIPTIONS");
+    expect(harness.out).toEqual([]);
+  });
+
+  test("W10 watch pins debug.inspect: trace/control scope callers are denied", async () => {
+    const { InspectionClient } = await import("../src/inspection.js");
+    const { generation } = await import("../src/panel-runtime.js");
+    const offline = {
+      isConnected: () => false,
+      request: () => {
+        throw new Error("IPC must not be used when disconnected");
+      },
+    };
+    const client = new InspectionClient(offline, null);
+    expect(() => client.listPlugins("debug.trace", generation(1))).toThrow(
+      "debug.inspect scope required",
+    );
+    expect(() => client.listPlugins("debug.control", generation(1))).toThrow(
+      "debug.inspect scope required",
+    );
+    expect(() => client.listSubscriptions("debug.trace", "plugin-a")).toThrow(
+      "debug.inspect scope required",
+    );
+    expect(() =>
+      client.getBudgets("debug.trace", "plugin-a", generation(1)),
+    ).toThrow("debug.inspect scope required");
+    let traceCode: number | null = null;
+    try {
+      client.listPlugins("debug.trace", generation(1));
+    } catch (error) {
+      traceCode = exitCodeForError(error);
+    }
+    expect(traceCode).toBe(EXIT_PERM);
+  });
+
+  test("W10 watch never escalates: no trace/control/automation dispatch exists on the watch path", () => {
+    const source = (runCliWatch as (...args: unknown[]) => unknown).toString();
+    expect(source).not.toContain("startTrace");
+    expect(source).not.toContain("synthesizeInput");
+    const liveSource = (
+      runCliLive as (...args: unknown[]) => unknown
+    ).toString();
+    expect(liveSource).not.toContain("startTrace");
+    expect(liveSource).not.toContain("synthesizeInput");
+  });
+
+  test("W10 watch makes zero trace/control/automation calls", async () => {
+    const transport = makeTransport();
+    transport.injectResponsePayload(
+      responsePayload(1, { plugins: [pluginPayload()] }),
+    );
+    transport.injectResponsePayload(
+      responsePayload(2, { plugins: [pluginPayload({ id: "plugin-b" })] }),
+    );
+    const harness = makeHarness(transport);
+    const names = [
+      "startTrace",
+      "startTraceWithFilter",
+      "stopTrace",
+      "streamEvents",
+      "streamFilteredEvents",
+      "fetchTraceChunk",
+      "appendToTrace",
+      "appendStructuredEvent",
+      "suspendHandler",
+      "pauseHandler",
+      "resumePlugin",
+      "disposeGeneration",
+      "automationClient",
+    ] as const;
+    const proto = DevtoolsClient.prototype as unknown as Record<
+      string,
+      unknown
+    >;
+    const original = new Map<string, unknown>();
+    const escalated: string[] = [];
+    for (const name of names) {
+      original.set(name, proto[name]);
+      proto[name] = (..._args: unknown[]) => {
+        escalated.push(name);
+        throw new Error(`watch must not call ${name}`);
+      };
+    }
+    try {
+      const code = await runCliWatch(
+        ["inspect", "--plugins", "--watch", "--max-ticks", "2"],
+        {
+          runtime: harness.deps.runtime,
+          transport,
+          watch: { random01: () => 0.5, sleep: async () => {} },
+        },
+      );
+      expect(code).toBe(EXIT_OK);
+      expect(escalated).toEqual([]);
+      expect(harness.out.length).toBe(2);
+    } finally {
+      for (const name of names) {
+        proto[name] = original.get(name);
+      }
+    }
   });
 });
