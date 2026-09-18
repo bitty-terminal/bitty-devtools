@@ -452,7 +452,7 @@ technical record remains
 Phase 2 extends phase 1 with live IPC and advanced tracing/control as
 experimental evidence for
 [DevTools RFC](https://github.com/bitty-terminal/bitty-terminal-docs/blob/main/specifications/devtools-rfc.md)
-(OQ-019), [IPC and Agent RFC](https://github.com/bitty-terminal/bitty-docs/blob/main/docs/specifications/ipc-agent-rfc.md)
+(OQ-019), [IPC and Agent RFC](https://github.com/bitty-terminal/bitty-ai-docs/blob/main/specifications/ipc-agent-rfc.md)
 (OQ-018), and budgets OQ-001. No installation procedure, supported API,
 compatibility guarantee, release, or distributable artifact is claimed until
 independent review and `Verified` lifecycle.
