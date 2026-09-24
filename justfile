@@ -2,7 +2,7 @@
 
 # Version pins live here only (one place per pin).
 prettier_version := "3.9.6"
-markdownlint_version := "0.23.1"
+markdownlint_version := "0.23.2"
 
 # Lint every Markdown file selected by .markdownlint-cli2.jsonc.
 lint:
