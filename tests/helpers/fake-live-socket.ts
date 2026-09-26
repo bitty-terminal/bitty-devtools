@@ -1,13 +1,19 @@
 import { spyOn } from "bun:test";
 import * as fs from "node:fs";
 import { connectLiveSocket } from "../../src/ipc-socket.js";
-import type { LiveSocketConnection } from "../../src/ipc-socket.js";
+import type {
+  LiveSocketConnection,
+  SymlinkProbe,
+} from "../../src/ipc-socket.js";
 
 export const MEMORY_SOCKET_PATH = "/memory/bitty/fixture.sock";
 export const MEMORY_TIMEOUT_MS = 100;
 export const MEMORY_RUNTIME_UID = 1000;
 export const MEMORY_DIR_MODE = 0o700;
 export const MEMORY_SOCK_MODE = 0o600;
+const memoryLstat: SymlinkProbe = () => ({
+  isSymbolicLink: () => false,
+});
 export const SCRATCH_TIMEOUT_MS = 1000;
 export const SCRATCH_SOCKET_LEAF = "loopback.sock";
 export const SCRATCH_TIMEOUT_CEILING_MS = 5000;
@@ -116,6 +122,7 @@ export async function withMemoryConnection(
       socketPath: MEMORY_SOCKET_PATH,
       runtimeUid: MEMORY_RUNTIME_UID,
       timeoutMs: MEMORY_TIMEOUT_MS,
+      lstatSync: memoryLstat,
     });
     try {
       await run(

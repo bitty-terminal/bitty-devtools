@@ -1,15 +1,17 @@
 /**
- * Peer-credential authentication for IPC (phase 2, live runtime).
+ * Headless authentication and endpoint-policy helpers for DevTools.
  *
- * This module reuses the accepted IPC auth contract from `bitty-ipc`
- * (Unix socket 0600 / 0700 directory, Windows named pipe ACL) without
- * introducing ambient credentials. Verification is headless and bounded,
- * requiring no unsafe. Real `SO_PEERCRED` / `GetNamedPipeClientProcessId`
- * extraction lives in the platform seam; this file only verifies
- * already-extracted credentials so tests run anywhere without a live socket.
+ * This module reuses the accepted IPC policy values from `bitty-ipc` without
+ * introducing ambient credentials. Verification is bounded and requires no
+ * unsafe code. It does not extract `SO_PEERCRED` or
+ * `GetNamedPipeClientProcessId` values and does not establish a live peer
+ * identity; callers supply already-extracted values only to the headless
+ * fixture. The implemented live adapter attests endpoint ownership and mode
+ * separately and remains inspect-only.
  *
  * All checks are fail-closed: directory mode, socket mode, owner UID,
- * peer UID equality, and re-check before each privileged action.
+ * supplied peer UID equality, and re-check before each privileged fixture
+ * action.
  */
 
 export const DIR_MODE = 0o700 as const;
@@ -163,7 +165,7 @@ export function verifyWindowsPipe(
 }
 
 // ---------------------------------------------------------------------------
-// Endpoint discovery (advisory, never credential)
+// Endpoint selection (a path selector, never a credential)
 // ---------------------------------------------------------------------------
 
 export type EndpointConfig = {
@@ -196,7 +198,8 @@ export function shortInstanceHash(instance: string): string {
  * Resolve the Unix socket path with `bitty-ipc` precedence and a portable
  * `AF_UNIX` bound.
  *
- * Precedence: non-empty `BITTY_SOCKET` (advisory) wins verbatim; otherwise
+ * Precedence: non-empty `BITTY_SOCKET` (the explicit dial target) wins
+ * verbatim; otherwise
  * `<base>/bitty/<instance>.sock` where `base` is `XDG_RUNTIME_DIR` or
  * `/run/user/<uid>`, and `instance` is `BITTY_INSTANCE_ID` or `default`.
  *
@@ -234,7 +237,7 @@ export function resolveSocketPath(config: EndpointConfig): string {
 }
 
 export function isBittyEnvDiscoverySafe(): string {
-  return "BITTY_SOCKET and BITTY_INSTANCE_ID are advisory identifiers, never credentials. Every request still requires SO_PEERCRED / pipe-ACL and per-request scope evaluation.";
+  return "BITTY_SOCKET and BITTY_INSTANCE_ID select a bounded endpoint path, never credentials or connected identity. The live Linux adapter attests endpoint ownership and mode; every request still requires per-request scope evaluation.";
 }
 
 // ---------------------------------------------------------------------------

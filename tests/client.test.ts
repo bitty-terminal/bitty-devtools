@@ -3,6 +3,7 @@ import { DevtoolsClient } from "../src/client.js";
 import { IpcTransport } from "../src/transport.js";
 import { peerCredentials } from "../src/auth.js";
 import { createScratchLoopback } from "./helpers/fake-live-socket.js";
+import { isLiveSocketSupported } from "../src/ipc-socket.js";
 
 describe("DevtoolsClient integration", () => {
   test("connect + scope lifecycle", () => {
@@ -17,6 +18,9 @@ describe("DevtoolsClient integration", () => {
     c.grantScope("debug.control");
     expect(c.currentScope()).toContain("debug.control");
     c.revokeScope("debug.inspect");
+    expect(c.currentScope()).toEqual(["debug.trace", "debug.control"]);
+    c.revokeScope("debug.trace");
+    c.revokeScope("debug.control");
     expect(c.currentScope()).toEqual([]);
   });
 
@@ -134,7 +138,80 @@ describe("DevtoolsClient inspection live IPC wiring", () => {
         maxSubscriptionsPerPanel: 32,
       },
     });
-    expect(c.listPlugins()).toEqual([]);
+  });
+
+  describe("CTX-0080 session and live boundaries", () => {
+    test("independent scopes do not widen one another", () => {
+      const c = new DevtoolsClient();
+      c.connect();
+      c.grantScope("debug.trace");
+      expect(() => c.listPlugins()).toThrow("debug.inspect scope required");
+      c.grantScope("debug.control");
+      c.revokeScope("debug.trace");
+      expect(() => c.startTrace({})).toThrow("debug.trace scope required");
+
+      expect(() => c.startTrace({})).toThrow("debug.trace scope required");
+    });
+
+    test("disconnect clears panel, trace, and control session state", () => {
+      const c = new DevtoolsClient();
+      c.connect();
+      c.grantScope("debug.trace");
+      const trace = c.startTrace({});
+      c.grantScope("debug.control");
+      c.suspendHandler(1 as never, "handler", "test", "tester");
+      c.disconnect();
+      c.connect();
+      c.grantScope("debug.inspect");
+      expect(c.getPanelSnapshot()).toBeNull();
+      c.grantScope("debug.trace");
+      expect(() => c.fetchTraceChunk(trace.traceId, 0)).toThrow("not found");
+      c.grantScope("debug.control");
+      expect(c.listAuditLog()).toEqual([]);
+    });
+
+    test("live socket identity is explicit and trace/control are unavailable", async () => {
+      if (!isLiveSocketSupported()) return;
+      const responsePayload = new TextEncoder().encode(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          result: { plugins: [] },
+          version: "1.0",
+        }),
+      );
+      const loopback = createScratchLoopback({
+        prefix: "bitty-devtools-client-ctx0080",
+        responsePayload,
+        timeoutMs: 1000,
+      });
+      try {
+        const c = new DevtoolsClient();
+        await c.connectLiveSocket(
+          loopback.runtimeUid,
+          peerCredentials(loopback.runtimeUid + 1, loopback.runtimeUid, 1),
+          undefined,
+          undefined,
+          loopback.socketPath,
+        );
+        expect(c.currentScope()).toEqual([]);
+        c.grantScope("debug.inspect");
+        expect(() => c.grantScope("debug.trace")).toThrow("inspect-only");
+        await expect(
+          c.requestLive(
+            { id: 2, method: "bitty.debug/startTrace", version: "1.0" },
+            0,
+          ),
+        ).rejects.toMatchObject({
+          name: "ProtocolError",
+          error: { code: "UnknownMethod" },
+        });
+
+        c.disconnect();
+      } finally {
+        loopback.stop();
+      }
+    });
   });
 
   test("failed live connect fails closed and never falls back to mock", () => {
@@ -234,6 +311,20 @@ describe("DevtoolsClient inspection live IPC wiring", () => {
       expect(session.connected).toBe(true);
       expect(c.isIpcConnected()).toBe(true);
       c.grantScope("debug.inspect");
+      await expect(
+        c.requestLive(
+          { id: 99, method: "bitty.debug/listPlugins", version: "2.0" },
+          0,
+        ),
+      ).rejects.toMatchObject({
+        name: "ProtocolError",
+        error: { code: "UnsupportedVersion" },
+      });
+      expect(() => c.listPlugins()).toThrow("unavailable synchronously");
+      const typedPlugins = await c.listPluginsLive();
+
+      expect(typedPlugins[0]?.id).toBe("panel-live");
+      expect(c.getLiveIdentity()?.authenticated).toBe(false);
       const response = await c.requestLive(
         {
           id: 1,

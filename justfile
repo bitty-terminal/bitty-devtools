@@ -21,11 +21,13 @@ cargo-check:
 
 # TypeScript type check (strict, no any).
 type-check:
-    bunx --bun tsc -p tsconfig.json --noEmit
+    bunx --bun tsc -p tsconfig.check.json --noEmit
 
 # TypeScript unit tests (bun:test, headless; no live socket or GUI).
+# Serialized: the workflow-import fixture suite drives real child processes and
+# must not compete with itself for the same temporary state.
 test:
-    bun test
+    bun test --max-concurrency=1
 
 # Validate a commit message against commitlint.config.ts.
 # Versions are pinned in package.json / bun.lock; run `bun install` first.

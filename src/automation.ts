@@ -28,7 +28,7 @@
  */
 
 import { BOUNDS } from "./bounds.js";
-import { PROTOCOL_VERSION } from "./protocol.js";
+import { decodeResponse, PROTOCOL_VERSION } from "./protocol.js";
 import type { IpcRequest, IpcResponse } from "./transport.js";
 
 /** Wire method for `synthesizeInput` (key/mouse/wheel/paste synthesis). */
@@ -728,6 +728,26 @@ export function dragTrajectory(
 // Client
 // ---------------------------------------------------------------------------
 
+function decodeTransportResponse(response: IpcResponse): IpcResponse {
+  let encoded: string | undefined;
+  try {
+    encoded = JSON.stringify(response);
+  } catch {
+    encoded = undefined;
+  }
+  if (encoded === undefined) {
+    throw new AutomationError("InvalidResult", "response is not serializable");
+  }
+  try {
+    return decodeResponse(encoded) as IpcResponse;
+  } catch (error) {
+    throw new AutomationError(
+      "InvalidResult",
+      error instanceof Error ? error.message : "invalid response envelope",
+    );
+  }
+}
+
 export class AutomationClient {
   private nextRequestId = 1;
 
@@ -809,9 +829,11 @@ export class AutomationClient {
     );
     const id = this.nextRequestId;
     this.nextRequestId += 1;
-    const response = transport.request(
-      { id, method, params, version: PROTOCOL_VERSION },
-      Date.now(),
+    const response = decodeTransportResponse(
+      transport.request(
+        { id, method, params, version: PROTOCOL_VERSION },
+        Date.now(),
+      ),
     );
     if (response.error !== undefined) {
       throw this.mapServerError(response.error);

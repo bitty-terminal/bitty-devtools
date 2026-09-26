@@ -118,8 +118,29 @@ pub fn check_matrix_invariants() -> Result<(), String> {
         if !seen.insert(e.surface) {
             return Err(format!("duplicate {}", e.surface));
         }
-        if e.corpus_rel.is_empty() {
-            return Err(format!("empty corpus for {}", e.surface));
+        if e.corpus_rel.is_empty() || e.corpus_rel.len() > 256 {
+            return Err(format!("invalid corpus for {}", e.surface));
+        }
+        if e.corpus_rel.starts_with('/')
+            || e.corpus_rel.contains("..")
+            || e.corpus_rel.contains('\\')
+            || e.corpus_rel.bytes().any(|byte| byte < 0x20 || byte == 0x7f)
+        {
+            return Err(format!("unsafe corpus path for {}", e.surface));
+        }
+        if e.category.is_empty()
+            || e.category.len() > 64
+            || e.category.bytes().any(|byte| byte < 0x20 || byte == 0x7f)
+        {
+            return Err(format!("invalid category for {}", e.surface));
+        }
+        if e.description.is_empty()
+            || e.description.len() > 256
+            || e.description
+                .bytes()
+                .any(|byte| byte < 0x20 || byte == 0x7f)
+        {
+            return Err(format!("invalid description for {}", e.surface));
         }
     }
     if MATRIX.first().unwrap().surface != "shell" {
@@ -132,6 +153,10 @@ pub fn check_matrix_invariants() -> Result<(), String> {
         return Err("reference terms must be 4".to_string());
     }
     Ok(())
+}
+
+pub fn validate_matrix_shape() -> Result<(), String> {
+    check_matrix_invariants()
 }
 
 /// Minimal JSON string escape for matrix fields (mirrors the upstream

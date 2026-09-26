@@ -3,10 +3,10 @@
 //!
 //! Phase 2 extends phase 1 with advanced tracing (filtering, retention/GC,
 //! structured events, coalescing), control surfaces (audit log, generation
-//! guards, pause/resume), and real IPC socket/pipe peer-creds integration
-//! against the live Bitty runtime. This crate **reuses** the Panel Runtime
-//! envelope and does not own the core debug protocol (devtools-rfc OQ-019,
-//! performance budgets OQ-001). All operations are bounded, fail-closed,
+//! guards, pause/resume), a headless transport fixture, and a Linux-only
+//! endpoint-attested live socket inspection path. This crate **reuses** the
+//! Panel Runtime envelope and does not own the core debug protocol (devtools-rfc
+//! OQ-019, performance budgets OQ-001). All operations are bounded, fail-closed,
 //! and scope-checked. No TCP listener, no ambient credential.
 //!
 //! - Connection alone grants no authority; `debug.inspect` is default.
@@ -23,7 +23,8 @@ pub mod inspection;
 pub mod ipc_socket;
 pub mod protocol;
 pub mod redaction;
-pub mod tracing;
+#[allow(dead_code)]
+mod tracing;
 pub mod transport;
 
 pub use compat::{MATRIX, MatrixEntry, REFERENCE_TERMS};

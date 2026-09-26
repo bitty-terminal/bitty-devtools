@@ -1,0 +1,19 @@
+# Status contexts required by branch protection on main, one per line.
+#
+# This list is a local mirror of the remote branch protection configuration and
+# exists only so a workflow change that renames or drops a required job is
+# caught before merge; the remote configuration remains authoritative and is
+# changed separately. Refresh it from the branch protection API when the remote
+# list changes.
+#
+# The "CodeQL" context is reported by the CodeQL GitHub App rather than by a
+# workflow job name, so it is not listed here.
+#
+# Verified against the branch protection API for this repository:
+#   Lint GitHub Actions workflows
+#   Quality gates
+#   Analyze (javascript-typescript, actions)
+#   CodeQL
+Lint GitHub Actions workflows
+Quality gates
+Analyze (javascript-typescript, actions)

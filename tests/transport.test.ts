@@ -18,7 +18,7 @@ import {
 } from "../src/transport.js";
 import { peerCredentials } from "../src/auth.js";
 
-describe("transport framing (phase 2, live runtime, bounded 256 KiB IPC / 1 MiB devtools)", () => {
+describe("transport framing (headless fixture, bounded 256 KiB IPC / 1 MiB devtools)", () => {
   test("frame roundtrip small", () => {
     const p = new TextEncoder().encode("hello");
     const wire = encodeFrame(p);
@@ -204,7 +204,7 @@ describe("transport framing (phase 2, live runtime, bounded 256 KiB IPC / 1 MiB 
     expect(new TextDecoder().decode(out[0]!.payload)).toBe("b");
   });
 
-  test("ipc transport peer creds verified at connect and per privileged action", () => {
+  test("headless transport verifies supplied peer values at connect and per privileged action", () => {
     const peer = peerCredentials(1000, 1000, 1);
     const t = new IpcTransport({
       runtimeUid: 1000,
@@ -319,6 +319,23 @@ describe("transport framing (phase 2, live runtime, bounded 256 KiB IPC / 1 MiB 
       peer,
     });
     expect(() => t.connect()).toThrow("peer uid");
+  });
+
+  test("ipc transport rejects malformed UTF-8 before response parsing", () => {
+    const t = new IpcTransport({
+      runtimeUid: 1000,
+      socketPath: "/unused/headless.sock",
+      peer: peerCredentials(1000, 1000, 1),
+    });
+    t.connect();
+    t.injectResponsePayload(new Uint8Array([0xff]));
+    expect(() =>
+      t.request(
+        { id: 1, method: "bitty.debug/listPlugins", version: "1.0" },
+        0,
+      ),
+    ).toThrow("not valid UTF-8");
+    t.disconnect();
   });
 
   test("ipc transport chunking at 256 KiB for 1 MiB logical frame", () => {

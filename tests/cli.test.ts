@@ -10,6 +10,7 @@ import {
   WATCH_CEILING_MS,
   WATCH_FLOOR_MS,
   WATCH_JITTER_FRACTION,
+  WATCH_MAX_FAILED_ATTEMPTS,
   WATCH_MAX_TICKS,
   exitCodeForError,
   parseCliArgs,
@@ -21,7 +22,7 @@ import {
 import type { CliRuntime } from "../src/cli.js";
 import { DIR_MODE, SOCKET_MODE, peerCredentials } from "../src/auth.js";
 import { IpcTransport, TransportError } from "../src/transport.js";
-import type { IpcRequest } from "../src/transport.js";
+import type { IpcRequest, IpcResponse } from "../src/transport.js";
 import {
   EXIT_CONFIG,
   EXIT_GENERIC,
@@ -77,6 +78,28 @@ function makeTransport(): RecordingTransport {
     socketPath: `/run/user/${uid}/bitty/default.sock`,
     peer: peerCredentials(uid, gid, pid),
   });
+}
+
+class AlternatingRateLimitTransport extends RecordingTransport {
+  attempts = 0;
+
+  override request(req: IpcRequest, _nowMs: number): IpcResponse {
+    this.attempts += 1;
+    if (this.attempts % 2 === 0) {
+      return {
+        jsonrpc: "2.0",
+        id: req.id,
+        error: { category: "budget", code: "RateLimited", message: "fixture" },
+        version: "1.0",
+      };
+    }
+    return {
+      jsonrpc: "2.0",
+      id: req.id,
+      result: { plugins: [pluginPayload()] },
+      version: "1.0",
+    };
+  }
 }
 
 function responsePayload(id: number, result: unknown): Uint8Array {
@@ -308,7 +331,7 @@ describe("runCli dispatch over an injected transport", () => {
     const harness = makeHarness(transport);
     expect(runCli(["inspect", "--plugins"], harness.deps)).toBe(EXIT_OK);
     const output = harness.out.join("");
-    expect(output).toContain(`${"x".repeat(MAX_CELL_CHARS)}...`);
+    expect(output).toContain(`${"x".repeat(MAX_CELL_CHARS - 3)}...`);
     expect(output).not.toContain(huge);
   });
 
@@ -324,7 +347,7 @@ describe("runCli dispatch over an injected transport", () => {
     );
     const parsed = JSON.parse(harness.out.join("")) as Array<{ id: string }>;
     expect(parsed[0]!.id.endsWith("...")).toBe(true);
-    expect(parsed[0]!.id.length).toBe(MAX_CELL_CHARS + 3);
+    expect(parsed[0]!.id.length).toBe(MAX_CELL_CHARS);
     expect(harness.out.join("")).not.toContain(huge);
   });
 
@@ -781,12 +804,12 @@ describe("wire-trace flag contract N1-N15", () => {
     expect(fetched.chunk).not.toContain("example-secret-value");
     expect(fetched.preview).not.toContain("example-secret-value");
     const stopped = c.stopTrace(s.traceId);
-    expect(stopped.spoolMode).toBe("0600");
+    expect(stopped.spoolMode).toBe("memory");
     expect(stopped.previews.join("")).not.toContain("example-secret-value");
     const s2 = c.startTrace({ maxBytes: 1024 });
     c.appendToTrace(s2.traceId, "hello");
     const preview = c.exportTracePreview(s2.traceId);
-    expect(preview.spoolMode).toBe("0600");
+    expect(preview.spoolMode).toBe("memory");
     let tampered: string | null = null;
     try {
       const { assertPreviewMatchesExport } = await import("../src/tracing.js");
@@ -862,7 +885,7 @@ describe("wire-trace flag contract N1-N15", () => {
       EXIT_RUNTIME,
     );
     expect(h.out).toEqual([]);
-    expect(h.err.join("")).toContain("no connected Bitty instance");
+    expect(h.err.join("")).toContain("inspect-only");
   });
 
   test("N14 rate and frame shedding fail closed with counted drops", () => {
@@ -1479,6 +1502,28 @@ describe("inspect --watch mode per accepted design A4 (CTX-0072)", () => {
     expect(detached).toBe(1);
   });
 
+  test("W9 total rate-limit budget survives alternating successful frames", async () => {
+    const { uid, gid, pid } = makeHarness().deps.runtime;
+    const transport = new AlternatingRateLimitTransport({
+      runtimeUid: uid,
+      socketPath: `/run/user/${uid}/bitty/default.sock`,
+      peer: peerCredentials(uid, gid, pid),
+      capacity: 256,
+    });
+    const harness = makeHarness(transport);
+    const code = await runCliWatch(
+      ["inspect", "--plugins", "--watch", "--max-ticks", "1000"],
+      {
+        runtime: harness.deps.runtime,
+        transport,
+        watch: { random01: () => 0.5, sleep: async () => {} },
+      },
+    );
+    expect(code).toBe(EXIT_OK);
+    expect(transport.attempts).toBeLessThan(WATCH_MAX_FAILED_ATTEMPTS * 3);
+    expect(harness.out.length).toBeGreaterThan(0);
+  });
+
   test("W9 per-tick bounds apply and no frames are retained across ticks", async () => {
     const huge = "x".repeat(MAX_CELL_CHARS + 50);
     const transport = makeTransport();
@@ -1499,7 +1544,7 @@ describe("inspect --watch mode per accepted design A4 (CTX-0072)", () => {
     );
     expect(code).toBe(EXIT_OK);
     expect(harness.out.length).toBe(2);
-    expect(harness.out[0]).toContain(`${"x".repeat(MAX_CELL_CHARS)}...`);
+    expect(harness.out[0]).toContain(`${"x".repeat(MAX_CELL_CHARS - 3)}...`);
     expect(harness.out[0]).not.toContain(huge);
     expect(harness.out[1]).toContain("plugin-b");
     expect(harness.out[1]).not.toContain("x".repeat(10));

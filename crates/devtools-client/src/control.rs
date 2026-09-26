@@ -2,8 +2,8 @@
 //! Control surface (debug.control, audited, no bypass) — phase 2 advanced.
 //!
 //! Phase 2 adds: generation exhaustion guard, transactional audit log,
-//! pause/resume with reactivation, per-generation ownership, peer-creds
-//! re-verification hooks, bounded audit retrieval.
+//! pause/resume with reactivation, per-generation ownership, fixture peer-value
+//! re-verification hooks, and bounded audit retrieval.
 
 use crate::bounds::GENERATION_RESERVE;
 
@@ -276,6 +276,10 @@ impl ControlClient {
         self.audit_log.clear();
         Ok(())
     }
+
+    pub fn clear_session_state(&mut self) {
+        self.audit_log.clear();
+    }
 }
 
 #[cfg(test)]
@@ -327,6 +331,17 @@ mod tests {
         assert_eq!(logs.len(), super::MAX_AUDIT_LOG);
         assert_eq!(logs[0].at_ms, 10);
         assert_eq!(logs[super::MAX_AUDIT_LOG - 1].at_ms, 265);
+    }
+
+    #[test]
+    fn clear_session_state_clears_audit() {
+        let mut client = ControlClient::new();
+        client
+            .suspend_handler_audited(true, "h", "c", "caller", 1, 0)
+            .unwrap();
+        assert_eq!(client.audit_count(), 1);
+        client.clear_session_state();
+        assert_eq!(client.audit_count(), 0);
     }
 
     #[test]

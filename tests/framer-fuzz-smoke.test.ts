@@ -352,7 +352,7 @@ describe("T1 framer pushBytes", () => {
       const frames = framer.pushBytes(wire.slice(at));
       expect(frames.length).toBe(1);
       expect(toHex(frames[0]!.payload)).toBe(
-        (vec.expect["framesHex"] as string[])[0],
+        String((vec.expect["framesHex"] as string[] | undefined)?.[0] ?? ""),
       );
     }
     const emojiPayload = loadSeed("emoji.bin");
@@ -417,9 +417,9 @@ describe("T2 encode decode round-trip", () => {
   test("oracle fixed frames match encoder output", () => {
     const oracle = loadOracle();
     const helloWire = encodeFrame(loadSeed("hello.bin"));
-    expect(toHex(helloWire)).toBe(vectorById(oracle, "V03").wireHex);
+    expect(toHex(helloWire)).toBe(vectorById(oracle, "V03").wireHex!);
     expect(toHex(encodeFrame(loadSeed("empty.bin")))).toBe(
-      vectorById(oracle, "V02").inputHex,
+      vectorById(oracle, "V02").inputHex!,
     );
   });
 });
@@ -430,8 +430,8 @@ describe("T3 chunkText boundary parity", () => {
     for (const id of ["C01", "C02", "C03"]) {
       const vec = vectorById(oracle, id);
       const chunks = chunkText(vec.input!, vec.limitBytes!);
-      expect(chunks).toEqual(vec.expect["chunks"]);
-      expect(chunks.join("")).toBe(vec.input);
+      expect(chunks).toEqual(vec.expect["chunks"] as string[]);
+      expect(chunks.join("")).toBe(vec.input!);
       const encoder = new TextEncoder();
       for (const chunk of chunks) {
         expect(encoder.encode(chunk).length).toBeLessThanOrEqual(

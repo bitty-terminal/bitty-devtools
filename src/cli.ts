@@ -2,8 +2,8 @@
  * bitty-devtools CLI wrapper (CTX-0025).
  *
  * A lightweight executable over the existing typed diagnostics client. It
- * parses `inspect` selectors, resolves a connection from explicit flags or the
- * advisory environment (`BITTY_SOCKET` / `BITTY_INSTANCE_ID` /
+ * parses `inspect` selectors, resolves a connection from explicit flags or
+ * environment-selected endpoint paths (`BITTY_SOCKET` / `BITTY_INSTANCE_ID` /
  * `XDG_RUNTIME_DIR`), dispatches through {@link DevtoolsClient} inspection
  * methods, and renders bounded tabular or JSON output.
  *
@@ -24,6 +24,7 @@
 
 import { BOUNDS, BoundError, truncateToChars } from "./bounds.js";
 import { generation } from "./panel-runtime.js";
+import type { Generation } from "./panel-runtime.js";
 import { DevtoolsClient } from "./client.js";
 import { InspectionError } from "./inspection.js";
 import type {
@@ -39,7 +40,6 @@ import type {
 } from "./tracing.js";
 import { AuthError, peerCredentials, resolveSocketPath } from "./auth.js";
 import { IpcTransport, TransportError } from "./transport.js";
-import { connectLiveSocket } from "./ipc-socket.js";
 import { ProtocolErrorImpl } from "./protocol.js";
 import {
   EXIT_CONFIG,
@@ -73,6 +73,7 @@ export const WATCH_JITTER_FRACTION = 0.1 as const;
 
 /** Cap for `--max-ticks` (tests use a bounded value at or below this). */
 export const WATCH_MAX_TICKS = 1000 as const;
+export const WATCH_MAX_FAILED_ATTEMPTS = 100 as const;
 
 export const DEFAULT_TRACE_DURATION_MS = 10000 as const;
 export const DEFAULT_TRACE_MAX_BYTES = 524288 as const;
@@ -168,7 +169,7 @@ Selectors (exactly one):
   --subscriptions     List event subscriptions for --plugin.
   --budgets           Show RC-1/RC-2/RC-4/RC-5 budgets for --plugin.
 
-Trace (requires --wire-trace, live socket, debug.trace):
+Trace (requires --wire-trace and the headless simulation transport):
   start               Start a wire trace with bounded duration and bytes.
   stop                Stop a wire trace and show redacted previews.
   fetch-chunk         Fetch one 262144-byte chunk with continuation.
@@ -185,7 +186,7 @@ Options:
   --include-input     Presence-only input capture opt-in, default off.
   --trace-id <id>     Trace id for stop and fetch-chunk.
   --offset <n>        Byte offset for fetch-chunk.
-  --socket <path>     Explicit Bitty IPC socket path (advisory).
+  --socket <path>     Explicit bounded Bitty IPC socket dial target.
   --instance <id>     Instance id under $XDG_RUNTIME_DIR/bitty/<id>.sock.
   --json              Emit bounded, pretty-printed JSON instead of a table.
   -h, --help          Show this help.
@@ -197,9 +198,9 @@ Connection:
   With no --socket/--instance, the CLI reads BITTY_SOCKET, then
   BITTY_INSTANCE_ID with XDG_RUNTIME_DIR. It fails closed when no instance is
   selected. Read-only; requires the debug.inspect scope and never fabricates
-  data for a server method the core has not implemented. Trace verbs use the
-  live socket only, require debug.trace, spool 0600, and never read
-  BITTY_WIRE_TRACE. Methods and fields follow the accepted devtools-rfc v1.`;
+  data for a server method the core has not implemented. The live socket is
+  inspect-only; trace verbs require the headless simulation transport and never
+  read BITTY_WIRE_TRACE. Methods and fields follow the accepted devtools-rfc v1.`;
 
 function takeValue(
   argv: readonly string[],
@@ -661,7 +662,7 @@ export type CliDeps = {
 };
 
 /**
- * Resolve the socket path from explicit options then advisory environment.
+ * Resolve the socket path from explicit options then environment selection.
  *
  * Returns `null` when no instance is selected. All resolved values are routed
  * through {@link resolveSocketPath} so its length/NUL/instance validation runs
@@ -715,9 +716,28 @@ function resolveSocket(
   }
 }
 
+function sanitizeDisplayText(value: string): string {
+  return Array.from(value, (character) => {
+    const codePoint = character.codePointAt(0);
+    if (codePoint === 0x09 || codePoint === 0x0a || codePoint === 0x0d) {
+      return character === "\t" ? "\\t" : character === "\n" ? "\\n" : "\\r";
+    }
+    if (
+      codePoint !== undefined &&
+      (codePoint < 0x20 ||
+        codePoint === 0x7f ||
+        (codePoint >= 0x80 && codePoint <= 0x9f))
+    ) {
+      return `\\u${codePoint.toString(16).padStart(4, "0")}`;
+    }
+    return character;
+  }).join("");
+}
+
 function boundCell(value: string): string {
-  const { text, truncated } = truncateToChars(value, MAX_CELL_CHARS);
-  return truncated ? `${text}...` : text;
+  const safe = sanitizeDisplayText(value);
+  const { text, truncated } = truncateToChars(safe, MAX_CELL_CHARS - 3);
+  return truncated ? `${text}...` : safe;
 }
 
 function renderTable(
@@ -789,14 +809,20 @@ function renderBudgets(budget: BudgetSnapshot): string {
 /** Recursively bound string fields so `--json` matches the table path (N2). */
 function boundJsonValue(value: unknown, depth = 0): unknown {
   if (typeof value === "string") return boundCell(value);
-  if (depth >= MAX_JSON_DEPTH) return value;
+  if (typeof value === "number" && !Number.isFinite(value)) return null;
+  if (depth >= MAX_JSON_DEPTH) return "[depth-limit]";
   if (Array.isArray(value)) {
-    return value.map((entry) => boundJsonValue(entry, depth + 1));
+    return value
+      .slice(0, BOUNDS.MAX_PANELS_PER_WINDOW)
+      .map((entry) => boundJsonValue(entry, depth + 1));
   }
   if (value !== null && typeof value === "object") {
     const bounded: Record<string, unknown> = {};
-    for (const [key, entry] of Object.entries(value)) {
-      bounded[key] = boundJsonValue(entry, depth + 1);
+    for (const [key, entry] of Object.entries(value).slice(
+      0,
+      BOUNDS.MAX_TOPICS_TOTAL,
+    )) {
+      bounded[boundCell(key)] = boundJsonValue(entry, depth + 1);
     }
     return bounded;
   }
@@ -804,7 +830,11 @@ function boundJsonValue(value: unknown, depth = 0): unknown {
 }
 
 function toJson(value: unknown): string {
-  return JSON.stringify(boundJsonValue(value), null, 2);
+  const json = JSON.stringify(boundJsonValue(value), null, 2);
+  if (new TextEncoder().encode(json).length > BOUNDS.MAX_SNAPSHOT_JSON_BYTES) {
+    throw new InspectionError("InvalidResult", "rendered JSON exceeds 16 KiB");
+  }
+  return json;
 }
 
 function renderTraceStart(result: TraceStartResult, json: boolean): string {
@@ -815,7 +845,7 @@ function renderTraceStart(result: TraceStartResult, json: boolean): string {
     ["FIELD", "VALUE"],
     [
       ["traceId", result.traceId],
-      ["spoolPath", result.spoolPath],
+      ["storage", result.storage],
       ["chunkBytes", String(result.chunkBytes)],
       ["startWallClockMs", String(result.startWallClockMs)],
     ],
@@ -1032,7 +1062,7 @@ async function runWatchTickLive(
   if (signal?.aborted) return { kind: "cancelled" };
   if (!client.isIpcConnected()) return { kind: "cancelled" };
   try {
-    const output = await dispatchLive(client, options, nowMs);
+    const output = await dispatchLive(client, options, nowMs, signal);
     if (signal?.aborted) return { kind: "cancelled" };
     return { kind: "frame", output };
   } catch (error) {
@@ -1099,6 +1129,7 @@ async function runWatchLoopWith(
     else external.addEventListener("abort", onExternalAbort, { once: true });
   }
   let frames = 0;
+  let failedAttempts = 0;
   let pending: unknown = null;
   const settle = (): number => {
     if (frames >= 1) return EXIT_OK;
@@ -1107,6 +1138,35 @@ async function runWatchLoopWith(
       return exitCodeForError(pending);
     }
     return EXIT_RUNTIME;
+  };
+  const sleepWithCancellation = (delayMs: number): Promise<void> => {
+    if (controller.signal.aborted) return Promise.resolve();
+    return new Promise<void>((resolve, reject) => {
+      let settled = false;
+      let onAbort: () => void = () => {};
+      const cleanup = (): void => {
+        controller.signal.removeEventListener("abort", onAbort);
+      };
+      const finish = (): void => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve();
+      };
+      const fail = (error: unknown): void => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(error);
+      };
+      onAbort = (): void => finish();
+      controller.signal.addEventListener("abort", onAbort, { once: true });
+      try {
+        void sleep(delayMs).then(finish, fail);
+      } catch (error) {
+        fail(error);
+      }
+    });
   };
   try {
     for (;;) {
@@ -1119,10 +1179,12 @@ async function runWatchLoopWith(
         runtime.stdout(`${outcome.output}\n`);
         frames += 1;
         if (maxTicks !== null && frames >= maxTicks) return EXIT_OK;
-        await sleep(delay);
+        await sleepWithCancellation(delay);
       } else if (outcome.kind === "rateLimited") {
         pending = outcome.error;
-        await sleep(delay);
+        failedAttempts += 1;
+        if (failedAttempts >= WATCH_MAX_FAILED_ATTEMPTS) return settle();
+        await sleepWithCancellation(delay);
       } else if (outcome.kind === "denied") {
         runtime.stderr(`bitty-devtools: ${formatCliError(outcome.error)}\n`);
         return exitCodeForError(outcome.error);
@@ -1174,85 +1236,32 @@ async function dispatchLive(
   client: DevtoolsClient,
   options: InspectOptions,
   nowMs: number,
+  signal?: AbortSignal,
 ): Promise<string> {
   switch (options.selector) {
     case "plugins": {
-      const response = await client.requestLive(
-        {
-          id: 1,
-          method: "bitty.debug/listPlugins",
-          params: {
-            generation: options.generation,
-          },
-          version: "1.0",
-        },
+      const plugins = await client.listPluginsLive(
+        (options.generation ?? undefined) as Generation | undefined,
         nowMs,
+        signal,
       );
-      if (response.error !== undefined) {
-        throw new InspectionError(
-          response.error.code,
-          `${response.error.category}: ${response.error.message}`,
-        );
-      }
-      // The accepted result envelope is `{ "plugins": [...] }`
-      // (devtools-rfc v1); fail closed on a mistyped envelope.
-      const envelope = response.result as { plugins?: unknown };
-      if (!Array.isArray(envelope?.plugins)) {
-        throw new InspectionError(
-          "InvalidResult",
-          "listPlugins result.plugins: expected an array",
-        );
-      }
-      const plugins = envelope.plugins as Parameters<typeof renderPlugins>[0];
       return options.json ? toJson(plugins) : renderPlugins(plugins);
     }
     case "subscriptions": {
-      const plugin = requirePlugin(options);
-      const response = await client.requestLive(
-        {
-          id: 1,
-          method: "bitty.debug/listSubscriptions",
-          params: { pluginId: plugin },
-          version: "1.0",
-        },
+      const subs = await client.listSubscriptionsLive(
+        requirePlugin(options),
         nowMs,
+        signal,
       );
-      if (response.error !== undefined) {
-        throw new InspectionError(
-          response.error.code,
-          `${response.error.category}: ${response.error.message}`,
-        );
-      }
-      if (!Array.isArray(response.result)) {
-        throw new InspectionError(
-          "InvalidResult",
-          "listSubscriptions result: expected an array",
-        );
-      }
-      const subs = response.result as Parameters<typeof renderSubscriptions>[0];
       return options.json ? toJson(subs) : renderSubscriptions(subs);
     }
     case "budgets": {
-      const plugin = requirePlugin(options);
-      const response = await client.requestLive(
-        {
-          id: 1,
-          method: "bitty.debug/getBudgets",
-          params: {
-            pluginId: plugin,
-            generation: options.generation ?? DEFAULT_GENERATION,
-          },
-          version: "1.0",
-        },
+      const budget = await client.getBudgetsLive(
+        requirePlugin(options),
+        (options.generation ?? DEFAULT_GENERATION) as Generation,
         nowMs,
+        signal,
       );
-      if (response.error !== undefined) {
-        throw new InspectionError(
-          response.error.code,
-          `${response.error.category}: ${response.error.message}`,
-        );
-      }
-      const budget = response.result as Parameters<typeof renderBudgets>[0];
       return options.json ? toJson(budget) : renderBudgets(budget);
     }
     default:
@@ -1260,27 +1269,35 @@ async function dispatchLive(
   }
 }
 
+function safeErrorText(value: string): string {
+  return [...sanitizeDisplayText(value)].slice(0, 512).join("");
+}
+
 export function formatCliError(error: unknown): string {
-  if (error instanceof CliUsageError) return error.message;
-  if (error instanceof CliConfigError) return error.message;
+  if (error instanceof CliUsageError) return safeErrorText(error.message);
+  if (error instanceof CliConfigError) return safeErrorText(error.message);
   if (error instanceof InspectionError) {
-    return `${error.code}: ${error.message}`;
+    return safeErrorText(`${error.code}: ${error.message}`);
   }
   if (error instanceof TracingError) {
-    return `${error.code}: ${error.message}`;
+    return safeErrorText(`${error.code}: ${error.message}`);
   }
   if (error instanceof BoundError) {
-    return `${error.bound}: ${error.message}`;
+    return safeErrorText(`${error.bound}: ${error.message}`);
   }
-  if (error instanceof AuthError) return `${error.code}: ${error.message}`;
+  if (error instanceof AuthError) {
+    return safeErrorText(`${error.code}: ${error.message}`);
+  }
   if (error instanceof TransportError) {
-    return `${error.code}: ${error.message}`;
+    return safeErrorText(`${error.code}: ${error.message}`);
   }
   if (error instanceof ProtocolErrorImpl) {
-    return `${error.error.category}/${error.error.code}: ${error.error.message}`;
+    return safeErrorText(
+      `${error.error.category}/${error.error.code}: ${error.error.message}`,
+    );
   }
-  if (error instanceof Error) return error.message;
-  return String(error);
+  if (error instanceof Error) return safeErrorText(error.message);
+  return safeErrorText(String(error));
 }
 
 export function exitCodeForError(error: unknown): number {
@@ -1299,6 +1316,13 @@ export function exitCodeForError(error: unknown): number {
     return expectedExitForError("Denied", error.code);
   }
   if (error instanceof TransportError) {
+    if (
+      error.code === "InvalidFrame" ||
+      error.code === "FrameTooLarge" ||
+      error.code === "FrameTruncated"
+    ) {
+      return EXIT_GENERIC;
+    }
     return expectedExitForError("Unavailable", error.code);
   }
   if (error instanceof ProtocolErrorImpl) {
@@ -1510,7 +1534,6 @@ export async function runCliLive(
   deps: CliDeps,
 ): Promise<number> {
   const { runtime } = deps;
-  void connectLiveSocket;
 
   let command: CliCommand;
   try {
@@ -1530,36 +1553,16 @@ export async function runCliLive(
     command.kind === "trace-stop" ||
     command.kind === "trace-fetch"
   ) {
-    const traceOptions = command.options;
-    let traceSocketPath: string | null;
-    try {
-      traceSocketPath = resolveSocket(traceOptions, runtime);
-    } catch (error) {
-      runtime.stderr(`bitty-devtools: ${formatCliError(error)}\n`);
-      return exitCodeForError(error);
-    }
-    if (traceSocketPath === null) {
+    const injected = deps.transport ?? null;
+    if (injected === null) {
       runtime.stderr(
-        "bitty-devtools: no connected Bitty instance; pass --socket <path> or " +
-          "--instance <id>, or set BITTY_SOCKET / BITTY_INSTANCE_ID with " +
-          "XDG_RUNTIME_DIR\n",
+        "bitty-devtools: live socket sessions are inspect-only; trace verbs require the headless simulation transport\n",
       );
       return EXIT_RUNTIME;
     }
-    const injected = deps.transport ?? null;
     const traceClient = new DevtoolsClient();
     try {
-      if (injected !== null) {
-        traceClient.connectWithTransport(injected);
-      } else {
-        await traceClient.connectLiveSocket(
-          runtime.uid,
-          peerCredentials(runtime.uid, runtime.gid, runtime.pid),
-          runtime.env["XDG_RUNTIME_DIR"],
-          traceOptions.instance ?? undefined,
-          traceSocketPath,
-        );
-      }
+      traceClient.connectWithTransport(injected);
       traceClient.grantScope("debug.trace");
       let traceOutput: string;
       if (command.kind === "trace-start") {
@@ -1625,7 +1628,10 @@ export async function runCliLive(
       }
       return await runWatchLoopLive(client, options, runtime, deps.watch ?? {});
     }
-    const output = await dispatchLive(client, options, runtime.now());
+    const output =
+      injected === null
+        ? await dispatchLive(client, options, runtime.now(), deps.watch?.signal)
+        : dispatch(client, options);
     runtime.stdout(`${output}\n`);
     return EXIT_OK;
   } catch (error) {

@@ -4,11 +4,8 @@ commit-msg:
     commit-check:
       run: just commit-check {1}
 
+# The pre-commit hook intentionally runs the same full quality gate as CI.
 pre-commit:
   commands:
-    lint:
-      glob: "*.md"
-      run: just lint
-    fmt-check:
-      glob: "*.md"
-      run: just fmt-check
+    check:
+      run: just check

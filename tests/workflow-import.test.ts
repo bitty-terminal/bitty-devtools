@@ -67,6 +67,31 @@ type FixtureOptions = {
   dryRun?: boolean;
 };
 
+// Inner budget: the hard kill deadline applied to every fixture child process
+// (the python fixture builders, the read-only sqlite3 probes, and the
+// workflow-import.sh run under test). A fixture that outlives it is killed and
+// reported as a hung fixture rather than stalling the suite.
+const FIXTURE_SPAWN_TIMEOUT_MS = 10_000;
+
+// Outer budget: Bun's per-test deadline defaults to 5_000 ms, which is shorter
+// than a single inner budget. A correct-but-slow fixture run therefore trips
+// the outer deadline first and is misreported as a test timeout, so the outer
+// deadline is derived from the inner one instead of left at the default. The
+// heaviest test drives two sequential fixture runs (the fresh sidecar-free WAL
+// case), so the outer budget covers MAX_SEQUENTIAL_FIXTURE_RUNS inner budgets
+// plus fixture setup and assertion headroom. tests/workflow-import-budget
+// .test.ts fails if this relationship is ever crossed again.
+const MAX_SEQUENTIAL_FIXTURE_RUNS = 2;
+const FIXTURE_TEST_HEADROOM_MS = 5_000;
+const FIXTURE_TEST_TIMEOUT_MS =
+  MAX_SEQUENTIAL_FIXTURE_RUNS * FIXTURE_SPAWN_TIMEOUT_MS +
+  FIXTURE_TEST_HEADROOM_MS;
+
+// Every test in this file goes through this wrapper so no test can silently
+// inherit a deadline shorter than the budget it drives.
+const fixtureTest = (name: string, body: () => void) =>
+  test(name, body, FIXTURE_TEST_TIMEOUT_MS);
+
 const script = resolve(import.meta.dir, "../scripts/workflow-import.sh");
 const original = "[project]\nname = 'benign-fixture'\n";
 const currentSchemaObjects = "74|6E|74|";
@@ -94,7 +119,7 @@ const currentMigrations = [
 ];
 const currentMigrationSnapshot = currentMigrations
   .map((row) => {
-    const [version, name, checksum] = row.split("|");
+    const [version = "", name = "", checksum = ""] = row.split("|");
     return `${version}|${Buffer.from(name).toString("hex").toUpperCase()}|${checksum.toUpperCase()}`;
   })
   .join("\n");
@@ -221,7 +246,7 @@ os._exit(0)
       authoritySchemaBase64,
       JSON.stringify(currentMigrations),
     ],
-    { timeout: 10_000 },
+    { timeout: FIXTURE_SPAWN_TIMEOUT_MS },
   );
   if (result.exitCode !== 0) {
     throw new Error(
@@ -290,7 +315,7 @@ connection.commit()
 os._exit(0)
 `;
   const result = Bun.spawnSync([python, "-c", program, path, modes], {
-    timeout: 10_000,
+    timeout: FIXTURE_SPAWN_TIMEOUT_MS,
   });
   if (result.exitCode !== 0) {
     throw new Error(
@@ -811,7 +836,7 @@ process.exit(result.exitCode);`,
           fixtureDatabase,
           "SELECT updated_at FROM projects;",
         ],
-        { timeout: 10_000 },
+        { timeout: FIXTURE_SPAWN_TIMEOUT_MS },
       );
       if (beforeProject.exitCode !== 0) {
         throw new Error(beforeProject.stderr.toString());
@@ -882,7 +907,7 @@ process.exit(result.exitCode);`,
         FIXTURE_VERSION_OUTPUT:
           options.versionOutput ?? realVersionEnvelope(schemaVersion),
       },
-      timeout: 10_000,
+      timeout: FIXTURE_SPAWN_TIMEOUT_MS,
     });
     const backups = readdirSync(temp)
       .map((entry) => join(temp, entry, "config.toml.before"))
@@ -910,7 +935,7 @@ process.exit(result.exitCode);`,
           authorityDatabase,
           "SELECT COUNT(*), COALESCE(SUM(CASE WHEN name LIKE '%fts%' THEN 1 ELSE 0 END), 0) FROM sqlite_master;",
         ],
-        { timeout: 10_000 },
+        { timeout: FIXTURE_SPAWN_TIMEOUT_MS },
       );
       if (inventory.exitCode !== 0) {
         throw new Error(inventory.stderr.toString());
@@ -937,7 +962,7 @@ process.exit(result.exitCode);`,
           currentDatabase,
           "SELECT updated_at FROM projects;",
         ],
-        { timeout: 10_000 },
+        { timeout: FIXTURE_SPAWN_TIMEOUT_MS },
       );
       if (afterProject.exitCode !== 0) {
         throw new Error(afterProject.stderr.toString());
@@ -964,7 +989,7 @@ process.exit(result.exitCode);`,
           path,
           "SELECT name FROM projects;",
         ],
-        { timeout: 10_000 },
+        { timeout: FIXTURE_SPAWN_TIMEOUT_MS },
       );
       return query.exitCode === 0 ? query.stdout.toString().trim() : undefined;
     };
@@ -1046,7 +1071,7 @@ function expectUnknown(result: ReturnType<typeof runFixture>) {
 
 describe("workflow import config preservation with fake commands", () => {
   for (const stage of ["init", "import", "stats", "success"]) {
-    test(`restores configuration after ${stage}`, () => {
+    fixtureTest(`restores configuration after ${stage}`, () => {
       const result = runFixture(stage, "overwrite");
       expect(result.exitCode).toBe(stage === "success" ? 0 : 1);
       expect(result.config).toBe(original);
@@ -1056,52 +1081,71 @@ describe("workflow import config preservation with fake commands", () => {
 
   for (const change of ["delete", "directory"]) {
     for (const stage of ["import", "success"]) {
-      test(`restores missing config after ${change} and ${stage}`, () => {
-        const result = runFixture(stage, change);
-        expect(result.exitCode).toBe(stage === "success" ? 0 : 1);
-        expect(result.config).toBe(original);
-        expect(result.backups).toEqual([]);
-      });
+      fixtureTest(
+        `restores missing config after ${change} and ${stage}`,
+        () => {
+          const result = runFixture(stage, change);
+          expect(result.exitCode).toBe(stage === "success" ? 0 : 1);
+          expect(result.config).toBe(original);
+          expect(result.backups).toEqual([]);
+        },
+      );
     }
   }
 
   for (const stage of ["import", "success"]) {
-    test(`retains recovery backup when restoration fails after ${stage}`, () => {
-      const result = runFixture(stage, "overwrite", true);
-      expect(result.exitCode).toBe(1);
-      expect(result.backups).toHaveLength(1);
-      expect(result.backups[0]?.content).toBe(original);
-      expect(result.stderr).toContain(result.backups[0]!.path);
-    });
+    fixtureTest(
+      `retains recovery backup when restoration fails after ${stage}`,
+      () => {
+        const result = runFixture(stage, "overwrite", true);
+        expect(result.exitCode).toBe(1);
+        expect(result.backups).toHaveLength(1);
+        expect(result.backups[0]?.content).toBe(original);
+        expect(result.stderr).toContain(result.backups[0]!.path);
+      },
+    );
   }
 });
 
 describe("workflow import local state classification with fake adapters", () => {
-  test("accepts the real version envelope shape and classifies an absent database", () => {
-    const result = runFixture("success", "none", false, { database: "absent" });
-    expect(result.exitCode).toBe(0);
-    expect(result.stdout).toContain("state=absent");
-    expect(result.commands).toMatch(/carryctx init\b/);
-    expect(result.commands).toMatch(/carryctx import\b/);
-  });
+  fixtureTest(
+    "accepts the real version envelope shape and classifies an absent database",
+    () => {
+      const result = runFixture("success", "none", false, {
+        database: "absent",
+      });
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain("state=absent");
+      expect(result.commands).toMatch(/carryctx init\b/);
+      expect(result.commands).toMatch(/carryctx import\b/);
+    },
+  );
 
-  test("classifies a current-schema empty database and initializes before import", () => {
-    const result = runFixture("success", "none", false, { database: "empty" });
-    expect(result.exitCode).toBe(0);
-    expect(result.stdout).toContain("state=empty");
-    expect(result.commands).toMatch(/carryctx init\b/);
-    expect(result.commands).toMatch(/carryctx import\b/);
-  });
+  fixtureTest(
+    "classifies a current-schema empty database and initializes before import",
+    () => {
+      const result = runFixture("success", "none", false, {
+        database: "empty",
+      });
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain("state=empty");
+      expect(result.commands).toMatch(/carryctx init\b/);
+      expect(result.commands).toMatch(/carryctx import\b/);
+    },
+  );
 
-  test("treats a project row as non-empty even without data rows", () => {
-    const result = runFixture("success", "none", false, {
-      database: "non-empty",
-      projectRows: 1,
-    });
-    expect(result.exitCode).toBe(1);
-    expect(result.stderr).toContain("non-empty");
-    expectNoImport(result);
-  });
+  fixtureTest(
+    "treats a project row as non-empty even without data rows",
+    () => {
+      const result = runFixture("success", "none", false, {
+        database: "non-empty",
+        projectRows: 1,
+      });
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toContain("non-empty");
+      expectNoImport(result);
+    },
+  );
 
   for (const table of [
     "operations",
@@ -1110,7 +1154,7 @@ describe("workflow import local state classification with fake adapters", () => 
     "tombstones",
     "snapshot_state",
   ]) {
-    test(`blocks rows found only in ${table}`, () => {
+    fixtureTest(`blocks rows found only in ${table}`, () => {
       const result = runFixture("success", "none", false, {
         database: "non-empty",
         rowTable: table,
@@ -1121,7 +1165,7 @@ describe("workflow import local state classification with fake adapters", () => 
     });
   }
 
-  test("blocks rows in actual disposable FTS shadow tables", () => {
+  fixtureTest("blocks rows in actual disposable FTS shadow tables", () => {
     const result = runFixture("success", "none", false, { realFts: true });
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain("non-empty");
@@ -1131,7 +1175,7 @@ describe("workflow import local state classification with fake adapters", () => 
     expectNoImport(result);
   });
 
-  test("rejects schema drift in a real 0.11.6 database", () => {
+  fixtureTest("rejects schema drift in a real 0.11.6 database", () => {
     const result = runFixture("success", "none", false, {
       realSchemaDrift: true,
     });
@@ -1140,7 +1184,7 @@ describe("workflow import local state classification with fake adapters", () => 
     expectNoImport(result);
   });
 
-  test("rejects migration drift in a real 0.11.6 database", () => {
+  fixtureTest("rejects migration drift in a real 0.11.6 database", () => {
     const result = runFixture("success", "none", false, {
       realMigrationDrift: true,
     });
@@ -1149,20 +1193,23 @@ describe("workflow import local state classification with fake adapters", () => 
     expectNoImport(result);
   });
 
-  test("force-imports a real pending WAL database with valid sidecars", () => {
-    const result = runFixture("success", "none", false, {
-      realWal: true,
-      force: true,
-    });
-    expect(result.exitCode).toBe(0);
-    expect(result.stdout).toContain("state=non-empty");
-    expect(result.walPendingBytes).toBeGreaterThan(0);
-    expect(result.shmPendingBytes).toBeGreaterThan(0);
-    expect(result.projectStatePreserved).toBe(true);
-    expect(result.commands).toMatch(/carryctx import\b/);
-  });
+  fixtureTest(
+    "force-imports a real pending WAL database with valid sidecars",
+    () => {
+      const result = runFixture("success", "none", false, {
+        realWal: true,
+        force: true,
+      });
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain("state=non-empty");
+      expect(result.walPendingBytes).toBeGreaterThan(0);
+      expect(result.shmPendingBytes).toBeGreaterThan(0);
+      expect(result.projectStatePreserved).toBe(true);
+      expect(result.commands).toMatch(/carryctx import\b/);
+    },
+  );
 
-  test("force-imports a real pending WAL database without SHM", () => {
+  fixtureTest("force-imports a real pending WAL database without SHM", () => {
     const result = runFixture("success", "none", false, {
       walWithoutShm: true,
       force: true,
@@ -1173,31 +1220,37 @@ describe("workflow import local state classification with fake adapters", () => 
     expect(result.projectStatePreserved).toBe(true);
   });
 
-  test("accepts fresh sidecar-free WAL mode for dry-run and force import", () => {
-    const dryRun = runFixture("success", "none", false, {
-      freshWal: true,
-      dryRun: true,
-      versionMutatesTarget: true,
-    });
-    expect(dryRun.exitCode).toBe(0);
-    expect(dryRun.databaseStable).toBe(true);
+  fixtureTest(
+    "accepts fresh sidecar-free WAL mode for dry-run and force import",
+    () => {
+      const dryRun = runFixture("success", "none", false, {
+        freshWal: true,
+        dryRun: true,
+        versionMutatesTarget: true,
+      });
+      expect(dryRun.exitCode).toBe(0);
+      expect(dryRun.databaseStable).toBe(true);
 
-    const force = runFixture("success", "none", false, {
-      freshWal: true,
-      force: true,
-    });
-    expect(force.exitCode).toBe(0);
-    expect(force.stdout).toContain("state=non-empty");
-  });
+      const force = runFixture("success", "none", false, {
+        freshWal: true,
+        force: true,
+      });
+      expect(force.exitCode).toBe(0);
+      expect(force.stdout).toContain("state=non-empty");
+    },
+  );
 
-  test("blocks a real disposable table name containing a newline", () => {
-    const result = runFixture("success", "none", false, {
-      realNewlineTable: true,
-    });
-    expectUnknown(result);
-  });
+  fixtureTest(
+    "blocks a real disposable table name containing a newline",
+    () => {
+      const result = runFixture("success", "none", false, {
+        realNewlineTable: true,
+      });
+      expectUnknown(result);
+    },
+  );
 
-  test("allows --force for a valid non-empty database", () => {
+  fixtureTest("allows --force for a valid non-empty database", () => {
     const result = runFixture("success", "none", false, {
       database: "non-empty",
       rowTable: "tombstones",
@@ -1209,23 +1262,26 @@ describe("workflow import local state classification with fake adapters", () => 
     expect(result.commands).not.toMatch(/carryctx init\b/);
   });
 
-  test("allows a dry-run for a valid non-empty database without init", () => {
-    const result = runFixture("success", "none", false, {
-      database: "non-empty",
-      rowTable: "tombstones",
-      dryRun: true,
-    });
-    expect(result.exitCode).toBe(0);
-    expect(result.stdout).toContain("dry-run PASS");
-    expect(result.commands).toMatch(/carryctx-dry-run import\b/);
-    expect(result.commands).not.toMatch(/carryctx init\b/);
-  });
+  fixtureTest(
+    "allows a dry-run for a valid non-empty database without init",
+    () => {
+      const result = runFixture("success", "none", false, {
+        database: "non-empty",
+        rowTable: "tombstones",
+        dryRun: true,
+      });
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain("dry-run PASS");
+      expect(result.commands).toMatch(/carryctx-dry-run import\b/);
+      expect(result.commands).not.toMatch(/carryctx init\b/);
+    },
+  );
 
   for (const [name, options] of [
     ["WAL and SHM", { realWal: true }],
     ["WAL without SHM", { walWithoutShm: true }],
   ] as const) {
-    test(`keeps real ${name} state unchanged during dry-run`, () => {
+    fixtureTest(`keeps real ${name} state unchanged during dry-run`, () => {
       const result = runFixture("success", "none", false, {
         ...options,
         dryRun: true,
@@ -1353,7 +1409,7 @@ describe("workflow import local state classification with fake adapters", () => 
   ];
 
   for (const [name, options] of unknownScenarios) {
-    test(`blocks ${name} before fetch, init, or import`, () => {
+    fixtureTest(`blocks ${name} before fetch, init, or import`, () => {
       const result = runFixture("success", "none", false, options);
       if (name === "symlinked database" || name === "symlinked WAL sidecar") {
         expect(result.exitCode).toBe(1);
@@ -1366,7 +1422,7 @@ describe("workflow import local state classification with fake adapters", () => 
     });
   }
 
-  test("enforces the portable command timeout", () => {
+  fixtureTest("enforces the portable command timeout", () => {
     const result = runFixture("success", "none", false, {
       database: "non-empty",
       sqliteMode: "hang",
@@ -1375,7 +1431,7 @@ describe("workflow import local state classification with fake adapters", () => 
     expectUnknown(result);
   });
 
-  test("blocks an existing CarryCtx admission lock", () => {
+  fixtureTest("blocks an existing CarryCtx admission lock", () => {
     const result = runFixture("success", "none", false, {
       database: "non-empty",
       rowTable: "tombstones",
@@ -1387,7 +1443,7 @@ describe("workflow import local state classification with fake adapters", () => 
     expectNoImport(result);
   });
 
-  test("blocks a database mutation during fetch", () => {
+  fixtureTest("blocks a database mutation during fetch", () => {
     const result = runFixture("success", "none", false, {
       database: "non-empty",
       rowTable: "tombstones",
@@ -1399,20 +1455,23 @@ describe("workflow import local state classification with fake adapters", () => 
     expectNoImport(result, true);
   });
 
-  test("preserves a writer that commits during import and aborts", () => {
-    const result = runFixture("success", "none", false, {
-      database: "non-empty",
-      rowTable: "tombstones",
-      force: true,
-      race: "import",
-    });
-    expect(result.exitCode).toBe(1);
-    expect(result.stderr).toContain("state changed while staging import");
-    expect(result.commands).not.toMatch(/carryctx project restore\b/);
-    expect(result.databaseContent).toBe("fixtureimport-race");
-  });
+  fixtureTest(
+    "preserves a writer that commits during import and aborts",
+    () => {
+      const result = runFixture("success", "none", false, {
+        database: "non-empty",
+        rowTable: "tombstones",
+        force: true,
+        race: "import",
+      });
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toContain("state changed while staging import");
+      expect(result.commands).not.toMatch(/carryctx project restore\b/);
+      expect(result.databaseContent).toBe("fixtureimport-race");
+    },
+  );
 
-  test("does not restore over a writer when recovery would fail", () => {
+  fixtureTest("does not restore over a writer when recovery would fail", () => {
     const result = runFixture("success", "none", true, {
       database: "non-empty",
       rowTable: "tombstones",
@@ -1424,78 +1483,93 @@ describe("workflow import local state classification with fake adapters", () => 
     expect(result.commands).not.toMatch(/carryctx project restore\b/);
   });
 
-  test("fails closed when import replaces the database path with a symlink", () => {
-    const result = runFixture("success", "none", false, {
-      database: "non-empty",
-      rowTable: "tombstones",
-      force: true,
-      race: "import-path",
-    });
-    expect(result.exitCode).toBe(1);
-    expect(result.stderr).toContain(
-      "project paths changed while staging import",
-    );
-    expect(result.commands).not.toMatch(/carryctx project restore\b/);
-  });
+  fixtureTest(
+    "fails closed when import replaces the database path with a symlink",
+    () => {
+      const result = runFixture("success", "none", false, {
+        database: "non-empty",
+        rowTable: "tombstones",
+        force: true,
+        race: "import-path",
+      });
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toContain(
+        "project paths changed while staging import",
+      );
+      expect(result.commands).not.toMatch(/carryctx project restore\b/);
+    },
+  );
 
-  test("fails closed when import replaces the CarryCtx directory", () => {
-    const result = runFixture("success", "none", false, {
-      database: "non-empty",
-      rowTable: "tombstones",
-      force: true,
-      race: "carryctx-dir",
-    });
-    expect(result.exitCode).toBe(1);
-    expect(result.stderr).toContain(
-      "project paths changed while staging import",
-    );
-    expect(result.commands).not.toMatch(/carryctx project restore\b/);
-  });
+  fixtureTest(
+    "fails closed when import replaces the CarryCtx directory",
+    () => {
+      const result = runFixture("success", "none", false, {
+        database: "non-empty",
+        rowTable: "tombstones",
+        force: true,
+        race: "carryctx-dir",
+      });
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toContain(
+        "project paths changed while staging import",
+      );
+      expect(result.commands).not.toMatch(/carryctx project restore\b/);
+    },
+  );
 
-  test("fails closed on a byte-identical database inode replacement at import", () => {
-    const result = runFixture("success", "none", false, {
-      realWal: true,
-      force: true,
-      race: "import-inode",
-    });
-    expect(result.exitCode).toBe(1);
-    expect(result.stderr).toContain(
-      "project paths changed while staging import",
-    );
-    expect(result.databaseStable).toBe(true);
-    expect(result.databaseIdentityStable).toBe(false);
-    expect(result.commands).not.toMatch(/carryctx project restore\b/);
-  });
+  fixtureTest(
+    "fails closed on a byte-identical database inode replacement at import",
+    () => {
+      const result = runFixture("success", "none", false, {
+        realWal: true,
+        force: true,
+        race: "import-inode",
+      });
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toContain(
+        "project paths changed while staging import",
+      );
+      expect(result.databaseStable).toBe(true);
+      expect(result.databaseIdentityStable).toBe(false);
+      expect(result.commands).not.toMatch(/carryctx project restore\b/);
+    },
+  );
 
-  test("fails closed when WAL is injected into the hidden guard at handoff", () => {
-    const result = runFixture("success", "none", false, {
-      realWal: true,
-      force: true,
-      race: "guard-wal",
-    });
-    expect(result.exitCode).toBe(1);
-    expect(result.stderr).toContain(
-      "post-handoff committed-state validation failed",
-    );
-    expect(result.activeProjectName).not.toContain("handoff-injected");
-    expect(result.guardProjectName).toContain("handoff-injected");
-  });
+  fixtureTest(
+    "fails closed when WAL is injected into the hidden guard at handoff",
+    () => {
+      const result = runFixture("success", "none", false, {
+        realWal: true,
+        force: true,
+        race: "guard-wal",
+      });
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toContain(
+        "post-handoff committed-state validation failed",
+      );
+      expect(result.activeProjectName).not.toContain("handoff-injected");
+      expect(result.guardProjectName).toContain("handoff-injected");
+    },
+  );
 
-  test("fails closed when WAL is injected after the prior handoff validation", () => {
-    const result = runFixture("success", "none", false, {
-      realWal: true,
-      force: true,
-      race: "guard-after-validation",
-    });
-    expect(result.exitCode).toBe(1);
-    expect(result.stderr).toContain(
-      "post-handoff committed-state validation failed",
-    );
-    expect(result.activeProjectName).not.toContain("held-final");
-    expect(result.guardProjectName).toContain("held-final");
-  });
+  fixtureTest(
+    "fails closed when WAL is injected after the prior handoff validation",
+    () => {
+      const result = runFixture("success", "none", false, {
+        realWal: true,
+        force: true,
+        race: "guard-after-validation",
+      });
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toContain(
+        "post-handoff committed-state validation failed",
+      );
+      expect(result.activeProjectName).not.toContain("held-final");
+      expect(result.guardProjectName).toContain("held-final");
+    },
+  );
 
-  test("blocks an SHM inode replacement during fetch", () => {
+  fixtureTest("blocks an SHM inode replacement during fetch", () => {
     const result = runFixture("success", "none", false, {
       realWal: true,
       force: true,
@@ -1507,7 +1581,7 @@ describe("workflow import local state classification with fake adapters", () => 
     expectNoImport(result, true);
   });
 
-  test("blocks a configuration path replacement during fetch", () => {
+  fixtureTest("blocks a configuration path replacement during fetch", () => {
     const result = runFixture("success", "none", false, {
       race: "config",
     });
@@ -1516,7 +1590,7 @@ describe("workflow import local state classification with fake adapters", () => 
     expectNoImport(result, true);
   });
 
-  test("uses job-control groups when setsid is unavailable", () => {
+  fixtureTest("uses job-control groups when setsid is unavailable", () => {
     const result = runFixture("success", "none", false, {
       database: "non-empty",
       rowTable: "tombstones",
@@ -1527,7 +1601,7 @@ describe("workflow import local state classification with fake adapters", () => 
     expect(result.commands).toMatch(/carryctx import\b/);
   });
 
-  test("terminates descendants when a probe command times out", () => {
+  fixtureTest("terminates descendants when a probe command times out", () => {
     const result = runFixture("success", "none", false, {
       database: "non-empty",
       sqliteMode: "hang-descendant",
@@ -1542,7 +1616,7 @@ describe("workflow import local state classification with fake adapters", () => 
     ).toEqual([]);
   });
 
-  test("does not allow --force to bypass unknown state", () => {
+  fixtureTest("does not allow --force to bypass unknown state", () => {
     const result = runFixture("success", "none", false, {
       database: "non-empty",
       sqliteMode: "corrupt",
@@ -1561,7 +1635,7 @@ describe("workflow import path safety", () => {
   ];
 
   for (const [name, options] of pathScenarios) {
-    test(`rejects ${name} before init, restore, or import`, () => {
+    fixtureTest(`rejects ${name} before init, restore, or import`, () => {
       const result = runFixture("success", "none", false, options);
       expect(result.exitCode).toBe(1);
       expect(result.config).toBe(original);
@@ -1600,7 +1674,587 @@ describe("workflow import strict version envelope parsing", () => {
   ];
 
   for (const [name, versionOutput] of malformed) {
-    test(`rejects ${name} before sqlite or import`, () => {
+    fixtureTest(`rejects ${name} before sqlite or import`, () => {
+      const result = runFixture("success", "none", false, {
+        database: "non-empty",
+        versionOutput,
+      });
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toContain("unknown");
+      expect(result.commands).not.toMatch(/sqlite3 /);
+      expectNoImport(result);
+    });
+  }
+});
+
+describe("workflow import local state classification with fake adapters", () => {
+  fixtureTest(
+    "accepts the real version envelope shape and classifies an absent database",
+    () => {
+      const result = runFixture("success", "none", false, {
+        database: "absent",
+      });
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain("state=absent");
+      expect(result.commands).toMatch(/carryctx init\b/);
+      expect(result.commands).toMatch(/carryctx import\b/);
+    },
+  );
+
+  fixtureTest(
+    "classifies a current-schema empty database and initializes before import",
+    () => {
+      const result = runFixture("success", "none", false, {
+        database: "empty",
+      });
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain("state=empty");
+      expect(result.commands).toMatch(/carryctx init\b/);
+      expect(result.commands).toMatch(/carryctx import\b/);
+    },
+  );
+
+  fixtureTest(
+    "treats a project row as non-empty even without data rows",
+    () => {
+      const result = runFixture("success", "none", false, {
+        database: "non-empty",
+        projectRows: 1,
+      });
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toContain("non-empty");
+      expectNoImport(result);
+    },
+  );
+
+  for (const table of [
+    "operations",
+    "sequences",
+    "worktree_cleanup_requests",
+    "tombstones",
+    "snapshot_state",
+  ]) {
+    fixtureTest(`blocks rows found only in ${table}`, () => {
+      const result = runFixture("success", "none", false, {
+        database: "non-empty",
+        rowTable: table,
+      });
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toContain("non-empty");
+      expectNoImport(result);
+    });
+  }
+
+  fixtureTest("blocks rows in actual disposable FTS shadow tables", () => {
+    const result = runFixture("success", "none", false, { realFts: true });
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("non-empty");
+    expect(result.authoritySchemaObjectCount).toBe(129);
+    expect(result.authorityFtsRelatedCount).toBe(36);
+    expect(result.config).toBe(original);
+    expectNoImport(result);
+  });
+
+  fixtureTest("rejects schema drift in a real 0.11.6 database", () => {
+    const result = runFixture("success", "none", false, {
+      realSchemaDrift: true,
+    });
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("unknown");
+    expectNoImport(result);
+  });
+
+  fixtureTest("rejects migration drift in a real 0.11.6 database", () => {
+    const result = runFixture("success", "none", false, {
+      realMigrationDrift: true,
+    });
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("unknown");
+    expectNoImport(result);
+  });
+
+  fixtureTest(
+    "force-imports a real pending WAL database with valid sidecars",
+    () => {
+      const result = runFixture("success", "none", false, {
+        realWal: true,
+        force: true,
+      });
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain("state=non-empty");
+      expect(result.walPendingBytes).toBeGreaterThan(0);
+      expect(result.shmPendingBytes).toBeGreaterThan(0);
+      expect(result.projectStatePreserved).toBe(true);
+      expect(result.commands).toMatch(/carryctx import\b/);
+    },
+  );
+
+  fixtureTest("force-imports a real pending WAL database without SHM", () => {
+    const result = runFixture("success", "none", false, {
+      walWithoutShm: true,
+      force: true,
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("state=non-empty");
+    expect(result.walPendingBytes).toBeGreaterThan(0);
+    expect(result.projectStatePreserved).toBe(true);
+  });
+
+  fixtureTest(
+    "accepts fresh sidecar-free WAL mode for dry-run and force import",
+    () => {
+      const dryRun = runFixture("success", "none", false, {
+        freshWal: true,
+        dryRun: true,
+        versionMutatesTarget: true,
+      });
+      expect(dryRun.exitCode).toBe(0);
+      expect(dryRun.databaseStable).toBe(true);
+
+      const force = runFixture("success", "none", false, {
+        freshWal: true,
+        force: true,
+      });
+      expect(force.exitCode).toBe(0);
+      expect(force.stdout).toContain("state=non-empty");
+    },
+  );
+
+  fixtureTest(
+    "blocks a real disposable table name containing a newline",
+    () => {
+      const result = runFixture("success", "none", false, {
+        realNewlineTable: true,
+      });
+      expectUnknown(result);
+    },
+  );
+
+  fixtureTest("allows --force for a valid non-empty database", () => {
+    const result = runFixture("success", "none", false, {
+      database: "non-empty",
+      rowTable: "tombstones",
+      force: true,
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toContain("--force");
+    expect(result.commands).toMatch(/carryctx import\b/);
+    expect(result.commands).not.toMatch(/carryctx init\b/);
+  });
+
+  fixtureTest(
+    "allows a dry-run for a valid non-empty database without init",
+    () => {
+      const result = runFixture("success", "none", false, {
+        database: "non-empty",
+        rowTable: "tombstones",
+        dryRun: true,
+      });
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain("dry-run PASS");
+      expect(result.commands).toMatch(/carryctx-dry-run import\b/);
+      expect(result.commands).not.toMatch(/carryctx init\b/);
+    },
+  );
+
+  for (const [name, options] of [
+    ["WAL and SHM", { realWal: true }],
+    ["WAL without SHM", { walWithoutShm: true }],
+  ] as const) {
+    fixtureTest(`keeps real ${name} state unchanged during dry-run`, () => {
+      const result = runFixture("success", "none", false, {
+        ...options,
+        dryRun: true,
+        versionMutatesTarget: true,
+      });
+      expect(result.exitCode).toBe(0);
+      expect(result.databaseStable).toBe(true);
+      expect(result.walPendingBytes).toBeGreaterThan(0);
+      expect(result.walSidecarsStable).toBe(true);
+      if (name === "WAL and SHM") {
+        expect(result.shmPendingBytes).toBeGreaterThan(0);
+      }
+      expect(result.commands).toMatch(
+        /carryctx version --json --project .*version-contract/,
+      );
+      expect(result.commands).not.toMatch(/carryctx version --json\n/);
+    });
+  }
+
+  const unknownScenarios: Array<[string, FixtureOptions]> = [
+    ["unreadable", { database: "non-empty", sqliteMode: "unreadable" }],
+    ["locked", { database: "non-empty", sqliteMode: "locked" }],
+    ["timed out", { database: "non-empty", sqliteMode: "timeout" }],
+    ["corrupt", { database: "non-empty", sqliteMode: "corrupt" }],
+    [
+      "newer",
+      {
+        database: "non-empty",
+        migrationCount: 19,
+        migrationMax: 19,
+        migrationDistinct: 19,
+      },
+    ],
+    [
+      "partial migration history",
+      {
+        database: "non-empty",
+        migrationCount: 17,
+        migrationMax: 17,
+        migrationDistinct: 17,
+      },
+    ],
+    [
+      "malformed schema output",
+      { database: "non-empty", sqliteMode: "malformed" },
+    ],
+    [
+      "migration identity drift",
+      { database: "non-empty", sqliteMode: "migration-drift" },
+    ],
+    [
+      "schema object drift",
+      { database: "non-empty", sqliteMode: "schema-drift" },
+    ],
+    [
+      "oversized schema object",
+      { database: "non-empty", sqliteMode: "schema-line-overflow" },
+    ],
+    [
+      "foreign-key violation",
+      { database: "non-empty", sqliteMode: "foreign-key" },
+    ],
+    [
+      "table inventory failure",
+      { database: "non-empty", sqliteMode: "table-list-error" },
+    ],
+    [
+      "missing project table",
+      { database: "non-empty", sqliteMode: "missing-projects" },
+    ],
+    [
+      "missing migration table",
+      { database: "non-empty", sqliteMode: "missing-schema-migrations" },
+    ],
+    ["row count failure", { database: "non-empty", sqliteMode: "count-error" }],
+    [
+      "authority schema failure",
+      { database: "non-empty", authorityFailure: true },
+    ],
+    ["malformed project row", { database: "non-empty", projectInvalid: 1 }],
+    [
+      "missing sqlite adapter",
+      { database: "non-empty", sqliteAvailable: false },
+    ],
+    ["non-file database path", { database: "directory" }],
+    [
+      "unavailable schema contract",
+      { database: "non-empty", versionFails: true },
+    ],
+    [
+      "unavailable schema contract for absent database",
+      { database: "absent", versionFails: true },
+    ],
+    ["orphan WAL sidecar", { database: "absent", orphanSidecar: true }],
+    [
+      "newline-containing table name",
+      { database: "non-empty", sqliteMode: "newline-table" },
+    ],
+    [
+      "overlong table name",
+      { database: "non-empty", sqliteMode: "long-table-name" },
+    ],
+    [
+      "too many tables",
+      { database: "non-empty", sqliteMode: "too-many-tables" },
+    ],
+    [
+      "duplicate table inventory entry",
+      { database: "non-empty", sqliteMode: "duplicate-table" },
+    ],
+    [
+      "invalid WAL sidecar",
+      { database: "non-empty", sidecars: "wal", sqliteMode: "wal-invalid" },
+    ],
+    [
+      "invalid SHM sidecar",
+      { database: "non-empty", sidecars: "shm", sqliteMode: "wal-invalid" },
+    ],
+    [
+      "invalid WAL and SHM sidecars",
+      { database: "non-empty", sidecars: "both", sqliteMode: "wal-invalid" },
+    ],
+    ["symlinked database", { database: "non-empty", databaseSymlink: true }],
+    ["symlinked WAL sidecar", { database: "non-empty", sidecarSymlink: true }],
+  ];
+
+  for (const [name, options] of unknownScenarios) {
+    fixtureTest(`blocks ${name} before fetch, init, or import`, () => {
+      const result = runFixture("success", "none", false, options);
+      if (name === "symlinked database" || name === "symlinked WAL sidecar") {
+        expect(result.exitCode).toBe(1);
+        expect(result.stderr).toContain("symlink");
+        expect(result.config).toBe(original);
+        expectNoImport(result);
+      } else {
+        expectUnknown(result);
+      }
+    });
+  }
+
+  fixtureTest("enforces the portable command timeout", () => {
+    const result = runFixture("success", "none", false, {
+      database: "non-empty",
+      sqliteMode: "hang",
+      gitTimeout: 1,
+    });
+    expectUnknown(result);
+  });
+
+  fixtureTest("blocks an existing CarryCtx admission lock", () => {
+    const result = runFixture("success", "none", false, {
+      database: "non-empty",
+      rowTable: "tombstones",
+      force: true,
+      commandLock: true,
+    });
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("already in progress");
+    expectNoImport(result);
+  });
+
+  fixtureTest("blocks a database mutation during fetch", () => {
+    const result = runFixture("success", "none", false, {
+      database: "non-empty",
+      rowTable: "tombstones",
+      force: true,
+      race: "database",
+    });
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("changed during fetch");
+    expectNoImport(result, true);
+  });
+
+  fixtureTest(
+    "preserves a writer that commits during import and aborts",
+    () => {
+      const result = runFixture("success", "none", false, {
+        database: "non-empty",
+        rowTable: "tombstones",
+        force: true,
+        race: "import",
+      });
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toContain("state changed while staging import");
+      expect(result.commands).not.toMatch(/carryctx project restore\b/);
+      expect(result.databaseContent).toBe("fixtureimport-race");
+    },
+  );
+
+  fixtureTest("does not restore over a writer when recovery would fail", () => {
+    const result = runFixture("success", "none", true, {
+      database: "non-empty",
+      rowTable: "tombstones",
+      force: true,
+      race: "import",
+    });
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("state changed while staging import");
+    expect(result.commands).not.toMatch(/carryctx project restore\b/);
+  });
+
+  fixtureTest(
+    "fails closed when import replaces the database path with a symlink",
+    () => {
+      const result = runFixture("success", "none", false, {
+        database: "non-empty",
+        rowTable: "tombstones",
+        force: true,
+        race: "import-path",
+      });
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toContain(
+        "project paths changed while staging import",
+      );
+      expect(result.commands).not.toMatch(/carryctx project restore\b/);
+    },
+  );
+
+  fixtureTest(
+    "fails closed when import replaces the CarryCtx directory",
+    () => {
+      const result = runFixture("success", "none", false, {
+        database: "non-empty",
+        rowTable: "tombstones",
+        force: true,
+        race: "carryctx-dir",
+      });
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toContain(
+        "project paths changed while staging import",
+      );
+      expect(result.commands).not.toMatch(/carryctx project restore\b/);
+    },
+  );
+
+  fixtureTest(
+    "fails closed on a byte-identical database inode replacement at import",
+    () => {
+      const result = runFixture("success", "none", false, {
+        realWal: true,
+        force: true,
+        race: "import-inode",
+      });
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toContain(
+        "project paths changed while staging import",
+      );
+      expect(result.databaseStable).toBe(true);
+      expect(result.databaseIdentityStable).toBe(false);
+      expect(result.commands).not.toMatch(/carryctx project restore\b/);
+    },
+  );
+
+  fixtureTest(
+    "fails closed when WAL is injected into the hidden guard at handoff",
+    () => {
+      const result = runFixture("success", "none", false, {
+        realWal: true,
+        force: true,
+        race: "guard-wal",
+      });
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toContain(
+        "post-handoff committed-state validation failed",
+      );
+      expect(result.activeProjectName).not.toContain("handoff-injected");
+      expect(result.guardProjectName).toContain("handoff-injected");
+    },
+  );
+
+  fixtureTest(
+    "fails closed when WAL is injected after the prior handoff validation",
+    () => {
+      const result = runFixture("success", "none", false, {
+        realWal: true,
+        force: true,
+        race: "guard-after-validation",
+      });
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toContain(
+        "post-handoff committed-state validation failed",
+      );
+      expect(result.activeProjectName).not.toContain("held-final");
+      expect(result.guardProjectName).toContain("held-final");
+    },
+  );
+
+  fixtureTest("blocks an SHM inode replacement during fetch", () => {
+    const result = runFixture("success", "none", false, {
+      realWal: true,
+      force: true,
+      race: "fetch-shm-inode",
+    });
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("changed during fetch");
+    expect(result.shmIdentityStable).toBe(false);
+    expectNoImport(result, true);
+  });
+
+  fixtureTest("blocks a configuration path replacement during fetch", () => {
+    const result = runFixture("success", "none", false, {
+      race: "config",
+    });
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("paths changed during fetch");
+    expectNoImport(result, true);
+  });
+
+  fixtureTest("uses job-control groups when setsid is unavailable", () => {
+    const result = runFixture("success", "none", false, {
+      database: "non-empty",
+      rowTable: "tombstones",
+      force: true,
+      noSetsid: true,
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.commands).toMatch(/carryctx import\b/);
+  });
+
+  fixtureTest("terminates descendants when a probe command times out", () => {
+    const result = runFixture("success", "none", false, {
+      database: "non-empty",
+      sqliteMode: "hang-descendant",
+      gitTimeout: 1,
+    });
+    expectUnknown(result);
+    expect(result.descendantLeak).toBe(false);
+    expect(
+      result.tempEntries.filter((entry) =>
+        entry.startsWith("workflow-import."),
+      ),
+    ).toEqual([]);
+  });
+
+  fixtureTest("does not allow --force to bypass unknown state", () => {
+    const result = runFixture("success", "none", false, {
+      database: "non-empty",
+      sqliteMode: "corrupt",
+      force: true,
+    });
+    expectUnknown(result);
+  });
+});
+
+describe("workflow import path safety", () => {
+  const pathScenarios: Array<[string, FixtureOptions]> = [
+    ["symlinked project path", { projectSymlink: true }],
+    ["symlinked project path component", { projectParentSymlink: true }],
+    ["symlinked .carryctx directory", { carryctxSymlink: true }],
+    ["symlinked config", { configSymlink: true }],
+  ];
+
+  for (const [name, options] of pathScenarios) {
+    fixtureTest(`rejects ${name} before init, restore, or import`, () => {
+      const result = runFixture("success", "none", false, options);
+      expect(result.exitCode).toBe(1);
+      expect(result.config).toBe(original);
+      expectNoImport(result);
+    });
+  }
+});
+
+describe("workflow import strict version envelope parsing", () => {
+  const envelope = realVersionEnvelope(18);
+  const malformed: Array<[string, string]> = [
+    ["success false", envelope.replace('"success":true', '"success":false')],
+    ["unsupported cli", envelope.replace('"cli":"0.11.6"', '"cli":"0.11.5"')],
+    [
+      "fractional db_schema",
+      envelope.replace('"db_schema":18', '"db_schema":18.0'),
+    ],
+    [
+      "exponent db_schema",
+      envelope.replace('"db_schema":18', '"db_schema":1e2'),
+    ],
+    [
+      "duplicate db_schema",
+      envelope.replace('"db_schema":18,', '"db_schema":18,"db_schema":18,'),
+    ],
+    [
+      "unknown envelope field",
+      envelope.replace(
+        '"command":"version",',
+        '"command":"version","extra":true,',
+      ),
+    ],
+    ["missing data path", envelope.replace(',"data":{', ",{")],
+    ["multiple JSON lines", `${envelope}\n{}`],
+    ["malformed JSON", "{"],
+  ];
+
+  for (const [name, versionOutput] of malformed) {
+    fixtureTest(`rejects ${name} before sqlite or import`, () => {
       const result = runFixture("success", "none", false, {
         database: "non-empty",
         versionOutput,

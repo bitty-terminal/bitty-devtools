@@ -7,8 +7,8 @@
  * Keep bounded, forbid unsafe (TypeScript strict, no any/unsafe), scope-checked.
  *
  * Phase 2 adds: advanced tracing with filtering/retention/GC, control surfaces
- * with audit log and generation guards, and real IPC socket/pipe peer-creds
- * integration against the live Bitty runtime via transport/auth modules.
+ * with audit log and generation guards, a bounded transport fixture, and a
+ * Linux-only endpoint-attested live inspection path.
  */
 
 export * from "./bounds.js";
@@ -21,7 +21,6 @@ export * from "./transport.js";
 export * from "./queue.js";
 export * from "./campaign.js";
 export * from "./inspection.js";
-export * from "./tracing.js";
 export * from "./control.js";
 export * from "./automation.js";
 export * from "./client.js";

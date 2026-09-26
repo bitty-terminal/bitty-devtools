@@ -371,6 +371,58 @@ describe("inspection over real IPC (connected path)", () => {
     }
   });
 
+  test("standard inspection results reject extra fields", () => {
+    const cases: Array<[string, unknown]> = [
+      [
+        "bitty.debug/listPlugins",
+        { plugins: [pluginPayload({ injected: true })] },
+      ],
+      ["bitty.debug/getPlugin", pluginPayload({ injected: true })],
+      [
+        "bitty.debug/listSubscriptions",
+        [subscriptionPayload({ injected: true })],
+      ],
+      ["bitty.debug/getBudgets", budgetPayload({ injected: true })],
+      ["bitty.debug/getQueueSnapshot", queuePayload({ injected: true })],
+      ["bitty.debug/listHandles", [handlePayload({ injected: true })]],
+      ["bitty.debug/getSnapshot", semanticSnapshotPayload({ injected: true })],
+    ];
+    for (const [method, result] of cases) {
+      const client = new InspectionClient(
+        new MethodTransport({ [method]: result }),
+      );
+      let failed = false;
+      try {
+        switch (method) {
+          case "bitty.debug/listPlugins":
+            client.listPlugins("debug.inspect");
+            break;
+          case "bitty.debug/getPlugin":
+            client.getPlugin("debug.inspect", "plugin-a");
+            break;
+          case "bitty.debug/listSubscriptions":
+            client.listSubscriptions("debug.inspect", "plugin-a");
+            break;
+          case "bitty.debug/getBudgets":
+            client.getBudgets("debug.inspect", "plugin-a", generation(1));
+            break;
+          case "bitty.debug/getQueueSnapshot":
+            client.getQueueSnapshot("debug.inspect", "plugin-a");
+            break;
+          case "bitty.debug/listHandles":
+            client.listHandles("debug.inspect", "plugin-a");
+            break;
+          case "bitty.debug/getSnapshot":
+            client.getSnapshotForTerminal("debug.inspect", "term-1", "");
+            break;
+        }
+      } catch (error) {
+        failed = error instanceof InspectionError;
+      }
+      expect(failed).toBe(true);
+    }
+  });
+
   test("getSnapshotForTerminal dispatches semantic getSnapshot and redacts", () => {
     const transport = new RecordingTransport(semanticSnapshotPayload());
     const client = new InspectionClient(transport);

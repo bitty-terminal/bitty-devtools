@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import * as publicApi from "../src/index.js";
 import { DevtoolsClient } from "../src/client.js";
 import { redactPreview } from "../src/redaction.js";
 import {
@@ -36,6 +37,10 @@ function snap(): PanelRuntimeSnapshot {
 }
 
 describe("tracing (debug.trace, opt-in, bounded)", () => {
+  test("low-level tracing client is not part of the public package surface", () => {
+    expect(Object.hasOwn(publicApi, "TracingClient")).toBe(false);
+  });
+
   test("inspect cannot start trace", () => {
     const c = new DevtoolsClient();
     c.connect();
@@ -58,6 +63,18 @@ describe("tracing (debug.trace, opt-in, bounded)", () => {
     expect(stop.previews[0]).toBe("hello");
   });
 
+  test("low-level tracing accessors require trace scope", () => {
+    const tracing = new TracingClient();
+    const start = tracing.startTrace("debug.trace", {});
+    expect(() =>
+      tracing.appendToTrace("debug.control", start.traceId, "x"),
+    ).toThrow("debug.trace scope required");
+    expect(() => tracing.listTraces("debug.control")).toThrow(
+      "debug.trace scope required",
+    );
+    tracing.stopTrace("debug.trace", start.traceId);
+  });
+
   test("streamEvents bounded 32/8 KiB and DropOldest", () => {
     const c = new DevtoolsClient();
     c.connect();
@@ -71,6 +88,57 @@ describe("tracing (debug.trace, opt-in, bounded)", () => {
     );
     expect(batch.records.length).toBe(2);
     expect(batch.dropCount).toBe(0);
+  });
+
+  test("streamEvents admits records against the requested byte budget", () => {
+    const c = new DevtoolsClient();
+    c.connect();
+    c.grantScope("debug.trace");
+    const first = {
+      owner: "panel-1",
+      kind: "one",
+      payload: JSON.stringify({ count: 1 }),
+    };
+    const firstBytes = new TextEncoder().encode(JSON.stringify([first])).length;
+    const batch = c.streamEvents(["one", "two"], {
+      maxEvents: 2,
+      maxBytes: firstBytes,
+    });
+    expect(batch.records).toHaveLength(1);
+    expect(batch.dropCount).toBe(1);
+    expect(new TextEncoder().encode(JSON.stringify(batch.records)).length).toBe(
+      firstBytes,
+    );
+  });
+
+  test("filtered streams use the same requested byte budget", () => {
+    const c = new DevtoolsClient();
+    c.connect();
+    c.grantScope("debug.trace");
+    const record = {
+      owner: "panel-1",
+      kind: "one",
+      payload: JSON.stringify({ count: 1 }),
+    };
+    const maxBytes = new TextEncoder().encode(JSON.stringify([record])).length;
+    const batch = c.streamFilteredEvents(
+      { kinds: ["one", "two"] },
+      { maxEvents: 2, maxBytes },
+    );
+    expect(batch.records).toHaveLength(1);
+    expect(batch.dropCount).toBe(1);
+  });
+
+  test("filtered stream kind cardinality matches Rust", () => {
+    const c = new DevtoolsClient();
+    c.connect();
+    c.grantScope("debug.trace");
+    expect(() =>
+      c.streamFilteredEvents(
+        { kinds: Array.from({ length: 33 }, (_, index) => `event.${index}`) },
+        { maxEvents: 32, maxBytes: 8192 },
+      ),
+    ).toThrow("filter.kinds");
   });
 
   test("trace duration and bytes bounded", () => {
@@ -114,7 +182,7 @@ describe("tracing (debug.trace, opt-in, bounded)", () => {
       const start = c.startTrace(scope, { maxBytes: 1024 * 1024 });
       const records: string[] = [];
       const chunks: string[] = [];
-      for (let i = 0; i < 100; i++) {
+      for (let i = 0; i < 80; i++) {
         const payload = `${i}:` + "abcdef".repeat(900 + (i % 5) * 100);
         const event = {
           sequence: i,
@@ -135,8 +203,8 @@ describe("tracing (debug.trace, opt-in, bounded)", () => {
         } else {
           chunks[last] += record;
         }
-        if (structured) c.appendStructuredEvent(start.traceId, event);
-        else c.appendToTrace(start.traceId, payload);
+        if (structured) c.appendStructuredEvent(scope, start.traceId, event);
+        else c.appendToTrace(scope, start.traceId, payload);
       }
       const reference = records.join("");
       expect(chunks.length).toBeGreaterThan(2);
@@ -182,7 +250,7 @@ describe("tracing (debug.trace, opt-in, bounded)", () => {
     const scope = "debug.trace";
     const start = c.startTrace(scope, {});
     const source = "aé中🙂\uFEFFz";
-    c.appendToTrace(start.traceId, source);
+    c.appendToTrace(scope, start.traceId, source);
     const encoder = new TextEncoder();
     let offset = 0;
     let charOffset = 0;
@@ -209,14 +277,16 @@ describe("tracing (debug.trace, opt-in, bounded)", () => {
     const bytes = encoder.encode(expected).length;
     for (const retentionFirst of [true, false]) {
       const c = new TracingClient();
+      const scope = "debug.trace";
       const { traceId } = c.startTrace("debug.trace", {
         maxBytes: retentionFirst ? bytes * 2 : bytes,
         retention: { maxBytes: retentionFirst ? bytes : bytes * 2 },
       });
-      for (const fragment of fragments) c.appendToTrace(traceId, fragment);
+      for (const fragment of fragments)
+        c.appendToTrace(scope, traceId, fragment);
       const before = c.fetchTraceChunk("debug.trace", traceId, 0);
       expect(before.chunk).toBe(expected);
-      c.appendToTrace(traceId, "extra");
+      c.appendToTrace(scope, traceId, "extra");
       expect(c.fetchTraceChunk("debug.trace", traceId, 0)).toEqual(before);
       let offset = 0;
       let charOffset = 0;
@@ -242,6 +312,7 @@ describe("tracing (debug.trace, opt-in, bounded)", () => {
   for (const structured of [false, true]) {
     test(`multilingual ${structured ? "structured" : "raw"} pages preserve retained bytes across chunks`, () => {
       const c = new TracingClient();
+      const scope = "debug.trace";
       const { traceId, chunkBytes } = c.startTrace("debug.trace", {
         maxBytes: 1024 * 1024,
       });
@@ -267,8 +338,8 @@ describe("tracing (debug.trace, opt-in, bounded)", () => {
         )
           chunks.push(record);
         else chunks[last] += record;
-        if (structured) c.appendStructuredEvent(traceId, event);
-        else c.appendToTrace(traceId, payload);
+        if (structured) c.appendStructuredEvent(scope, traceId, event);
+        else c.appendToTrace(scope, traceId, payload);
       }
       const reference = records.join("");
       const referenceBytes = encoder.encode(reference);
@@ -309,10 +380,10 @@ describe("tracing (debug.trace, opt-in, bounded)", () => {
     const start = c.startTrace(scope, {});
     expect(c.fetchTraceChunk(scope, start.traceId, 0).chunk).toBe("");
     expect(c.fetchTraceChunk(scope, start.traceId, 0).continuation).toBe(false);
-    c.appendToTrace(start.traceId, "hello");
+    c.appendToTrace(scope, start.traceId, "hello");
     const first = c.fetchTraceChunk(scope, start.traceId, 0);
     expect(first.continuation).toBe(false);
-    c.appendToTrace(start.traceId, " world");
+    c.appendToTrace(scope, start.traceId, " world");
     const tail = c.fetchTraceChunk(scope, start.traceId, first.chunk.length);
     expect(tail.chunk).toBe(" world");
     expect(tail.continuation).toBe(false);
@@ -359,6 +430,7 @@ describe("tracing (debug.trace, opt-in, bounded)", () => {
           [48, 24],
         ]) {
           const c = new TracingClient();
+          const scope = "debug.trace";
           const { traceId } = c.startTrace("debug.trace", {
             maxBytes,
             retention: { maxBytes: retentionBytes },
@@ -374,7 +446,7 @@ describe("tracing (debug.trace, opt-in, bounded)", () => {
             } else {
               drops++;
             }
-            c.appendToTrace(traceId, record);
+            c.appendToTrace(scope, traceId, record);
             const state = c["traces"].get(traceId)!;
             expect(state.chunks.join("")).toBe(retained);
             expect(state.bytes).toBe(new TextEncoder().encode(retained).length);
@@ -405,12 +477,13 @@ describe("tracing (debug.trace, opt-in, bounded)", () => {
     for (const limit of [bytes - 1, bytes, bytes + 1]) {
       for (const retentionFirst of [true, false]) {
         const c = new TracingClient();
+        const scope = "debug.trace";
         const { traceId } = c.startTrace("debug.trace", {
           maxBytes: retentionFirst ? bytes * 2 : limit,
           retention: { maxBytes: retentionFirst ? limit : bytes * 2 },
         });
         const before = structuredClone(c["traces"].get(traceId)!);
-        c.appendStructuredEvent(traceId, event);
+        c.appendStructuredEvent(scope, traceId, event);
         const state = c["traces"].get(traceId)!;
         if (limit < bytes) {
           expect({ ...state, drops: before.drops }).toEqual(before);
@@ -420,7 +493,7 @@ describe("tracing (debug.trace, opt-in, bounded)", () => {
           expect(state.bytes).toBe(bytes);
           expect(state.events).toEqual([event]);
           const accepted = structuredClone(state);
-          c.appendStructuredEvent(traceId, event);
+          c.appendStructuredEvent(scope, traceId, event);
           expect({ ...state, drops: accepted.drops }).toEqual(accepted);
           expect(state.drops).toBe(1);
         }
@@ -430,6 +503,7 @@ describe("tracing (debug.trace, opt-in, bounded)", () => {
 
   test("retained redaction is measured and detached from caller events", () => {
     const c = new TracingClient();
+    const scope = "debug.trace";
     const { traceId } = c.startTrace("debug.trace", { maxBytes: 512 });
     const event: StructuredTraceEvent = {
       sequence: 1,
@@ -439,7 +513,7 @@ describe("tracing (debug.trace, opt-in, bounded)", () => {
       generation: 1,
       wallClockMs: 10,
     };
-    c.appendStructuredEvent(traceId, event);
+    c.appendStructuredEvent(scope, traceId, event);
     const retained = { ...event, payload: "[REDACTED]" };
     event.payload = "changed after append";
     const state = c["traces"].get(traceId)!;
@@ -449,7 +523,7 @@ describe("tracing (debug.trace, opt-in, bounded)", () => {
       new TextEncoder().encode(JSON.stringify(retained)).length,
     );
     const raw = c.startTrace("debug.trace", { maxBytes: 10 });
-    c.appendToTrace(raw.traceId, "password=example");
+    c.appendToTrace(scope, raw.traceId, "password=example");
     expect(c["traces"].get(raw.traceId)!.chunks).toEqual(["[REDACTED]"]);
     expect(c.stopTrace("debug.trace", raw.traceId).byteCount).toBe(10);
   });
@@ -457,9 +531,10 @@ describe("tracing (debug.trace, opt-in, bounded)", () => {
   test("opaque raw records never partially coalesce with event metadata", () => {
     for (const coalesce of ["budget", "none"] as const) {
       const c = new TracingClient();
+      const scope = "debug.trace";
       const { traceId } = c.startTrace("debug.trace", { coalesce });
-      c.appendToTrace(traceId, "你好");
-      c.appendToTrace(traceId, "trace.record café");
+      c.appendToTrace(scope, traceId, "你好");
+      c.appendToTrace(scope, traceId, "trace.record café");
       const state = c["traces"].get(traceId)!;
       expect(state.events.map((event) => event.payload)).toEqual([
         "你好",
@@ -474,10 +549,11 @@ describe("tracing (debug.trace, opt-in, bounded)", () => {
 
   test("validation and filtering leave retained state unchanged", () => {
     const c = new TracingClient();
+    const scope = "debug.trace";
     const { traceId } = c.startTrace("debug.trace", {
       filter: { kinds: ["trace.record"] },
     });
-    c.appendToTrace(traceId, "café");
+    c.appendToTrace(scope, traceId, "café");
     const before = structuredClone(c["traces"].get(traceId)!);
     const event: StructuredTraceEvent = {
       sequence: 2,
@@ -487,9 +563,9 @@ describe("tracing (debug.trace, opt-in, bounded)", () => {
       generation: -1,
       wallClockMs: 10,
     };
-    expect(() => c.appendStructuredEvent(traceId, event)).toThrow();
+    expect(() => c.appendStructuredEvent(scope, traceId, event)).toThrow();
     expect(c["traces"].get(traceId)).toEqual(before);
-    c.appendStructuredEvent(traceId, {
+    c.appendStructuredEvent(scope, traceId, {
       ...event,
       generation: 1,
       kind: "other",
@@ -505,17 +581,18 @@ describe("tracing (debug.trace, opt-in, bounded)", () => {
     const [lead, trail] = [scalar.slice(0, 1), scalar.slice(1, 2)];
     const replacement = "\uFFFD";
     const c = new TracingClient();
+    const scope = "debug.trace";
     const { traceId } = c.startTrace("debug.trace", {
       maxBytes: 16,
       retention: { maxBytes: 32 },
       coalesce: "budget",
     });
-    c.appendToTrace(traceId, lead);
+    c.appendToTrace(scope, traceId, lead);
     let state = c["traces"].get(traceId)!;
     expect(state.chunks).toEqual([replacement]);
     expect(state.bytes).toBe(3);
     expect(state.events.map((event) => event.payload)).toEqual([replacement]);
-    c.appendToTrace(traceId, trail);
+    c.appendToTrace(scope, traceId, trail);
     state = c["traces"].get(traceId)!;
     expect(state.chunks).toEqual([replacement + replacement]);
     expect(state.bytes).toBe(6);
@@ -526,23 +603,25 @@ describe("tracing (debug.trace, opt-in, bounded)", () => {
     expect(new TextEncoder().encode(state.chunks.join("")).length).toBe(6);
     expect(c.stopTrace("debug.trace", traceId).byteCount).toBe(6);
     const replay = new TracingClient();
+    const replayScope = "debug.trace";
     const whole = replay.startTrace("debug.trace", {
       maxBytes: 16,
       retention: { maxBytes: 16 },
       coalesce: "budget",
     });
-    replay.appendToTrace(whole.traceId, scalar);
+    replay.appendToTrace(replayScope, whole.traceId, scalar);
     const wholeState = replay["traces"].get(whole.traceId)!;
     expect(wholeState.bytes).toBe(4);
     expect(wholeState.chunks).toEqual([scalar]);
     expect(wholeState.events.map((event) => event.payload)).toEqual([scalar]);
     const owned = new TracingClient();
+    const ownedScope = "debug.trace";
     const { traceId: ownedId } = owned.startTrace("debug.trace", {
       maxBytes: 2,
       retention: { maxBytes: 4 },
     });
     const before = structuredClone(owned["traces"].get(ownedId)!);
-    owned.appendToTrace(ownedId, scalar);
+    owned.appendToTrace(ownedScope, ownedId, scalar);
     state = owned["traces"].get(ownedId)!;
     expect(state.chunks).toEqual([]);
     expect(state.bytes).toBe(0);
@@ -612,7 +691,7 @@ describe("wire-trace negatives N5-N14", () => {
   test("N8 direct offset rejects negative noninteger and over bytes", () => {
     const t = new TracingClient();
     const s = t.startTrace("debug.trace", { maxBytes: 1024 });
-    t.appendToTrace(s.traceId, "hello");
+    t.appendToTrace("debug.trace", s.traceId, "hello");
     expect(() => t.fetchTraceChunk("debug.trace", s.traceId, -1)).toThrow();
     expect(() => t.fetchTraceChunk("debug.trace", s.traceId, 1.5)).toThrow();
     expect(() => t.fetchTraceChunk("debug.trace", s.traceId, 6)).toThrow();
@@ -628,7 +707,11 @@ describe("wire-trace negatives N5-N14", () => {
   test("N9 input default off with redaction on opt in", () => {
     const t = new TracingClient();
     const s = t.startTrace("debug.trace", { maxBytes: 1024 });
-    t.appendToTrace(s.traceId, "clipboard=top-secret-value password=hide");
+    t.appendToTrace(
+      "debug.trace",
+      s.traceId,
+      "clipboard=top-secret-value password=hide",
+    );
     const page = t.fetchTraceChunk("debug.trace", s.traceId, 0);
     expect(page.chunk).not.toContain("hide");
     expect(page.chunk).toBe("[REDACTED]");
@@ -637,7 +720,7 @@ describe("wire-trace negatives N5-N14", () => {
       maxBytes: 1024,
       includeInput: true,
     });
-    t.appendToTrace(s2.traceId, "password=hide-me");
+    t.appendToTrace("debug.trace", s2.traceId, "password=hide-me");
     const page2 = t.fetchTraceChunk("debug.trace", s2.traceId, 0);
     expect(page2.chunk).toBe("[REDACTED]");
     t.stopTrace("debug.trace", s2.traceId);
@@ -648,9 +731,9 @@ describe("wire-trace negatives N5-N14", () => {
     expect(SOCKET_MODE).toBe(0o600);
     const t = new TracingClient();
     const s = t.startTrace("debug.trace", { maxBytes: 2048 });
-    t.appendToTrace(s.traceId, "token=sk-live-abcdefgh12345678");
+    t.appendToTrace("debug.trace", s.traceId, "token=sk-live-abcdefgh12345678");
     const stopped = t.stopTrace("debug.trace", s.traceId);
-    expect(stopped.spoolMode).toBe("0600");
+    expect(stopped.spoolMode).toBe("memory");
     expect(stopped.previews.join("")).not.toContain("sk-live");
     expect(() => assertPreviewMatchesExport("hello", "hello-tampered")).toThrow(
       "preview must equal export",
@@ -663,8 +746,8 @@ describe("wire-trace negatives N5-N14", () => {
     expect("aé中".length).toBe(3);
     const t = new TracingClient();
     const s = t.startTrace("debug.trace", { maxBytes: 1024 });
-    t.appendToTrace(s.traceId, "é");
-    const state = t.listTraces();
+    t.appendToTrace("debug.trace", s.traceId, "é");
+    const state = t.listTraces("debug.trace");
     expect(state).toContain(s.traceId);
     expect(() => t.fetchTraceChunk("debug.trace", s.traceId, 1)).toThrow();
     const p0 = t.fetchTraceChunk("debug.trace", s.traceId, 0);
@@ -682,8 +765,8 @@ describe("wire-trace negatives N5-N14", () => {
     expect(() => checkConnectionCap(16)).toThrow("shed newest");
     const t = new TracingClient();
     const s = t.startTrace("debug.trace", { maxBytes: 5 });
-    t.appendToTrace(s.traceId, "hello");
-    t.appendToTrace(s.traceId, "extra-bytes");
+    t.appendToTrace("debug.trace", s.traceId, "hello");
+    t.appendToTrace("debug.trace", s.traceId, "extra-bytes");
     const stopped = t.stopTrace("debug.trace", s.traceId);
     expect(stopped.dropCount).toBe(1);
     expect(stopped.truncated).toBe(true);

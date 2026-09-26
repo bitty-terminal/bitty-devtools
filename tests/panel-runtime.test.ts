@@ -13,8 +13,8 @@ describe("panel-runtime re-use", () => {
   test("PanelId distinct from ViewId (branded, no From)", () => {
     const pid = panelId(1);
     const vid = viewId(1);
-    expect(pid).toBe(1);
-    expect(vid).toBe(1);
+    expect(Number(pid)).toBe(1);
+    expect(Number(vid)).toBe(1);
     // Branded types share runtime value but are distinct at type level
     expect(pid !== (vid as unknown as typeof pid)).toBe(false); // same numeric, type-level distinct
   });
@@ -33,13 +33,15 @@ describe("panel-runtime re-use", () => {
   });
 
   test("EventTopic grammar bounded 64", () => {
-    expect(parseEventTopic("example.git:branch-changed")).toBe(
+    expect(parseEventTopic("example.git:branch-changed") as string).toBe(
       "example.git:branch-changed",
     );
     expect(() => parseEventTopic("badtopic")).toThrow("invalid topic");
     expect(() => parseEventTopic("Owner.name:topic")).toThrow("invalid topic");
     expect(() => parseEventTopic("bitty.foo:bar")).toThrow("forbidden");
-    expect(parseEventTopic("bitty.panel:mounted")).toBe("bitty.panel:mounted");
+    expect(parseEventTopic("bitty.panel:mounted") as string).toBe(
+      "bitty.panel:mounted",
+    );
   });
 
   test("BoundedPayload rejects oversize", () => {

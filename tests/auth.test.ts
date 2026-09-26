@@ -15,7 +15,7 @@ import {
   SOCKET_MODE,
 } from "../src/auth.js";
 
-describe("auth peer-creds (phase 2, live runtime)", () => {
+describe("headless auth policy and endpoint selection", () => {
   test("peer uid equality", () => {
     const peer = peerCredentials(1000, 1000, 42);
     expect(() => verifyPeerUid(peer, 1000)).not.toThrow();
@@ -53,7 +53,7 @@ describe("auth peer-creds (phase 2, live runtime)", () => {
     expect(() => verifyWindowsPipe(123n, 999n)).toThrow("pipe peer sid");
   });
 
-  test("resolve socket path precedence BITTY_SOCKET advisory", () => {
+  test("resolve socket path precedence uses BITTY_SOCKET as a bounded selector", () => {
     const p1 = resolveSocketPath({
       runtimeUid: 1000,
       bittySocket: "/tmp/custom.sock",
@@ -160,7 +160,7 @@ describe("auth peer-creds (phase 2, live runtime)", () => {
     check("child token expired");
   });
 
-  test("BITTY_SOCKET without peer cred still fails (advisory only)", () => {
+  test("BITTY_SOCKET selection does not provide peer credentials", () => {
     const peer = peerCredentials(2000, 2000, 99);
     const runtimeUid = 1000;
     expect(() => verifyPeerUid(peer, runtimeUid)).toThrow("peer uid");

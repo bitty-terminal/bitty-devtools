@@ -1,16 +1,16 @@
 /**
- * IPC transport for DevTools phase 2 (live runtime, bounded, headless-testable).
+ * Bounded IPC transport fixture for DevTools phase 2.
  *
- * This module provides the real IPC socket/pipe peer-creds integration against
- * the live Bitty runtime without requiring unsafe or a live socket in tests.
- * It reuses the framing and budget vocabulary from `bitty-ipc` and the
+ * This module verifies caller-supplied peer and endpoint values in an
+ * injectable in-memory transport. The Linux endpoint-attested OS socket adapter lives
+ * in `ipc-socket.ts`; no live socket is opened by this fixture. It reuses the
+ * framing and budget vocabulary from `bitty-ipc` and the
  * devtools-rfc: length-prefixed frames bounded at 256 KiB (IPC) and logical
  * devtools frames at 1 MiB, chunked at 256 KiB (RC-10), rate limits RC-9
  * (100 req/s, 2x burst, 16 concurrent connections).
  *
- * The transport is headless by default (in-memory VecDeque stub) and accepts
- * an injectable socket factory for live integration. No TCP listener is
- * created. All queues are bounded and fail-closed; producers never block.
+ * The transport is an in-memory VecDeque fixture with no TCP listener. All
+ * queues are bounded and fail-closed; producers never block.
  */
 
 import { BOUNDS, assertBounded, assertStringBounded } from "./bounds.js";
@@ -431,7 +431,7 @@ export class StdioTransportStub {
 }
 
 // ---------------------------------------------------------------------------
-// IpcTransport (phase 2): live-runtime-capable, peer-creds verified, rate-limited
+// IpcTransport (phase 2): bounded fixture transport with peer-value checks
 // ---------------------------------------------------------------------------
 
 export type IpcTransportConfig = {
@@ -444,11 +444,8 @@ export type IpcTransportConfig = {
   peer?: PeerCredentials | null;
   capacity?: number;
   /**
-   * Windows named-pipe peer identity (CTX-0043). When both SIDs are present
-   * the transport verifies the pipe peer instead of the Unix endpoint checks
-   * (Unix mode/owner checks are meaningless on a named pipe). Absent on
-   * Unix; injected headlessly in tests since the pipe path cannot execute
-   * on Linux (Windows-CI item).
+   * Headless test seam for caller-supplied named-pipe identity values. It
+   * does not open a Windows pipe or establish a live peer identity.
    */
   windowsPeerSid?: bigint | number;
   windowsRuntimeSid?: bigint | number;
@@ -530,7 +527,6 @@ export class IpcTransport {
       throw new TransportError("TransportClosed", "stdio transport is closed");
     }
     if (this.isWindowsPipe()) {
-      // CTX-0043: named-pipe peers carry SIDs, not Unix modes/owners.
       this.checkWindowsPipe(
         this.config.windowsPeerSid as bigint | number,
         this.config.windowsRuntimeSid as bigint | number,
@@ -586,7 +582,6 @@ export class IpcTransport {
 
   verifyPeerForPrivilegedAction(): void {
     if (this.isWindowsPipe()) {
-      // CTX-0043: every privileged action re-verifies the pipe peer SID.
       this.checkWindowsPipe(
         this.config.windowsPeerSid as bigint | number,
         this.config.windowsRuntimeSid as bigint | number,
@@ -651,10 +646,9 @@ export class IpcTransport {
    * it asynchronously. Response ids must match the request id, and the
    * envelope is validated by `decodeResponse` before it is returned.
    *
-   * L2 (recorded, not fixed here): this reads exactly one inbound frame and
-   * does not reassemble RC-10 256 KiB continuation frames, and the transport
-   * is still the in-memory `StdioTransportStub` rather than a live socket
-   * reader. Those remain tracked follow-ups outside PR #45's scope.
+   * This headless seam consumes exactly one inbound frame and does not
+   * reassemble RC-10 continuation frames. OS socket readers use the separate
+   * live socket path and their own bounded response contract.
    */
   request(req: IpcRequest, nowMs: number): IpcResponse {
     this.sendRequest(req, nowMs);
@@ -665,7 +659,14 @@ export class IpcTransport {
         `no response for id ${req.id} (${req.method})`,
       );
     }
-    const raw = new TextDecoder().decode(frame.payload);
+    let raw: string;
+    try {
+      raw = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(
+        frame.payload,
+      );
+    } catch {
+      throw new TransportError("InvalidFrame", "response is not valid UTF-8");
+    }
     const response: IpcResponse = decodeResponse(raw);
     if (response.id !== req.id) {
       throw new TransportError(
