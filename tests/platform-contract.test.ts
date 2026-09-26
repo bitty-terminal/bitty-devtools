@@ -71,8 +71,7 @@ describe("offline platform contract", () => {
     expect(workflow).toContain('category: "/language:rust"');
     expect(workflow).toContain("languages: javascript-typescript, actions");
     expect(workflow).toContain("languages: rust");
-    expect(workflow.match(/build-mode: none/gu)).toHaveLength(1);
-    expect(workflow.match(/build-mode: autobuild/gu)).toHaveLength(1);
+    expect(workflow.match(/build-mode: none/gu)).toHaveLength(2);
     expect(config).toContain("uses: security-and-quality");
     expect(config).toContain("paths-ignore:");
   });
