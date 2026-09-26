@@ -2636,8 +2636,8 @@ export async function probeTerminalSpawnObservability(
   const declared = new Set<string>();
   const owned = new Set<string>();
   let previousFocus: string | undefined;
-  let baselineTerminals: ReadonlySet<string> = new Set();
-  let baselineViews: ReadonlySet<string> = new Set();
+  let baselineTerminals: ReadonlySet<string>;
+  let baselineViews: ReadonlySet<string>;
   try {
     const before = await terminalSummary(dispatcher, "before");
     baselineTerminals = new Set(before.terminals);
