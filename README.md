@@ -407,7 +407,7 @@ repository `justfile`:
 ```text
 just check          # fmt-check + lint + type-check + test + cargo-check
 just fmt-check      # Prettier 3.9.6 check without writing files
-just lint           # markdownlint-cli2 0.23.1
+just lint           # markdownlint-cli2 0.23.2
 just type-check     # tsc --noEmit strict
 just test           # bun:test headless unit tests
 just cargo-check    # cargo check + clippy -D warnings + cargo test
