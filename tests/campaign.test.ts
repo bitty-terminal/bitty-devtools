@@ -51,7 +51,6 @@ import {
   type CtlInvocation,
   type CtlResult,
   type ProcessDispatcherConfig,
-  type SocketDirStat,
 } from "../src/campaign.js";
 import { ProtocolErrorImpl, decodeResponse } from "../src/protocol.js";
 import {
