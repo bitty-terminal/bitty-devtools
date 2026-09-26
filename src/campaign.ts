@@ -24,6 +24,8 @@
  */
 
 import { DIR_MODE } from "./auth.js";
+import { truncateToBytes } from "./bounds.js";
+import { redactSensitiveText, sanitizeTerminalOutput } from "./redaction.js";
 
 function isAbsoluteSocketPath(socketPath: string): boolean {
   const platform = (globalThis as { process?: { platform?: string } }).process
@@ -35,11 +37,9 @@ function isAbsoluteSocketPath(socketPath: string): boolean {
 }
 
 function campaignFailureMessage(error: unknown): string {
-  try {
-    return error instanceof Error ? error.message : String(error);
-  } catch {
-    return "unknown campaign failure";
-  }
+  return error instanceof CampaignError
+    ? safeReportText(`campaign failure (${error.code}): ${error.message}`)
+    : "campaign operation failed";
 }
 
 // ---------------------------------------------------------------------------
@@ -73,6 +73,42 @@ export const EXIT_TIMEOUT = 124 as const;
 export const DEFAULT_TIMEOUT_MS = 10_000 as const;
 /** Default bound on captured live output (guards Debug-dump blowups). */
 export const MAX_CAMPAIGN_OUTPUT_BYTES = 4 * 1024 * 1024;
+export const MAX_CAMPAIGN_COMMAND_BYTES = 512 as const;
+export const MAX_CAMPAIGN_ERROR_CLASS_BYTES = 128 as const;
+export const MAX_CAMPAIGN_ERROR_MESSAGE_BYTES = 1024 as const;
+export const MAX_CAMPAIGN_STRING_BYTES = 256 * 1024;
+export const MAX_CAMPAIGN_ARRAY_ITEMS = 256 as const;
+export const MAX_CAMPAIGN_OBJECT_KEYS = 128 as const;
+export const MAX_CAMPAIGN_JSON_DEPTH = 16 as const;
+export const MAX_CAMPAIGN_JSON_NODES = 4096 as const;
+export const MAX_CAMPAIGN_WORKSPACES = 64 as const;
+export const MAX_CAMPAIGN_MATRIX_ROWS = 64 as const;
+export const MAX_CAMPAIGN_REPORT_RESULTS = 128 as const;
+export const MAX_CAMPAIGN_REPORT_EVIDENCE_ITEMS = 16 as const;
+export const MAX_CAMPAIGN_REPORT_TEXT_BYTES = 1024 as const;
+export const MAX_CAMPAIGN_ARGS = 64 as const;
+export const MAX_CAMPAIGN_ARG_BYTES = 4096 as const;
+export const MAX_CAMPAIGN_IDENTIFIER_BYTES = 128 as const;
+export const MAX_CAMPAIGN_CHILD_ENV_VALUE_BYTES = 4096 as const;
+
+export const CAMPAIGN_CHILD_ENV_ALLOWLIST = [
+  "PATH",
+  "Path",
+  "HOME",
+  "XDG_RUNTIME_DIR",
+  "XDG_CONFIG_HOME",
+  "TMPDIR",
+  "TMP",
+  "TEMP",
+  "LANG",
+  "LC_ALL",
+  "LC_CTYPE",
+  "SystemRoot",
+  "SYSTEMROOT",
+  "WINDIR",
+  "PATHEXT",
+  "COMSPEC",
+] as const;
 
 /** Stable exit-code table, keyed by normalized failure class/code. */
 export function expectedExitForError(errorClass: string, code: string): number {
@@ -147,7 +183,11 @@ export type CtlEnvelope = CtlSuccessEnvelope | CtlFailureEnvelope;
 export class CampaignError extends Error {
   constructor(
     public readonly code:
-      "MalformedEnvelope" | "MissingField" | "InvalidJson" | "EmptyOutput",
+      | "MalformedEnvelope"
+      | "MissingField"
+      | "InvalidJson"
+      | "EmptyOutput"
+      | "OutputTooLarge",
     message: string,
   ) {
     super(message);
@@ -157,6 +197,108 @@ export class CampaignError extends Error {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function utf8Bytes(value: string): number {
+  return new TextEncoder().encode(value).length;
+}
+
+function assertBoundedString(
+  field: string,
+  value: unknown,
+  maxBytes: number,
+): asserts value is string {
+  if (typeof value !== "string" || value.length === 0) {
+    throw new CampaignError(
+      "MalformedEnvelope",
+      `${field} must be a non-empty string`,
+    );
+  }
+  if (utf8Bytes(value) > maxBytes) {
+    throw new CampaignError(
+      "OutputTooLarge",
+      `${field} exceeds ${maxBytes} bytes`,
+    );
+  }
+}
+
+function hasControlCharacters(value: string): boolean {
+  return Array.from(value).some((character) => {
+    const codePoint = character.codePointAt(0) ?? 0;
+    return codePoint <= 0x1f || (codePoint >= 0x7f && codePoint <= 0x9f);
+  });
+}
+
+function validateBoundedJsonValue(value: unknown): string[] {
+  const problems: string[] = [];
+  let nodes = 0;
+  const visit = (entry: unknown, depth: number, path: string): void => {
+    nodes += 1;
+    if (nodes > MAX_CAMPAIGN_JSON_NODES) {
+      problems.push(`result exceeds ${MAX_CAMPAIGN_JSON_NODES} values`);
+      return;
+    }
+    if (depth > MAX_CAMPAIGN_JSON_DEPTH) {
+      problems.push(`result exceeds depth ${MAX_CAMPAIGN_JSON_DEPTH}`);
+      return;
+    }
+    if (typeof entry === "string") {
+      if (utf8Bytes(entry) > MAX_CAMPAIGN_STRING_BYTES) {
+        problems.push(
+          `result string at ${path} exceeds ${MAX_CAMPAIGN_STRING_BYTES} bytes`,
+        );
+      }
+      return;
+    }
+    if (Array.isArray(entry)) {
+      if (entry.length > MAX_CAMPAIGN_ARRAY_ITEMS) {
+        problems.push(
+          `result array at ${path} exceeds ${MAX_CAMPAIGN_ARRAY_ITEMS} items`,
+        );
+        return;
+      }
+      for (const [index, item] of entry.entries()) {
+        visit(item, depth + 1, `${path}[${index}]`);
+        if (problems.length >= 8) return;
+      }
+      return;
+    }
+    if (isRecord(entry)) {
+      const keys = Object.keys(entry);
+      if (keys.length > MAX_CAMPAIGN_OBJECT_KEYS) {
+        problems.push(
+          `result object at ${path} exceeds ${MAX_CAMPAIGN_OBJECT_KEYS} fields`,
+        );
+        return;
+      }
+      for (const key of keys) {
+        if (utf8Bytes(key) > MAX_CAMPAIGN_IDENTIFIER_BYTES) {
+          problems.push(
+            `result key at ${path} exceeds ${MAX_CAMPAIGN_IDENTIFIER_BYTES} bytes`,
+          );
+          continue;
+        }
+        visit(entry[key], depth + 1, `${path}.${key}`);
+        if (problems.length >= 8) return;
+      }
+      return;
+    }
+    if (typeof entry === "number" && !Number.isFinite(entry)) {
+      problems.push(`result number at ${path} must be finite`);
+    }
+  };
+  visit(value, 0, "result");
+  return problems;
+}
+
+function unexpectedEnvelopeFields(
+  value: Record<string, unknown>,
+  allowed: readonly string[],
+): string[] {
+  const allowSet = new Set(allowed);
+  return Object.keys(value)
+    .filter((key) => !allowSet.has(key))
+    .map((key) => `unexpected field ${JSON.stringify(safeReportText(key))}`);
 }
 
 /**
@@ -169,37 +311,166 @@ export function validateEnvelopeShape(value: unknown): string[] {
   if (value["v"] !== CTL_ENVELOPE_VERSION) {
     problems.push(`v must be ${CTL_ENVELOPE_VERSION}`);
   }
-  if (typeof value["command"] !== "string" || value["command"].length === 0) {
+  const command = value["command"];
+  if (typeof command !== "string" || command.length === 0) {
     problems.push("command must be a non-empty string");
+  } else {
+    if (utf8Bytes(command) > MAX_CAMPAIGN_COMMAND_BYTES) {
+      problems.push(`command exceeds ${MAX_CAMPAIGN_COMMAND_BYTES} bytes`);
+    }
+    if (hasControlCharacters(command)) {
+      problems.push("command must not contain control characters");
+    }
   }
   if (typeof value["ok"] !== "boolean") {
     problems.push("ok must be boolean");
   } else if (value["ok"] === true) {
-    if (!("result" in value)) problems.push("ok:true requires a result field");
+    if (!Object.hasOwn(value, "result")) {
+      problems.push("result/error branches are exclusive");
+    }
+    if (Object.hasOwn(value, "error")) {
+      problems.push("result/error branches are exclusive");
+    }
+    problems.push(
+      ...unexpectedEnvelopeFields(value, ["v", "command", "ok", "result"]),
+    );
+    if (Object.hasOwn(value, "result")) {
+      problems.push(...validateBoundedJsonValue(value["result"]));
+    }
   } else {
-    const err = value["error"];
-    if (!isRecord(err)) {
+    const error = value["error"];
+    if (Object.hasOwn(value, "result") || !Object.hasOwn(value, "error")) {
+      problems.push("result/error branches are exclusive");
+    }
+    problems.push(
+      ...unexpectedEnvelopeFields(value, ["v", "command", "ok", "error"]),
+    );
+    if (!isRecord(error)) {
       problems.push("ok:false requires an error object");
     } else {
-      for (const key of ["class", "code", "message"] as const) {
-        if (typeof err[key] !== "string" || err[key].length === 0) {
+      problems.push(
+        ...unexpectedEnvelopeFields(error, ["class", "code", "message"]),
+      );
+      const fields = [
+        ["class", MAX_CAMPAIGN_ERROR_CLASS_BYTES],
+        ["code", MAX_CAMPAIGN_ERROR_CLASS_BYTES],
+        ["message", MAX_CAMPAIGN_ERROR_MESSAGE_BYTES],
+      ] as const;
+      for (const [key, limit] of fields) {
+        const entry = error[key];
+        if (typeof entry !== "string" || entry.length === 0) {
           problems.push(`error.${key} must be a non-empty string`);
+        } else {
+          if (utf8Bytes(entry) > limit) {
+            problems.push(`error.${key} exceeds ${limit} bytes`);
+          }
+          if (hasControlCharacters(entry)) {
+            problems.push(`error.${key} must not contain control characters`);
+          }
+          if (redactSensitiveText(entry) !== entry) {
+            problems.push(`error.${key} contains sensitive material`);
+          }
         }
       }
     }
   }
-  return problems;
+  return [...new Set(problems)].slice(0, 8).map(safeReportText);
 }
 
-/** Parse a v1 `ctl` envelope from CLI stdout; throws {@link CampaignError}. */
-export function parseCtlEnvelope(stdout: string): CtlEnvelope {
-  const trimmed = stdout.trim();
-  if (trimmed.length === 0) {
+/**
+ * Reject a ctl stdout envelope that repeats an object key. `JSON.parse` keeps
+ * the last occurrence, so a duplicate key lets a hostile target show one value
+ * to the operator and hand a different one to every later consumer.
+ * Single-line JSONL only: `parseCtlEnvelopeShape` rejects embedded newlines
+ * before this runs.
+ */
+function assertCtlEnvelopeUniqueKeys(raw: string): void {
+  const stack: Array<
+    { kind: "object"; keys: Set<string> } | { kind: "array" }
+  > = [];
+  for (let index = 0; index < raw.length; index += 1) {
+    const character = raw[index];
+    if (character === "{") {
+      stack.push({ kind: "object", keys: new Set<string>() });
+      continue;
+    }
+    if (character === "[") {
+      stack.push({ kind: "array" });
+      continue;
+    }
+    if (character === "}" || character === "]") {
+      const expected = character === "}" ? "object" : "array";
+      const current = stack.pop();
+      if (current?.kind !== expected) {
+        throw new SyntaxError("JSON contains mismatched structure");
+      }
+      continue;
+    }
+    if (character !== '"') continue;
+    let end = index + 1;
+    let escaped = false;
+    for (; end < raw.length; end += 1) {
+      const code = raw.charCodeAt(end);
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+      if (raw[end] === "\\") {
+        escaped = true;
+        continue;
+      }
+      if (raw[end] === '"') break;
+      if (code < 0x20) {
+        throw new SyntaxError("JSON string contains a control character");
+      }
+    }
+    if (end >= raw.length) {
+      throw new SyntaxError("JSON contains an unterminated string");
+    }
+    const current = stack.at(-1);
+    if (current?.kind === "object") {
+      let next = end + 1;
+      while (next < raw.length && /\s/u.test(raw[next] ?? "")) next += 1;
+      if (raw[next] === ":") {
+        const parsedKey: unknown = JSON.parse(raw.slice(index, end + 1));
+        if (typeof parsedKey !== "string") {
+          throw new SyntaxError("JSON object key is not a string");
+        }
+        if (current.keys.has(parsedKey)) {
+          throw new SyntaxError("JSON contains a duplicate object key");
+        }
+        current.keys.add(parsedKey);
+      }
+    }
+    index = end;
+  }
+  if (stack.length > 0) {
+    throw new SyntaxError("JSON contains unclosed structure");
+  }
+}
+
+function parseCtlEnvelopeShape(stdout: string): CtlEnvelope {
+  if (utf8Bytes(stdout) > MAX_CAMPAIGN_OUTPUT_BYTES) {
+    throw new CampaignError(
+      "OutputTooLarge",
+      `ctl stdout exceeds ${MAX_CAMPAIGN_OUTPUT_BYTES} bytes`,
+    );
+  }
+  let line = stdout;
+  if (line.endsWith("\r\n")) line = line.slice(0, -2);
+  else if (line.endsWith("\n")) line = line.slice(0, -1);
+  if (line.trim().length === 0) {
     throw new CampaignError("EmptyOutput", "ctl produced no stdout envelope");
   }
-  const line = trimmed.split("\n")[0] ?? "";
+  if (line.includes("\n") || line.includes("\r")) {
+    throw new CampaignError(
+      "MalformedEnvelope",
+      "ctl stdout must contain exactly one JSONL record",
+    );
+  }
   let parsed: unknown;
   try {
+    assertCtlEnvelopeUniqueKeys(line);
     parsed = JSON.parse(line);
   } catch {
     throw new CampaignError("InvalidJson", "ctl stdout is not valid JSON");
@@ -208,10 +479,25 @@ export function parseCtlEnvelope(stdout: string): CtlEnvelope {
   if (problems.length > 0) {
     throw new CampaignError(
       "MalformedEnvelope",
-      `invalid ctl envelope: ${problems.join("; ")}`,
+      safeReportText(`invalid ctl envelope: ${problems.join("; ")}`),
     );
   }
   return parsed as CtlEnvelope;
+}
+
+/** Parse a v1 `ctl` envelope from CLI stdout; throws {@link CampaignError}. */
+export function parseCtlEnvelope(stdout: string): CtlEnvelope {
+  const envelope = parseCtlEnvelopeShape(stdout);
+  if (envelope.ok) {
+    if (!envelope.command.startsWith("core.")) {
+      throw new CampaignError(
+        "MalformedEnvelope",
+        "ctl command does not name a known registry verb",
+      );
+    }
+    assertCtlResultProjection(envelope.command.slice(5), envelope);
+  }
+  return envelope;
 }
 
 /** Result of one `ctl` invocation (bounded, observation-only). */
@@ -222,6 +508,40 @@ export type CtlResult = {
   stderr: string;
   timedOut: boolean;
 };
+
+function assertBoundedCtlResult(result: CtlResult): void {
+  if (
+    !Number.isSafeInteger(result.exitCode) ||
+    typeof result.timedOut !== "boolean" ||
+    !Array.isArray(result.argv) ||
+    result.argv.length > MAX_CAMPAIGN_ARGS
+  ) {
+    throw new CampaignError(
+      "MalformedEnvelope",
+      "ctl result metadata is invalid",
+    );
+  }
+  for (const argument of result.argv) {
+    assertBoundedProcessToken(argument, "ctl result argv");
+  }
+  for (const [field, value] of [
+    ["stdout", result.stdout],
+    ["stderr", result.stderr],
+  ] as const) {
+    if (typeof value !== "string") {
+      throw new CampaignError(
+        "MalformedEnvelope",
+        `ctl ${field} must be a string`,
+      );
+    }
+    if (utf8Bytes(value) > MAX_CAMPAIGN_OUTPUT_BYTES) {
+      throw new CampaignError(
+        "OutputTooLarge",
+        `ctl ${field} exceeds ${MAX_CAMPAIGN_OUTPUT_BYTES} bytes`,
+      );
+    }
+  }
+}
 
 /** One `ctl` invocation to dispatch. */
 export type CtlInvocation = {
@@ -328,23 +648,47 @@ export type SpawnSyncFn = (
   args: readonly string[],
   options: {
     timeoutMs: number;
-    /** Environment delta merged over the host environment by the default spawn. */
+    /** Allowlisted environment overlay applied to the minimal child environment. */
     env: Record<string, string | undefined>;
     cwd?: string;
   },
 ) => CtlResult;
 
-/**
- * `BITTY_CTL_ELEVATE` scope list announced for elevated invocations.
- *
- * The variable is a server-side pre-grant allowlist of comma-separated scope
- * names (for example `terminal.manage,config.modify`); the server intersects
- * them with its own allowlist and unknown names grant nothing. A bare `1` is
- * not a scope and therefore grants nothing, which is why an elevated probe
- * must announce the scopes it needs. This is observation-only wiring: the
- * server remains the authority and still fails closed on a missing grant.
- */
+/** Default server-side scope allowlist; each verb announces only its mapped scope. */
 export const DEFAULT_ELEVATION_SCOPES = "terminal.manage,config.modify";
+
+const ELEVATION_SCOPE_BY_VERB: Readonly<Record<string, string>> = {
+  "terminal.spawn": "terminal.manage",
+  "terminal.close": "terminal.manage",
+  "workspace.close": "terminal.manage",
+  "config.reload": "config.modify",
+};
+
+const SUPPORTED_ELEVATION_SCOPES = new Set([
+  "terminal.manage",
+  "config.modify",
+]);
+
+function parseElevationScopes(raw: string): ReadonlySet<string> {
+  const entries = raw.split(",");
+  if (entries.length === 0 || entries.length > 8) {
+    throw new CampaignError(
+      "MalformedEnvelope",
+      "elevation scope list is empty or too large",
+    );
+  }
+  const scopes = new Set<string>();
+  for (const entry of entries) {
+    if (!SUPPORTED_ELEVATION_SCOPES.has(entry)) {
+      throw new CampaignError(
+        "MalformedEnvelope",
+        "elevation scope list contains an unsupported scope",
+      );
+    }
+    scopes.add(entry);
+  }
+  return scopes;
+}
 
 export type ProcessDispatcherConfig = {
   /** Program to execute; defaults to `bitty`. */
@@ -355,12 +699,9 @@ export type ProcessDispatcherConfig = {
   socketPath?: string;
   /** Command timeout in milliseconds. */
   timeoutMs?: number;
-  /** Extra environment (e.g. `XDG_RUNTIME_DIR`). */
+  /** Allowlisted environment overrides (e.g. `XDG_RUNTIME_DIR`). */
   env?: Record<string, string>;
-  /**
-   * Comma-separated `BITTY_CTL_ELEVATE` scope list announced for elevated
-   * invocations. Defaults to {@link DEFAULT_ELEVATION_SCOPES}.
-   */
+  /** Comma-separated upper bound for per-verb `BITTY_CTL_ELEVATE` scopes. */
   elevationScopes?: string;
   /** Working directory. */
   cwd?: string;
@@ -368,8 +709,8 @@ export type ProcessDispatcherConfig = {
 
 type BunSpawnResult = {
   exitCode: number | null;
-  stdout?: { toString(): string } | null;
-  stderr?: { toString(): string } | null;
+  stdout?: { byteLength?: number; toString(): string } | null;
+  stderr?: { byteLength?: number; toString(): string } | null;
   signalCode?: string | null;
   success?: boolean;
 };
@@ -381,6 +722,7 @@ type BunSpawnSync = (options: {
   env?: Record<string, string | undefined>;
   cwd?: string;
   timeout?: number;
+  maxBuffer?: number;
 }) => BunSpawnResult;
 
 /** Resolve the runtime `Bun.spawnSync` without taking a compile-time node dep. */
@@ -397,12 +739,78 @@ function resolveHostEnv(): Record<string, string | undefined> {
   return bun?.env ?? {};
 }
 
+function boundedEnvironmentValue(key: string, value: string): string {
+  if (
+    utf8Bytes(value) > MAX_CAMPAIGN_CHILD_ENV_VALUE_BYTES ||
+    hasControlCharacters(value)
+  ) {
+    throw new CampaignError(
+      "MalformedEnvelope",
+      `child environment value for ${key} is invalid`,
+    );
+  }
+  return value;
+}
+
+export function buildCampaignChildEnvironment(
+  hostEnv: Readonly<Record<string, string | undefined>>,
+  requestedEnv: Readonly<Record<string, string | undefined>>,
+): Record<string, string | undefined> {
+  const env: Record<string, string | undefined> = {};
+  for (const key of CAMPAIGN_CHILD_ENV_ALLOWLIST) {
+    const requested = Object.hasOwn(requestedEnv, key);
+    const value = requested ? requestedEnv[key] : hostEnv[key];
+    if (value !== undefined) env[key] = boundedEnvironmentValue(key, value);
+  }
+  if (
+    Object.hasOwn(requestedEnv, "BITTY_CTL_ELEVATE") &&
+    requestedEnv["BITTY_CTL_ELEVATE"] !== undefined
+  ) {
+    const elevation = requestedEnv["BITTY_CTL_ELEVATE"];
+    if (elevation !== "terminal.manage" && elevation !== "config.modify") {
+      throw new CampaignError(
+        "MalformedEnvelope",
+        "child elevation must name exactly one supported scope",
+      );
+    }
+    env["BITTY_CTL_ELEVATE"] = boundedEnvironmentValue(
+      "BITTY_CTL_ELEVATE",
+      elevation,
+    );
+  }
+  return env;
+}
+
+function boundedSpawnOutput(
+  output: { byteLength?: number; toString(): string } | null | undefined,
+  field: string,
+): string {
+  if (output == null) return "";
+  if (
+    output.byteLength !== undefined &&
+    output.byteLength > MAX_CAMPAIGN_OUTPUT_BYTES
+  ) {
+    throw new CampaignError(
+      "OutputTooLarge",
+      `ctl ${field} exceeds ${MAX_CAMPAIGN_OUTPUT_BYTES} bytes`,
+    );
+  }
+  const value = output.toString();
+  if (utf8Bytes(value) > MAX_CAMPAIGN_OUTPUT_BYTES) {
+    throw new CampaignError(
+      "OutputTooLarge",
+      `ctl ${field} exceeds ${MAX_CAMPAIGN_OUTPUT_BYTES} bytes`,
+    );
+  }
+  return value;
+}
+
 /**
  * Default live spawn over the runtime's `Bun.spawnSync`, with a hard timeout
  * and bounded capture. No node builtin types are required, so the harness
  * type-checks under the repository's committed dependency pins.
  */
-export function defaultSpawnSync(
+function defaultSpawnSync(
   program: string,
   args: readonly string[],
   options: {
@@ -422,20 +830,45 @@ export function defaultSpawnSync(
     cmd: [program, ...args],
     stdout: "pipe",
     stderr: "pipe",
-    env: { ...resolveHostEnv(), ...options.env },
+    env: buildCampaignChildEnvironment(resolveHostEnv(), options.env),
     cwd: options.cwd,
     timeout: options.timeoutMs,
+    maxBuffer: MAX_CAMPAIGN_OUTPUT_BYTES,
   });
   const timedOut = res.exitCode === null && res.signalCode === "SIGTERM";
-  const stdout = res.stdout?.toString() ?? "";
-  const stderr = res.stderr?.toString() ?? "";
   return {
     argv: [program, ...args],
     exitCode: timedOut ? EXIT_TIMEOUT : (res.exitCode ?? EXIT_GENERIC),
-    stdout: stdout.slice(0, MAX_CAMPAIGN_OUTPUT_BYTES),
-    stderr: stderr.slice(0, MAX_CAMPAIGN_OUTPUT_BYTES),
+    stdout: boundedSpawnOutput(res.stdout, "stdout"),
+    stderr: boundedSpawnOutput(res.stderr, "stderr"),
     timedOut,
   };
+}
+
+function assertBoundedProcessToken(value: string, field: string): void {
+  if (
+    value.length === 0 ||
+    utf8Bytes(value) > MAX_CAMPAIGN_ARG_BYTES ||
+    hasControlCharacters(value)
+  ) {
+    throw new CampaignError(
+      "MalformedEnvelope",
+      `${field} is empty, oversized, or contains control characters`,
+    );
+  }
+}
+
+function assertBoundedInvocation(invocation: CtlInvocation): void {
+  assertBoundedProcessToken(invocation.verb, "ctl verb");
+  if (invocation.args.length > MAX_CAMPAIGN_ARGS) {
+    throw new CampaignError(
+      "MalformedEnvelope",
+      `ctl argv exceeds ${MAX_CAMPAIGN_ARGS} arguments`,
+    );
+  }
+  for (const argument of invocation.args) {
+    assertBoundedProcessToken(argument, "ctl argument");
+  }
 }
 
 /**
@@ -447,8 +880,8 @@ export class ProcessCtlDispatcher implements CtlDispatcher {
   private readonly baseArgs: readonly string[];
   private readonly socketPath: string | undefined;
   private readonly timeoutMs: number;
-  private readonly env: Record<string, string>;
-  private readonly elevationScopes: string;
+  private readonly env: Record<string, string | undefined>;
+  private readonly elevationScopes: ReadonlySet<string>;
   private readonly cwd: string | undefined;
   private readonly spawn: SpawnSyncFn;
 
@@ -457,12 +890,39 @@ export class ProcessCtlDispatcher implements CtlDispatcher {
     spawn: SpawnSyncFn = defaultSpawnSync,
   ) {
     this.program = config.program ?? "bitty";
-    this.baseArgs = config.baseArgs ?? ["ctl"];
+    this.baseArgs = [...(config.baseArgs ?? ["ctl"])];
     this.socketPath = config.socketPath;
     this.timeoutMs = config.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-    this.env = config.env ?? {};
-    this.elevationScopes = config.elevationScopes ?? DEFAULT_ELEVATION_SCOPES;
+    this.env = buildCampaignChildEnvironment(
+      {},
+      { ...(config.env ?? {}), BITTY_CTL_ELEVATE: undefined },
+    );
+    this.elevationScopes = parseElevationScopes(
+      config.elevationScopes ?? DEFAULT_ELEVATION_SCOPES,
+    );
     this.cwd = config.cwd;
+    assertBoundedProcessToken(this.program, "ctl program");
+    if (this.baseArgs.length > MAX_CAMPAIGN_ARGS) {
+      throw new CampaignError(
+        "MalformedEnvelope",
+        `ctl base argv exceeds ${MAX_CAMPAIGN_ARGS} arguments`,
+      );
+    }
+    for (const argument of this.baseArgs) {
+      assertBoundedProcessToken(argument, "ctl base argument");
+    }
+    if (this.socketPath !== undefined) {
+      assertBoundedProcessToken(this.socketPath, "ctl socket path");
+    }
+    if (this.cwd !== undefined) {
+      assertBoundedProcessToken(this.cwd, "ctl working directory");
+    }
+    if (!Number.isSafeInteger(this.timeoutMs) || this.timeoutMs <= 0) {
+      throw new CampaignError(
+        "MalformedEnvelope",
+        "ctl timeout must be a positive safe integer",
+      );
+    }
     this.spawn = spawn;
   }
 
@@ -474,15 +934,37 @@ export class ProcessCtlDispatcher implements CtlDispatcher {
   }
 
   async dispatch(invocation: CtlInvocation): Promise<CtlResult> {
+    assertBoundedInvocation(invocation);
     const args = [...this.baseArgs];
     if (this.socketPath !== undefined) {
       args.push("--socket", this.socketPath);
     }
     args.push(...invocation.args);
+    if (args.length > MAX_CAMPAIGN_ARGS) {
+      throw new CampaignError(
+        "MalformedEnvelope",
+        `ctl argv exceeds ${MAX_CAMPAIGN_ARGS} arguments`,
+      );
+    }
     const env: Record<string, string | undefined> = { ...this.env };
-    env["BITTY_CTL_ELEVATE"] = invocation.elevated
-      ? this.elevationScopes
-      : undefined;
+    if (invocation.elevated) {
+      const required = ELEVATION_SCOPE_BY_VERB[invocation.verb];
+      if (required === undefined) {
+        throw new CampaignError(
+          "MalformedEnvelope",
+          "elevated ctl verb has no per-verb scope mapping",
+        );
+      }
+      if (!this.elevationScopes.has(required)) {
+        throw new CampaignError(
+          "MalformedEnvelope",
+          "elevated ctl verb is outside the configured scope allowlist",
+        );
+      }
+      env["BITTY_CTL_ELEVATE"] = required;
+    } else {
+      env["BITTY_CTL_ELEVATE"] = undefined;
+    }
     return this.spawn(this.program, args, {
       timeoutMs: this.timeoutMs,
       env,
@@ -507,11 +989,13 @@ const OUTCOME_EXIT: Record<ExpectedOutcome, number> = {
   notfound: EXIT_GENERIC,
 };
 
-const OUTCOME_CLASS: Partial<Record<ExpectedOutcome, string>> = {
-  denied: "Denied",
-  conflict: "Conflict",
-  unavailable: "Unavailable",
-  notfound: "NotFound",
+const OUTCOME_ERROR: Partial<
+  Record<ExpectedOutcome, { class: string; code: string }>
+> = {
+  denied: { class: "Denied", code: "ScopeDenied" },
+  conflict: { class: "Conflict", code: "Conflict" },
+  unavailable: { class: "Unavailable", code: "Transport" },
+  notfound: { class: "NotFound", code: "NotFound" },
 };
 
 export type VerbExpectation = {
@@ -551,6 +1035,7 @@ export type KeystrokeProbeTarget = {
 export const KEYSTROKE_PROBE_PAYLOAD = "echo BITTY_CAMPAIGN_PROBE" as const;
 
 const TERMINAL_ID_RE = /^t:\d+$/;
+const VIEW_ID_RE = /^v:\d+$/;
 
 /**
  * Validate an explicit keystroke-probe target. Fails closed unless the caller
@@ -571,7 +1056,7 @@ export function assertKeystrokeProbeTarget(target: KeystrokeProbeTarget): void {
   ) {
     throw new CampaignError(
       "MissingField",
-      `invalid keystroke probe terminal id '${target.terminalId}' (want t:<n>)`,
+      "keystroke probe terminal id is invalid",
     );
   }
   if (target.terminalId === "t:1") {
@@ -775,12 +1260,47 @@ export type ProbeResult = {
   evidence: readonly string[];
 };
 
+function safeReportText(value: string): string {
+  const redacted = redactSensitiveText(value);
+  const sanitized = sanitizeTerminalOutput(
+    redacted,
+    MAX_CAMPAIGN_REPORT_TEXT_BYTES,
+  );
+  if (
+    new TextEncoder().encode(sanitized).length <
+    new TextEncoder().encode(redacted).length
+  ) {
+    const suffix = "...[truncated]";
+    const prefixLimit = Math.max(
+      0,
+      MAX_CAMPAIGN_REPORT_TEXT_BYTES - new TextEncoder().encode(suffix).length,
+    );
+    return `${truncateToBytes(sanitized, prefixLimit)}${suffix}`;
+  }
+  return sanitized;
+}
+
+function normalizeProbeResult(result: ProbeResult): ProbeResult {
+  const status: ProbeStatus =
+    result.status === "pass" || result.status === "skip"
+      ? result.status
+      : "fail";
+  return {
+    name: safeReportText(result.name),
+    status,
+    detail: safeReportText(result.detail),
+    evidence: result.evidence
+      .slice(0, MAX_CAMPAIGN_REPORT_EVIDENCE_ITEMS)
+      .map(safeReportText),
+  };
+}
+
 function pass(
   name: string,
   detail: string,
   evidence: readonly string[] = [],
 ): ProbeResult {
-  return { name, status: "pass", detail, evidence };
+  return normalizeProbeResult({ name, status: "pass", detail, evidence });
 }
 
 function fail(
@@ -788,7 +1308,7 @@ function fail(
   detail: string,
   evidence: readonly string[] = [],
 ): ProbeResult {
-  return { name, status: "fail", detail, evidence };
+  return normalizeProbeResult({ name, status: "fail", detail, evidence });
 }
 
 function skip(
@@ -796,11 +1316,77 @@ function skip(
   detail: string,
   evidence: readonly string[] = [],
 ): ProbeResult {
-  return { name, status: "skip", detail, evidence };
+  return normalizeProbeResult({ name, status: "skip", detail, evidence });
 }
 
-function expectedClassFor(outcome: ExpectedOutcome): string | undefined {
-  return OUTCOME_CLASS[outcome];
+function expectedErrorFor(
+  outcome: ExpectedOutcome,
+): { class: string; code: string } | undefined {
+  return OUTCOME_ERROR[outcome];
+}
+
+function assertBoundedVerbExpectation(
+  value: unknown,
+): asserts value is VerbExpectation {
+  if (!isRecord(value)) {
+    throw new CampaignError(
+      "MalformedEnvelope",
+      "campaign matrix row is invalid",
+    );
+  }
+  const allowed = new Set([
+    "verb",
+    "args",
+    "outcome",
+    "elevated",
+    "note",
+    "keystroke",
+  ]);
+  if (
+    Object.keys(value).some((key) => !allowed.has(key)) ||
+    typeof value["verb"] !== "string" ||
+    value["verb"].length === 0 ||
+    utf8Bytes(value["verb"]) > MAX_CAMPAIGN_IDENTIFIER_BYTES ||
+    hasControlCharacters(value["verb"]) ||
+    typeof value["elevated"] !== "boolean" ||
+    !Array.isArray(value["args"]) ||
+    value["args"].length > MAX_CAMPAIGN_ARGS ||
+    !["ok", "denied", "conflict", "unavailable", "notfound", "usage"].includes(
+      value["outcome"] as string,
+    ) ||
+    typeof value["note"] !== "string" ||
+    utf8Bytes(value["note"]) > MAX_CAMPAIGN_REPORT_TEXT_BYTES ||
+    hasControlCharacters(value["note"]) ||
+    (value["keystroke"] !== undefined &&
+      typeof value["keystroke"] !== "boolean")
+  ) {
+    throw new CampaignError(
+      "MalformedEnvelope",
+      "campaign matrix row is invalid",
+    );
+  }
+  for (const argument of value["args"]) {
+    if (typeof argument !== "string") {
+      throw new CampaignError(
+        "MalformedEnvelope",
+        "campaign matrix argument is invalid",
+      );
+    }
+    assertBoundedProcessToken(argument, "campaign matrix argument");
+  }
+}
+
+function campaignMatrixProblem(matrix: unknown): string | undefined {
+  if (!Array.isArray(matrix)) return "campaign matrix is invalid";
+  if (matrix.length > MAX_CAMPAIGN_MATRIX_ROWS) {
+    return `campaign matrix exceeds ${MAX_CAMPAIGN_MATRIX_ROWS} rows`;
+  }
+  try {
+    for (const row of matrix) assertBoundedVerbExpectation(row);
+    return undefined;
+  } catch (error) {
+    return campaignFailureMessage(error);
+  }
 }
 
 /**
@@ -819,6 +1405,10 @@ export async function probeEnvelopeConformance(
   matrix: readonly VerbExpectation[] = CTL_VERB_MATRIX,
   opts: { keystrokeTarget?: KeystrokeProbeTarget } = {},
 ): Promise<ProbeResult[]> {
+  const matrixProblem = campaignMatrixProblem(matrix);
+  if (matrixProblem !== undefined) {
+    return [fail(campaignMatrixFailureName(matrix), matrixProblem)];
+  }
   const results: ProbeResult[] = [];
   const allowKeystrokes = keystrokeProbeOptIn(opts.keystrokeTarget);
   for (const expectation of matrix) {
@@ -828,7 +1418,6 @@ export async function probeEnvelopeConformance(
         fail(
           name,
           "keystroke probe refused: pass an explicit keystrokeTarget with allowLiveKeystrokes:true and a non-default terminal id",
-          [`verb=${expectation.verb}`],
         ),
       );
       continue;
@@ -840,10 +1429,9 @@ export async function probeEnvelopeConformance(
         args: expectation.args,
         elevated: expectation.elevated,
       });
-    } catch (err) {
-      results.push(
-        fail(name, `dispatch threw: ${campaignFailureMessage(err)}`),
-      );
+      assertBoundedCtlResult(result);
+    } catch (error) {
+      results.push(fail(name, campaignFailureMessage(error)));
       continue;
     }
     const evidence = [`exit=${result.exitCode}`];
@@ -873,9 +1461,25 @@ export async function probeEnvelopeConformance(
     let envelope: CtlEnvelope;
     try {
       envelope = parseCtlEnvelope(result.stdout);
-    } catch (err) {
-      results.push(fail(name, campaignFailureMessage(err), evidence));
+    } catch (error) {
+      results.push(fail(name, campaignFailureMessage(error), evidence));
       continue;
+    }
+    if (
+      envelope.command !== `core.${canonicalProjectionVerb(expectation.verb)}`
+    ) {
+      results.push(
+        fail(name, "envelope command did not match the verb", evidence),
+      );
+      continue;
+    }
+    if (envelope.ok) {
+      try {
+        assertCtlResultProjection(expectation.verb, envelope);
+      } catch (error) {
+        results.push(fail(name, campaignFailureMessage(error), evidence));
+        continue;
+      }
     }
     evidence.push(`ok=${envelope.ok}`);
     const expectOk = expectation.outcome === "ok";
@@ -890,32 +1494,29 @@ export async function probeEnvelopeConformance(
       continue;
     }
     if (!envelope.ok) {
-      const expectedClass = expectedClassFor(expectation.outcome);
+      const expectedError = expectedErrorFor(expectation.outcome);
       if (
-        expectedClass !== undefined &&
-        envelope.error.class !== expectedClass
+        expectedError !== undefined &&
+        (envelope.error.class !== expectedError.class ||
+          envelope.error.code !== expectedError.code)
       ) {
         results.push(
-          fail(
-            name,
-            `expected class ${expectedClass}, got ${envelope.error.class}/${envelope.error.code}`,
-            [
-              ...evidence,
-              `class=${envelope.error.class}`,
-              `code=${envelope.error.code}`,
-            ],
-          ),
+          fail(name, "error class/code did not match expectation", [
+            ...evidence,
+            `class=${expectedError.class}`,
+            `code=${expectedError.code}`,
+          ]),
         );
         continue;
       }
     }
     if (result.exitCode !== expectedExit) {
       results.push(
-        fail(name, `expected exit ${expectedExit}, got ${result.exitCode}`, [
-          ...evidence,
-          `class=${envelope.ok ? "-" : envelope.error.class}`,
-          `code=${envelope.ok ? "-" : envelope.error.code}`,
-        ]),
+        fail(
+          name,
+          `expected exit ${expectedExit}, got ${result.exitCode}`,
+          evidence,
+        ),
       );
       continue;
     }
@@ -935,7 +1536,7 @@ export async function probeEnvelopeConformance(
 // ---------------------------------------------------------------------------
 
 const WORKSPACE_NAME_RE = /^ws(\d+)$/;
-const WORKSPACE_ID_RE = /^ws:\d+$/;
+const WORKSPACE_ID_RE = /^ws:(\d+)$/;
 
 /**
  * Validate a workspace identifier before it is spliced into spawned `ctl`
@@ -950,10 +1551,25 @@ export function assertSafeWorkspaceId(identifier: string): void {
   if (WORKSPACE_ID_RE.test(identifier) || WORKSPACE_NAME_RE.test(identifier)) {
     return;
   }
-  throw new CampaignError(
-    "MissingField",
-    `invalid workspace id '${identifier}' (want ws:<n> or ws<n>)`,
-  );
+  throw new CampaignError("MissingField", "workspace identifier is invalid");
+}
+
+function canonicalWorkspaceId(identifier: string): string | undefined {
+  const bare = WORKSPACE_NAME_RE.exec(identifier);
+  if (bare?.[1] !== undefined) {
+    return `ws:${bare[1].replace(/^0+(?=\d)/, "")}`;
+  }
+  const canonical = WORKSPACE_ID_RE.exec(identifier);
+  if (canonical?.[1] !== undefined) {
+    return `ws:${canonical[1].replace(/^0+(?=\d)/, "")}`;
+  }
+  return undefined;
+}
+
+function campaignMatrixFailureName(matrix: unknown): string {
+  return Array.isArray(matrix) && matrix.length > MAX_CAMPAIGN_MATRIX_ROWS
+    ? "campaign:matrix-limit"
+    : "campaign:matrix-invalid";
 }
 
 /** Candidate verb ids for a listed workspace identifier (`ws4` -> `ws:4`). */
@@ -972,6 +1588,7 @@ export function workspaceNamesFrom(envelope: CtlEnvelope): string[] {
   if (!envelope.ok) {
     throw new CampaignError("MissingField", "workspace list returned an error");
   }
+  assertCtlResultProjection("workspace.list", envelope);
   const result = envelope.result;
   if (!isRecord(result) || !Array.isArray(result["workspaces"])) {
     throw new CampaignError(
@@ -979,7 +1596,30 @@ export function workspaceNamesFrom(envelope: CtlEnvelope): string[] {
       "workspace list result.workspaces missing",
     );
   }
-  return result["workspaces"].filter((v): v is string => typeof v === "string");
+  const workspaces = result["workspaces"];
+  if (workspaces.length > MAX_CAMPAIGN_WORKSPACES) {
+    throw new CampaignError(
+      "OutputTooLarge",
+      `workspace list exceeds ${MAX_CAMPAIGN_WORKSPACES} items`,
+    );
+  }
+  const identifiers: string[] = [];
+  for (const [index, workspace] of workspaces.entries()) {
+    try {
+      assertBoundedString(
+        "workspace identifier",
+        workspace,
+        MAX_CAMPAIGN_IDENTIFIER_BYTES,
+      );
+    } catch {
+      throw new CampaignError(
+        "MalformedEnvelope",
+        `workspace identifier at index ${index} is invalid`,
+      );
+    }
+    identifiers.push(workspace);
+  }
+  return identifiers;
 }
 
 /** Read `result.created` from a workspace-new envelope. */
@@ -987,25 +1627,500 @@ export function workspaceCreatedFrom(envelope: CtlEnvelope): string {
   if (!envelope.ok) {
     throw new CampaignError("MissingField", "workspace new returned an error");
   }
+  assertCtlResultProjection("workspace.new", envelope);
   const result = envelope.result;
-  if (!isRecord(result) || typeof result["created"] !== "string") {
+  if (!isRecord(result)) {
     throw new CampaignError(
       "MissingField",
       "workspace new result.created missing",
     );
   }
+  assertBoundedString(
+    "workspace created identifier",
+    result["created"],
+    MAX_CAMPAIGN_IDENTIFIER_BYTES,
+  );
   return result["created"];
+}
+
+function projectionObjectProblems(
+  value: unknown,
+  keys: readonly string[],
+): string[] {
+  if (!isRecord(value)) return ["result must be an object"];
+  const allowed = new Set(keys);
+  const problems: string[] = [];
+  if (Object.keys(value).some((key) => !allowed.has(key))) {
+    problems.push("result has unexpected fields");
+  }
+  if (keys.some((key) => !Object.hasOwn(value, key))) {
+    problems.push("result is missing required fields");
+  }
+  return problems;
+}
+
+function projectionStringProblem(
+  value: unknown,
+  field: string,
+  maxBytes = MAX_CAMPAIGN_STRING_BYTES,
+  allowEmpty = false,
+): string[] {
+  if (
+    typeof value !== "string" ||
+    (!allowEmpty && value.length === 0) ||
+    utf8Bytes(value) > maxBytes
+  ) {
+    return [`result.${field} must be a bounded string`];
+  }
+  return [];
+}
+
+function projectionArrayProblem(value: unknown, field: string): string[] {
+  if (!Array.isArray(value) || value.length > MAX_CAMPAIGN_ARRAY_ITEMS) {
+    return [`result.${field} must be a bounded array`];
+  }
+  return [];
+}
+
+function projectionRecordProblem(
+  value: unknown,
+  keys: readonly string[],
+): string[] {
+  return projectionObjectProblems(value, keys);
+}
+
+function canonicalProjectionVerb(verb: string): string {
+  if (verb === "view.list.no-instance") return "view.list";
+  if (
+    verb === "workspace.list.baseline" ||
+    verb === "workspace.list.after-new"
+  ) {
+    return "workspace.list";
+  }
+  if (verb === "view.list.before" || verb === "view.list.after") {
+    return "view.list";
+  }
+  if (verb === "terminal.list.before" || verb === "terminal.list.after") {
+    return "terminal.list";
+  }
+  return verb;
+}
+
+function ctlResultProjectionProblems(
+  verb: string,
+  envelope: CtlEnvelope,
+): string[] {
+  if (!envelope.ok) return [];
+  const result = envelope.result;
+  const canonicalVerb = canonicalProjectionVerb(verb);
+  const problems: string[] = [];
+  const requireIdentifier = (
+    value: unknown,
+    pattern: RegExp,
+    field: string,
+  ): void => {
+    if (typeof value !== "string" || !pattern.test(value)) {
+      problems.push(`result.${field} has an invalid identifier`);
+    }
+  };
+
+  switch (canonicalVerb) {
+    case "instance.list": {
+      problems.push(...projectionObjectProblems(result, ["instances"]));
+      const instances = isRecord(result) ? result["instances"] : undefined;
+      problems.push(...projectionArrayProblem(instances, "instances"));
+      if (Array.isArray(instances)) {
+        const instanceIds = new Set<string>();
+        for (const instance of instances) {
+          problems.push(
+            ...projectionRecordProblem(instance, [
+              "instance",
+              "socket",
+              "live",
+            ]),
+          );
+          if (isRecord(instance)) {
+            problems.push(
+              ...projectionStringProblem(
+                instance["instance"],
+                "instance",
+                MAX_CAMPAIGN_IDENTIFIER_BYTES,
+              ),
+              ...projectionStringProblem(instance["socket"], "socket"),
+            );
+            if (instance["live"] !== true) {
+              problems.push("result.instances contains a non-live record");
+            }
+            if (
+              typeof instance["instance"] === "string" &&
+              instanceIds.has(instance["instance"])
+            ) {
+              problems.push("result.instances contains a duplicate id");
+            } else if (typeof instance["instance"] === "string") {
+              instanceIds.add(instance["instance"]);
+            }
+          }
+        }
+      }
+      break;
+    }
+    case "window.list": {
+      problems.push(...projectionObjectProblems(result, ["windows"]));
+      const windows = isRecord(result) ? result["windows"] : undefined;
+      problems.push(...projectionArrayProblem(windows, "windows"));
+      if (Array.isArray(windows)) {
+        const windowIds = new Set<string>();
+        for (const window of windows) {
+          problems.push(...projectionRecordProblem(window, ["id"]));
+          if (isRecord(window))
+            requireIdentifier(window["id"], /^w:\d+$/, "windows.id");
+          if (
+            isRecord(window) &&
+            typeof window["id"] === "string" &&
+            windowIds.has(window["id"])
+          ) {
+            problems.push("result.windows contains a duplicate id");
+          } else if (isRecord(window) && typeof window["id"] === "string") {
+            windowIds.add(window["id"]);
+          }
+        }
+      }
+      break;
+    }
+    case "view.list":
+      try {
+        viewsFrom(envelope);
+      } catch {
+        problems.push("view list projection is invalid");
+      }
+      break;
+    case "terminal.list":
+      try {
+        terminalsFrom(envelope);
+      } catch {
+        problems.push("terminal list projection is invalid");
+      }
+      break;
+    case "terminal.text":
+      try {
+        const text = terminalTextFrom(envelope);
+        if (utf8Bytes(text) > MAX_CAMPAIGN_STRING_BYTES) {
+          problems.push("terminal text projection is oversized");
+        }
+      } catch {
+        problems.push("terminal text projection is invalid");
+      }
+      break;
+    case "workspace.list": {
+      problems.push(
+        ...projectionObjectProblems(result, [
+          "workspaces",
+          "names",
+          "active",
+          "active_id",
+          "count",
+          "tabline",
+        ]),
+      );
+      if (isRecord(result)) {
+        const workspaces = result["workspaces"];
+        const names = result["names"];
+        problems.push(
+          ...projectionArrayProblem(workspaces, "workspaces"),
+          ...projectionArrayProblem(names, "names"),
+          ...projectionStringProblem(
+            result["tabline"],
+            "tabline",
+            MAX_CAMPAIGN_STRING_BYTES,
+            true,
+          ),
+        );
+        if (Array.isArray(workspaces)) {
+          const identifiers = new Set<string>();
+          for (const [index, workspace] of workspaces.entries()) {
+            problems.push(
+              ...projectionStringProblem(
+                workspace,
+                `workspaces.${index}`,
+                MAX_CAMPAIGN_IDENTIFIER_BYTES,
+              ),
+            );
+            if (typeof workspace === "string") {
+              try {
+                assertSafeWorkspaceId(workspace);
+                const canonical = canonicalWorkspaceId(workspace);
+                if (canonical === undefined || identifiers.has(canonical)) {
+                  problems.push("workspace list projection has an invalid id");
+                } else {
+                  identifiers.add(canonical);
+                }
+              } catch {
+                problems.push("workspace list projection has an invalid id");
+              }
+            }
+          }
+          if (Array.isArray(names)) {
+            if (names.length !== workspaces.length) {
+              problems.push("workspace names count does not match ids");
+            }
+            for (const [index, name] of names.entries()) {
+              problems.push(
+                ...projectionStringProblem(
+                  name,
+                  `names.${index}`,
+                  MAX_CAMPAIGN_STRING_BYTES,
+                  true,
+                ),
+              );
+            }
+          }
+          if (
+            !Number.isSafeInteger(result["count"]) ||
+            result["count"] !== workspaces.length
+          ) {
+            problems.push("workspace count does not match ids");
+          }
+          if (
+            !Number.isSafeInteger(result["active"]) ||
+            (result["active"] as number) < 1 ||
+            (result["active"] as number) > workspaces.length ||
+            typeof result["active_id"] !== "string" ||
+            canonicalWorkspaceId(result["active_id"]) === undefined ||
+            !identifiers.has(canonicalWorkspaceId(result["active_id"]) ?? "")
+          ) {
+            problems.push("workspace active projection is invalid");
+          }
+        }
+      }
+      break;
+    }
+    case "workspace.new": {
+      problems.push(
+        ...projectionObjectProblems(result, ["created", "tabline"]),
+      );
+      if (isRecord(result)) {
+        problems.push(
+          ...projectionStringProblem(
+            result["created"],
+            "created",
+            MAX_CAMPAIGN_IDENTIFIER_BYTES,
+          ),
+        );
+        problems.push(
+          ...projectionStringProblem(
+            result["tabline"],
+            "tabline",
+            MAX_CAMPAIGN_STRING_BYTES,
+            true,
+          ),
+        );
+        try {
+          assertSafeWorkspaceId(result["created"] as string);
+        } catch {
+          problems.push("workspace created projection is invalid");
+        }
+      }
+      break;
+    }
+    case "workspace.focus": {
+      problems.push(
+        ...projectionObjectProblems(result, ["focused", "tabline"]),
+      );
+      if (isRecord(result)) {
+        problems.push(
+          ...projectionStringProblem(
+            result["focused"],
+            "focused",
+            MAX_CAMPAIGN_IDENTIFIER_BYTES,
+          ),
+        );
+        problems.push(
+          ...projectionStringProblem(
+            result["tabline"],
+            "tabline",
+            MAX_CAMPAIGN_STRING_BYTES,
+            true,
+          ),
+        );
+        try {
+          assertSafeWorkspaceId(result["focused"] as string);
+        } catch {
+          problems.push("workspace focus projection is invalid");
+        }
+      }
+      break;
+    }
+    case "view.split": {
+      problems.push(...projectionObjectProblems(result, ["split", "new_view"]));
+      if (isRecord(result)) {
+        if (
+          !["left", "right", "up", "down"].includes(result["split"] as string)
+        ) {
+          problems.push("view split direction is invalid");
+        }
+        requireIdentifier(result["new_view"], VIEW_ID_RE, "new_view");
+      }
+      break;
+    }
+    case "view.focus": {
+      problems.push(...projectionObjectProblems(result, ["focused"]));
+      if (isRecord(result))
+        requireIdentifier(result["focused"], VIEW_ID_RE, "focused");
+      break;
+    }
+    case "terminal.spawn":
+      try {
+        terminalSpawnedFrom(envelope);
+      } catch {
+        problems.push("terminal spawn projection is invalid");
+      }
+      break;
+    case "terminal.close": {
+      problems.push(...projectionObjectProblems(result, ["closed"]));
+      if (isRecord(result))
+        requireIdentifier(result["closed"], TERMINAL_ID_RE, "closed");
+      break;
+    }
+    case "workspace.close": {
+      problems.push(
+        ...projectionObjectProblems(result, ["closed", "killed", "tabline"]),
+      );
+      if (isRecord(result)) {
+        requireIdentifier(result["closed"], WORKSPACE_ID_RE, "closed");
+        if (typeof result["killed"] !== "boolean") {
+          problems.push("workspace close killed projection is invalid");
+        }
+        problems.push(
+          ...projectionStringProblem(
+            result["tabline"],
+            "tabline",
+            MAX_CAMPAIGN_STRING_BYTES,
+            true,
+          ),
+        );
+      }
+      break;
+    }
+    case "terminal.send": {
+      problems.push(...projectionObjectProblems(result, ["sent_to", "bytes"]));
+      if (isRecord(result)) {
+        requireIdentifier(result["sent_to"], TERMINAL_ID_RE, "sent_to");
+        if (
+          !Number.isSafeInteger(result["bytes"]) ||
+          (result["bytes"] as number) < 0
+        ) {
+          problems.push("terminal send byte count is invalid");
+        }
+      }
+      break;
+    }
+    case "config.reload": {
+      problems.push(
+        ...projectionObjectProblems(result, [
+          "probed",
+          "applied",
+          "path",
+          "hot_swap",
+        ]),
+      );
+      if (isRecord(result)) {
+        if (
+          result["probed"] !== true ||
+          result["applied"] !== false ||
+          result["hot_swap"] !== "follow-up"
+        ) {
+          problems.push("config reload outcome projection is invalid");
+        }
+        problems.push(
+          ...projectionStringProblem(result["path"], "path"),
+          ...projectionStringProblem(result["hot_swap"], "hot_swap", 128),
+        );
+      }
+      break;
+    }
+    default:
+      problems.push(`result projection for ${canonicalVerb} is unavailable`);
+  }
+  return [...new Set(problems)].slice(0, 8);
+}
+
+function assertCtlResultProjection(verb: string, envelope: CtlEnvelope): void {
+  const problems = ctlResultProjectionProblems(verb, envelope);
+  if (problems.length > 0) {
+    throw new CampaignError(
+      "MalformedEnvelope",
+      safeReportText(
+        `ctl result projection is invalid: ${problems.join("; ")}`,
+      ),
+    );
+  }
+}
+
+async function dispatchRawEnvelope(
+  dispatcher: CtlDispatcher,
+  invocation: CtlInvocation,
+): Promise<CtlEnvelope> {
+  const result = await dispatcher.dispatch(invocation);
+  assertBoundedCtlResult(result);
+  if (result.timedOut) {
+    throw new CampaignError("EmptyOutput", "ctl invocation timed out");
+  }
+  const envelope = parseCtlEnvelopeShape(result.stdout);
+  if (envelope.command !== `core.${canonicalProjectionVerb(invocation.verb)}`) {
+    throw new CampaignError(
+      "MalformedEnvelope",
+      "ctl envelope command does not match the invocation",
+    );
+  }
+  return envelope;
 }
 
 async function dispatchEnvelope(
   dispatcher: CtlDispatcher,
   invocation: CtlInvocation,
 ): Promise<CtlEnvelope> {
-  const result = await dispatcher.dispatch(invocation);
-  if (result.timedOut) {
-    throw new CampaignError("EmptyOutput", `${invocation.verb} timed out`);
+  const envelope = await dispatchRawEnvelope(dispatcher, invocation);
+  assertCtlResultProjection(invocation.verb, envelope);
+  return envelope;
+}
+
+type WorkspaceObservation = {
+  ids: string[];
+  problems: number;
+};
+
+function observeWorkspaceIds(envelope: CtlEnvelope): WorkspaceObservation {
+  let problems = ctlResultProjectionProblems("workspace.list", envelope).length;
+  const ids: string[] = [];
+  if (!envelope.ok || !isRecord(envelope.result)) {
+    return { ids, problems: problems + 1 };
   }
-  return parseCtlEnvelope(result.stdout);
+  const workspaces = envelope.result["workspaces"];
+  if (
+    !Array.isArray(workspaces) ||
+    workspaces.length > MAX_CAMPAIGN_WORKSPACES
+  ) {
+    return { ids, problems: problems + 1 };
+  }
+  const seen = new Set<string>();
+  for (const workspace of workspaces) {
+    if (typeof workspace !== "string") {
+      problems += 1;
+      continue;
+    }
+    const canonical = canonicalWorkspaceId(workspace);
+    if (canonical === undefined) {
+      problems += 1;
+      continue;
+    }
+    if (seen.has(canonical)) {
+      problems += 1;
+      continue;
+    }
+    seen.add(canonical);
+    ids.push(canonical);
+  }
+  return { ids, problems };
 }
 
 /**
@@ -1015,12 +2130,13 @@ async function dispatchEnvelope(
  */
 export async function probeWorkspaceIdRoundTrip(
   dispatcher: CtlDispatcher,
-  opts: { elevated?: boolean } = {},
+  _opts: { elevated?: boolean } = {},
 ): Promise<ProbeResult> {
   const name = "workspace:id-round-trip";
   const evidence: string[] = [];
   const problems: string[] = [];
-  let owned: string | undefined;
+  const declared = new Set<string>();
+  const owned = new Set<string>();
   let count = 0;
   try {
     const listed = workspaceNamesFrom(
@@ -1030,97 +2146,129 @@ export async function probeWorkspaceIdRoundTrip(
         elevated: false,
       }),
     );
-    evidence.push(`baseline=[${listed.join(",")}]`);
-    const baseline = new Set(
-      listed.map((id) => {
-        assertSafeWorkspaceId(id);
-        return id.replace(/^ws:?0*(?=\d)/, "ws:");
-      }),
-    );
-
-    const created = workspaceCreatedFrom(
-      await dispatchEnvelope(dispatcher, {
-        verb: "workspace.new",
-        args: ["workspace", "new", "--format", "json"],
-        elevated: false,
-      }),
-    );
-    evidence.push(`created=${created}`);
-    if (!WORKSPACE_ID_RE.test(created)) {
-      throw new CampaignError(
-        "MissingField",
-        `workspace new created non-id '${created}'`,
-      );
+    evidence.push(`baseline.count=${listed.length}`);
+    const baseline = new Set<string>();
+    for (const identifier of listed) {
+      const canonical = canonicalWorkspaceId(identifier);
+      if (canonical === undefined) {
+        throw new CampaignError(
+          "MissingField",
+          "workspace identifier is invalid",
+        );
+      }
+      baseline.add(canonical);
     }
-    if (baseline.has(created.replace(/^ws:?0*(?=\d)/, "ws:"))) {
-      throw new CampaignError(
-        "MissingField",
-        "workspace new returned a pre-existing id",
-      );
-    }
-    owned = created;
 
-    const afterNew = workspaceNamesFrom(
-      await dispatchEnvelope(dispatcher, {
+    try {
+      const created = workspaceCreatedFrom(
+        await dispatchEnvelope(dispatcher, {
+          verb: "workspace.new",
+          args: ["workspace", "new", "--format", "json"],
+          elevated: false,
+        }),
+      );
+      const canonical = canonicalWorkspaceId(created);
+      if (canonical === undefined) {
+        problems.push("workspace new projection is invalid");
+      } else if (baseline.has(canonical)) {
+        problems.push("workspace new reported a baseline identifier");
+      } else {
+        declared.add(canonical);
+        owned.add(canonical);
+        evidence.push("created=true");
+      }
+    } catch (error) {
+      problems.push(campaignFailureMessage(error));
+    }
+
+    const observation = observeWorkspaceIds(
+      await dispatchRawEnvelope(dispatcher, {
         verb: "workspace.list.after-new",
         args: ["workspace", "list", "--format", "json"],
         elevated: false,
       }),
     );
-    evidence.push(`afterNew=[${afterNew.join(",")}]`);
-
-    count = afterNew.length;
-    if (afterNew.length === 0) {
+    count = observation.ids.length;
+    evidence.push(`afterNew.count=${count}`);
+    if (observation.problems > 0) {
+      problems.push("workspace post-create projection is invalid");
+    }
+    const observedOwned = new Set<string>();
+    for (const identifier of observation.ids) {
+      if (baseline.has(identifier)) continue;
+      owned.add(identifier);
+      observedOwned.add(identifier);
+      if (!declared.has(identifier)) {
+        problems.push("workspace list contained an unexpected new identifier");
+      }
+    }
+    if (
+      declared.size > 0 &&
+      [...declared].some((identifier) => !observedOwned.has(identifier))
+    ) {
+      problems.push("workspace create response was not observed");
+    }
+    if (observation.ids.length === 0) {
       problems.push("workspace list empty after new");
     }
-    for (const identifier of afterNew) {
-      try {
-        assertSafeWorkspaceId(identifier);
-      } catch {
-        problems.push(`listed id '${identifier}' is not a workspace id`);
-        continue;
-      }
-      let accepted = false;
-      const candidates = workspaceIdCandidates(identifier);
-      for (const candidate of candidates) {
-        const focused = await dispatchEnvelope(dispatcher, {
-          verb: "workspace.focus",
-          args: ["workspace", "focus", candidate, "--format", "json"],
-          elevated: false,
-        });
-        if (focused.ok) {
-          accepted = true;
-          evidence.push(`focus(${candidate})=ok`);
-          break;
+
+    if (observation.problems === 0) {
+      for (const [index, identifier] of observation.ids.entries()) {
+        let accepted = false;
+        for (const candidate of workspaceIdCandidates(identifier)) {
+          const focused = await dispatchEnvelope(dispatcher, {
+            verb: "workspace.focus",
+            args: ["workspace", "focus", candidate, "--format", "json"],
+            elevated: false,
+          });
+          const returned =
+            focused.ok && isRecord(focused.result)
+              ? focused.result["focused"]
+              : undefined;
+          if (
+            focused.ok &&
+            typeof returned === "string" &&
+            canonicalWorkspaceId(returned) === canonicalWorkspaceId(candidate)
+          ) {
+            accepted = true;
+            evidence.push(`focus.${index}=ok`);
+            break;
+          }
+          if (focused.ok) {
+            evidence.push(`focus.${index}=mismatch`);
+          }
+          evidence.push(`focus.${index}=rejected`);
         }
-        evidence.push(
-          `focus(${candidate})=${focused.error.class}/${focused.error.code}`,
-        );
-      }
-      if (!accepted) {
-        problems.push(`listed id ${identifier} rejected by focus`);
+        if (!accepted) {
+          problems.push(`workspace identifier at index ${index} was rejected`);
+        }
       }
     }
-  } catch (err) {
-    problems.push(campaignFailureMessage(err));
+  } catch (error) {
+    problems.push(campaignFailureMessage(error));
   } finally {
-    if (opts.elevated === true && owned !== undefined) {
+    for (const identifier of [...owned].sort()) {
       try {
         const closed = await dispatchEnvelope(dispatcher, {
           verb: "workspace.close",
-          args: ["workspace", "close", owned, "--format", "json"],
+          args: ["workspace", "close", identifier, "--format", "json"],
           elevated: true,
         });
-        if (!closed.ok) {
-          problems.push(
-            `owned id ${owned} rejected by close (${closed.error.class}/${closed.error.code})`,
-          );
+        if (
+          closed.ok &&
+          isRecord(closed.result) &&
+          typeof closed.result["closed"] === "string" &&
+          canonicalWorkspaceId(closed.result["closed"]) === identifier
+        ) {
+          evidence.push("owned.cleanup=ok");
+        } else if (!closed.ok && closed.error.code === "NotFound") {
+          evidence.push("owned.cleanup=already-absent");
         } else {
-          evidence.push(`close(${owned})=ok`);
+          problems.push("owned workspace cleanup response did not match");
         }
-      } catch (err) {
+      } catch (error) {
         problems.push(
-          `owned workspace cleanup failed: ${campaignFailureMessage(err)}`,
+          `owned workspace cleanup failed: ${campaignFailureMessage(error)}`,
         );
       }
     }
@@ -1148,12 +2296,22 @@ export function terminalTextFrom(envelope: CtlEnvelope): string {
     throw new CampaignError("MissingField", "terminal text returned an error");
   }
   const result = envelope.result;
-  if (!isRecord(result) || typeof result["text"] !== "string") {
+  if (
+    !isRecord(result) ||
+    projectionObjectProblems(result, ["terminal_id", "text"]).length > 0 ||
+    typeof result["terminal_id"] !== "string" ||
+    !TERMINAL_ID_RE.test(result["terminal_id"])
+  ) {
     throw new CampaignError(
       "MissingField",
-      "terminal text result.text missing",
+      "terminal text result projection is invalid",
     );
   }
+  assertBoundedString(
+    "terminal text",
+    result["text"],
+    MAX_CAMPAIGN_STRING_BYTES,
+  );
   return result["text"];
 }
 
@@ -1166,6 +2324,9 @@ export async function probeTerminalTextShape(
   terminalId = "t:1",
 ): Promise<ProbeResult> {
   const name = "terminal:text-shape";
+  if (!TERMINAL_ID_RE.test(terminalId)) {
+    return fail(name, "terminal text target is invalid");
+  }
   try {
     const envelope = await dispatchEnvelope(dispatcher, {
       verb: "terminal.text",
@@ -1177,15 +2338,15 @@ export async function probeTerminalTextShape(
       return fail(
         name,
         `terminal text looks like a Rust Debug dump (${text.length} chars)`,
-        [`terminal=${terminalId}`, `preview=${text.slice(0, 120)}`],
+        ["target=redacted"],
       );
     }
     return pass(name, `plain grid text (${text.length} chars)`, [
-      `terminal=${terminalId}`,
+      "target=validated",
       `lines=${text.split("\n").length}`,
     ]);
-  } catch (err) {
-    return fail(name, campaignFailureMessage(err), [`terminal=${terminalId}`]);
+  } catch (error) {
+    return fail(name, campaignFailureMessage(error));
   }
 }
 
@@ -1193,21 +2354,71 @@ export async function probeTerminalTextShape(
 // Probe 4: terminal spawn observability (D3 guard)
 // ---------------------------------------------------------------------------
 
-type TerminalSummary = {
-  views: string[];
-  terminals: string[];
-  paneSessions: boolean[];
+type ViewRecord = {
+  id: string;
+  focused: boolean;
 };
 
-function viewsFrom(envelope: CtlEnvelope): string[] {
+type TerminalSummary = {
+  views: ViewRecord[];
+  terminals: string[];
+  paneSessions: boolean[];
+  focusedView: string | undefined;
+};
+
+function viewsFrom(envelope: CtlEnvelope): ViewRecord[] {
   if (!envelope.ok) throw new CampaignError("MissingField", "view list error");
   const result = envelope.result;
-  if (!isRecord(result) || !Array.isArray(result["views"])) {
+  if (
+    !isRecord(result) ||
+    projectionObjectProblems(result, ["views"]).length > 0 ||
+    !Array.isArray(result["views"])
+  ) {
     throw new CampaignError("MissingField", "view list result.views missing");
   }
-  return result["views"]
-    .map((v) => (isRecord(v) ? v["id"] : undefined))
-    .filter((v): v is string => typeof v === "string");
+  if (result["views"].length > MAX_CAMPAIGN_ARRAY_ITEMS) {
+    throw new CampaignError(
+      "OutputTooLarge",
+      `view list exceeds ${MAX_CAMPAIGN_ARRAY_ITEMS} items`,
+    );
+  }
+  const views: ViewRecord[] = [];
+  const seen = new Set<string>();
+  for (const entry of result["views"]) {
+    if (!isRecord(entry)) {
+      throw new CampaignError(
+        "MalformedEnvelope",
+        "view list contains a malformed record",
+      );
+    }
+    const problems = unexpectedEnvelopeFields(entry, ["id", "focused"]);
+    if (problems.length > 0 || typeof entry["focused"] !== "boolean") {
+      throw new CampaignError(
+        "MalformedEnvelope",
+        "view list record is invalid",
+      );
+    }
+    assertBoundedString(
+      "view identifier",
+      entry["id"],
+      MAX_CAMPAIGN_IDENTIFIER_BYTES,
+    );
+    if (!VIEW_ID_RE.test(entry["id"])) {
+      throw new CampaignError(
+        "MalformedEnvelope",
+        "view identifier is invalid",
+      );
+    }
+    if (seen.has(entry["id"])) {
+      throw new CampaignError(
+        "MalformedEnvelope",
+        "view list contains a duplicate identifier",
+      );
+    }
+    seen.add(entry["id"]);
+    views.push({ id: entry["id"], focused: entry["focused"] });
+  }
+  return views;
 }
 
 function terminalsFrom(envelope: CtlEnvelope): {
@@ -1217,20 +2428,109 @@ function terminalsFrom(envelope: CtlEnvelope): {
   if (!envelope.ok)
     throw new CampaignError("MissingField", "terminal list error");
   const result = envelope.result;
-  if (!isRecord(result) || !Array.isArray(result["terminals"])) {
+  if (
+    !isRecord(result) ||
+    projectionObjectProblems(result, ["terminals"]).length > 0 ||
+    !Array.isArray(result["terminals"])
+  ) {
     throw new CampaignError(
       "MissingField",
       "terminal list result.terminals missing",
     );
   }
+  if (result["terminals"].length > MAX_CAMPAIGN_ARRAY_ITEMS) {
+    throw new CampaignError(
+      "OutputTooLarge",
+      `terminal list exceeds ${MAX_CAMPAIGN_ARRAY_ITEMS} items`,
+    );
+  }
   const ids: string[] = [];
   const paneSessions: boolean[] = [];
+  const seen = new Set<string>();
   for (const entry of result["terminals"]) {
-    if (!isRecord(entry)) continue;
-    if (typeof entry["id"] === "string") ids.push(entry["id"]);
-    paneSessions.push(entry["has_pane_session"] === true);
+    if (!isRecord(entry)) {
+      throw new CampaignError(
+        "MalformedEnvelope",
+        "terminal list contains a malformed record",
+      );
+    }
+    const problems = unexpectedEnvelopeFields(entry, [
+      "id",
+      "has_pane_session",
+    ]);
+    if (problems.length > 0 || typeof entry["has_pane_session"] !== "boolean") {
+      throw new CampaignError(
+        "MalformedEnvelope",
+        "terminal list record is invalid",
+      );
+    }
+    assertBoundedString(
+      "terminal identifier",
+      entry["id"],
+      MAX_CAMPAIGN_IDENTIFIER_BYTES,
+    );
+    if (!TERMINAL_ID_RE.test(entry["id"])) {
+      throw new CampaignError(
+        "MalformedEnvelope",
+        "terminal identifier is invalid",
+      );
+    }
+    if (seen.has(entry["id"])) {
+      throw new CampaignError(
+        "MalformedEnvelope",
+        "terminal list contains a duplicate identifier",
+      );
+    }
+    seen.add(entry["id"]);
+    ids.push(entry["id"]);
+    paneSessions.push(entry["has_pane_session"]);
   }
   return { ids, paneSessions };
+}
+
+function terminalSpawnedFrom(envelope: CtlEnvelope): {
+  terminalId: string;
+  viewId: string;
+} {
+  if (!envelope.ok) {
+    throw new CampaignError("MissingField", "terminal spawn returned an error");
+  }
+  const result = envelope.result;
+  if (!isRecord(result)) {
+    throw new CampaignError("MissingField", "terminal spawn result is missing");
+  }
+  const problems = unexpectedEnvelopeFields(result, [
+    "spawned",
+    "terminal_id",
+    "view_id",
+  ]);
+  if (
+    problems.length > 0 ||
+    result["spawned"] !== true ||
+    typeof result["terminal_id"] !== "string" ||
+    typeof result["view_id"] !== "string" ||
+    !TERMINAL_ID_RE.test(result["terminal_id"]) ||
+    !VIEW_ID_RE.test(result["view_id"])
+  ) {
+    throw new CampaignError(
+      "MalformedEnvelope",
+      "terminal spawn result is invalid",
+    );
+  }
+  assertBoundedString(
+    "spawned terminal identifier",
+    result["terminal_id"],
+    MAX_CAMPAIGN_IDENTIFIER_BYTES,
+  );
+  assertBoundedString(
+    "spawned view identifier",
+    result["view_id"],
+    MAX_CAMPAIGN_IDENTIFIER_BYTES,
+  );
+  return {
+    terminalId: result["terminal_id"],
+    viewId: result["view_id"],
+  };
 }
 
 async function terminalSummary(
@@ -1248,11 +2548,78 @@ async function terminalSummary(
     elevated: false,
   });
   const terminals = terminalsFrom(terminalEnvelope);
+  const views = viewsFrom(viewEnvelope);
+  const terminalIds = new Set(terminals.ids);
+  if (
+    views.length !== terminalIds.size ||
+    views.some((view) => !terminalIds.has(`t:${view.id.slice(2)}`))
+  ) {
+    throw new CampaignError(
+      "MalformedEnvelope",
+      "view and terminal lists are inconsistent",
+    );
+  }
+  const focused = views.filter((view) => view.focused);
+  if (focused.length > 1) {
+    throw new CampaignError(
+      "MalformedEnvelope",
+      "view list contains multiple focused records",
+    );
+  }
   return {
-    views: viewsFrom(viewEnvelope),
+    views,
     terminals: terminals.ids,
     paneSessions: terminals.paneSessions,
+    focusedView: focused[0]?.id,
   };
+}
+
+type TerminalObservation = {
+  ids: string[];
+  paneSessions: Map<string, boolean>;
+  problems: number;
+};
+
+function observeTerminalIds(envelope: CtlEnvelope): TerminalObservation {
+  let problems = ctlResultProjectionProblems("terminal.list", envelope).length;
+  const ids: string[] = [];
+  const paneSessions = new Map<string, boolean>();
+  if (!envelope.ok || !isRecord(envelope.result)) {
+    return { ids, paneSessions, problems: problems + 1 };
+  }
+  const terminals = envelope.result["terminals"];
+  if (
+    !Array.isArray(terminals) ||
+    terminals.length > MAX_CAMPAIGN_ARRAY_ITEMS
+  ) {
+    return { ids, paneSessions, problems: problems + 1 };
+  }
+  const seen = new Set<string>();
+  for (const terminal of terminals) {
+    if (!isRecord(terminal)) {
+      problems += 1;
+      continue;
+    }
+    const id = terminal["id"];
+    const paneSession = terminal["has_pane_session"];
+    if (
+      typeof id !== "string" ||
+      !TERMINAL_ID_RE.test(id) ||
+      utf8Bytes(id) > MAX_CAMPAIGN_IDENTIFIER_BYTES ||
+      typeof paneSession !== "boolean"
+    ) {
+      problems += 1;
+      continue;
+    }
+    if (seen.has(id)) {
+      problems += 1;
+      continue;
+    }
+    seen.add(id);
+    ids.push(id);
+    paneSessions.set(id, paneSession);
+  }
+  return { ids, paneSessions, problems };
 }
 
 /**
@@ -1265,58 +2632,169 @@ export async function probeTerminalSpawnObservability(
 ): Promise<ProbeResult> {
   const name = "terminal:spawn-observable";
   const evidence: string[] = [];
+  const problems: string[] = [];
+  const declared = new Set<string>();
+  const owned = new Set<string>();
+  let previousFocus: string | undefined;
+  let baselineTerminals: ReadonlySet<string> = new Set();
+  let baselineViews: ReadonlySet<string> = new Set();
   try {
     const before = await terminalSummary(dispatcher, "before");
+    baselineTerminals = new Set(before.terminals);
+    baselineViews = new Set(before.views.map((view) => view.id));
+    previousFocus = before.focusedView;
     evidence.push(
       `before.views=${before.views.length}`,
       `before.terminals=${before.terminals.length}`,
     );
 
-    const spawned = await dispatchEnvelope(dispatcher, {
-      verb: "terminal.spawn",
-      args: ["terminal", "spawn", "--format", "json"],
-      elevated: opts.elevated ?? true,
-    });
-    if (!spawned.ok) {
-      return fail(
-        name,
-        `spawn failed: ${spawned.error.class}/${spawned.error.code}`,
-        evidence,
-      );
+    try {
+      const spawned = await dispatchEnvelope(dispatcher, {
+        verb: "terminal.spawn",
+        args: ["terminal", "spawn", "--format", "json"],
+        elevated: opts.elevated ?? true,
+      });
+      if (!spawned.ok) {
+        problems.push("terminal spawn returned an error");
+      } else {
+        const created = terminalSpawnedFrom(spawned);
+        if (baselineTerminals.has(created.terminalId)) {
+          problems.push("terminal spawn reported a baseline resource");
+        } else {
+          declared.add(created.terminalId);
+          owned.add(created.terminalId);
+          if (
+            baselineViews.has(created.viewId) ||
+            created.terminalId.slice(2) !== created.viewId.slice(2)
+          ) {
+            problems.push("terminal spawn returned inconsistent identifiers");
+          }
+          evidence.push("spawned=true");
+        }
+      }
+    } catch (error) {
+      problems.push(campaignFailureMessage(error));
     }
-    evidence.push("spawned=true");
 
-    const after = await terminalSummary(dispatcher, "after");
-    evidence.push(
-      `after.views=${after.views.length}`,
-      `after.terminals=${after.terminals.length}`,
+    const terminalObservation = observeTerminalIds(
+      await dispatchRawEnvelope(dispatcher, {
+        verb: "terminal.list.after",
+        args: ["terminal", "list", "--format", "json"],
+        elevated: false,
+      }),
     );
-    evidence.push(
-      `paneSession.before=${before.paneSessions.join(",")}`,
-      `paneSession.after=${after.paneSessions.join(",")}`,
-    );
-
-    const newView = after.views.some((id) => !before.views.includes(id));
-    const newTerminal = after.terminals.some(
-      (id) => !before.terminals.includes(id),
-    );
-    const paneFlipped =
-      after.paneSessions.some((v) => v) && !before.paneSessions.some((v) => v);
-    if (!newView && !newTerminal && !paneFlipped) {
-      return fail(
-        name,
-        "spawn reported success but no view/terminal/has_pane_session change",
-        evidence,
-      );
+    evidence.push(`after.terminals=${terminalObservation.ids.length}`);
+    if (terminalObservation.problems > 0) {
+      problems.push("terminal post-create projection is invalid");
     }
-    return pass(
-      name,
-      "spawn is observable in view/terminal list or pane session",
-      evidence,
-    );
-  } catch (err) {
-    return fail(name, campaignFailureMessage(err), evidence);
+    const observedOwned = new Set<string>();
+    for (const identifier of terminalObservation.ids) {
+      if (baselineTerminals.has(identifier)) continue;
+      owned.add(identifier);
+      observedOwned.add(identifier);
+      if (!declared.has(identifier)) {
+        problems.push("terminal list contained an unexpected new identifier");
+      }
+    }
+    if (
+      declared.size > 0 &&
+      [...declared].some((identifier) => !observedOwned.has(identifier))
+    ) {
+      problems.push("terminal spawn response was not observed");
+    }
+
+    try {
+      const afterViews = viewsFrom(
+        await dispatchRawEnvelope(dispatcher, {
+          verb: "view.list.after",
+          args: ["view", "list", "--format", "json"],
+          elevated: false,
+        }),
+      );
+      evidence.push(`after.views=${afterViews.length}`);
+      const viewIds = new Set(afterViews.map((view) => view.id));
+      const declaredViewIds = new Set(
+        [...declared].map((identifier) => `v:${identifier.slice(2)}`),
+      );
+      if (
+        afterViews.some(
+          (view) =>
+            !baselineViews.has(view.id) && !declaredViewIds.has(view.id),
+        )
+      ) {
+        problems.push("view list contained an unexpected new identifier");
+      }
+      for (const identifier of declared) {
+        const viewId = `v:${identifier.slice(2)}`;
+        if (
+          !viewIds.has(viewId) ||
+          terminalObservation.paneSessions.get(identifier) !== true
+        ) {
+          problems.push(
+            "spawn reported success but the created resource was not observable",
+          );
+        }
+      }
+    } catch (error) {
+      problems.push(campaignFailureMessage(error));
+    }
+  } catch (error) {
+    problems.push(campaignFailureMessage(error));
+  } finally {
+    for (const identifier of [...owned].sort()) {
+      try {
+        const closed = await dispatchEnvelope(dispatcher, {
+          verb: "terminal.close",
+          args: ["terminal", "close", identifier, "--format", "json"],
+          elevated: true,
+        });
+        if (
+          closed.ok &&
+          isRecord(closed.result) &&
+          closed.result["closed"] === identifier
+        ) {
+          evidence.push("owned.terminal.cleanup=ok");
+        } else if (!closed.ok && closed.error.code === "NotFound") {
+          evidence.push("owned.terminal.cleanup=already-absent");
+        } else {
+          problems.push("owned terminal cleanup response did not match");
+        }
+      } catch (error) {
+        problems.push(
+          `owned terminal cleanup failed: ${campaignFailureMessage(error)}`,
+        );
+      }
+    }
+    if (previousFocus !== undefined) {
+      try {
+        const focused = await dispatchEnvelope(dispatcher, {
+          verb: "view.focus",
+          args: ["view", "focus", previousFocus, "--format", "json"],
+          elevated: false,
+        });
+        if (
+          focused.ok &&
+          isRecord(focused.result) &&
+          focused.result["focused"] === previousFocus
+        ) {
+          evidence.push("baseline.focus.restored=true");
+        } else {
+          problems.push("baseline focus restoration response did not match");
+        }
+      } catch (error) {
+        problems.push(
+          `baseline focus restoration failed: ${campaignFailureMessage(error)}`,
+        );
+      }
+    }
   }
+  return problems.length > 0
+    ? fail(name, problems.join("; "), evidence)
+    : pass(
+        name,
+        "spawn is observable and every run-owned terminal was cleaned",
+        evidence,
+      );
 }
 
 // ---------------------------------------------------------------------------
@@ -1444,16 +2922,18 @@ export function probeSocketDirPreflight(
 ): ProbeResult {
   const name = "socket:parent-dir-0700";
   if (result.ok) {
-    return pass(name, `parent ${result.parentDir} is 0700 and owner-matched`, [
+    return pass(name, "parent directory is 0700 and owner-matched", [
       `mode=${result.mode === null ? "?" : dirModeOctal(result.mode)}`,
     ]);
   }
-  const diagnostic = result.diagnostic ?? "socket preflight failed";
-  const detail =
-    result.remedy === null ? diagnostic : `${diagnostic}; ${result.remedy}`;
-  return fail(name, detail, [
-    result.remedy === null ? "" : `remedy=${result.remedy}`,
-  ]);
+  if (result.mode !== null) {
+    return fail(
+      name,
+      "socket parent mode must be 0700; chmod 700 is required",
+      [`mode=${dirModeOctal(result.mode)}`],
+    );
+  }
+  return fail(name, "socket parent preflight failed", ["path=redacted"]);
 }
 
 // ---------------------------------------------------------------------------
@@ -1523,15 +3003,26 @@ export type CampaignReport = {
 export function summarizeCampaign(
   results: readonly ProbeResult[],
 ): CampaignReport {
+  const bounded = results
+    .slice(0, MAX_CAMPAIGN_REPORT_RESULTS)
+    .map(normalizeProbeResult);
+  if (results.length > MAX_CAMPAIGN_REPORT_RESULTS) {
+    bounded.push(
+      fail(
+        "campaign:report-limit",
+        `campaign report exceeds ${MAX_CAMPAIGN_REPORT_RESULTS} results`,
+      ),
+    );
+  }
   let passed = 0;
   let failed = 0;
   let skipped = 0;
-  for (const result of results) {
+  for (const result of bounded) {
     if (result.status === "pass") passed += 1;
     else if (result.status === "fail") failed += 1;
     else skipped += 1;
   }
-  return { results, passed, failed, skipped, ok: failed === 0 };
+  return { results: bounded, passed, failed, skipped, ok: failed === 0 };
 }
 
 export type CampaignOptions = {
@@ -1545,7 +3036,7 @@ export type CampaignOptions = {
     stat: (dir: string) => SocketDirStat | null;
     requiredMode?: number;
   };
-  /** Set true to also exercise workspace `close` (destructive; live only). */
+  /** Legacy explicit destructive-admission flag; owned cleanup is unconditional. */
   closeWorkspaces?: boolean;
   /** Override the verb matrix (tests inject focused matrices). */
   matrix?: readonly VerbExpectation[];
@@ -1569,6 +3060,16 @@ export type CampaignOptions = {
 export async function runCampaign(
   options: CampaignOptions,
 ): Promise<CampaignReport> {
+  const providedMatrix: unknown = Object.hasOwn(options, "matrix")
+    ? options.matrix
+    : CTL_VERB_MATRIX;
+  const matrixProblem = campaignMatrixProblem(providedMatrix);
+  if (matrixProblem !== undefined) {
+    return summarizeCampaign([
+      fail(campaignMatrixFailureName(providedMatrix), matrixProblem),
+    ]);
+  }
+  const sourceMatrix = providedMatrix as readonly VerbExpectation[];
   const results: ProbeResult[] = [];
   if (options.socket !== undefined) {
     try {
@@ -1612,19 +3113,33 @@ export async function runCampaign(
     return summarizeCampaign(results);
   }
   const allowKeystrokes = keystrokeProbeOptIn(options.keystrokeTarget);
+  if (allowKeystrokes && sourceMatrix.length >= MAX_CAMPAIGN_MATRIX_ROWS) {
+    return summarizeCampaign([
+      fail(
+        "campaign:matrix-limit",
+        `campaign matrix cannot append keystroke row beyond ${MAX_CAMPAIGN_MATRIX_ROWS} rows`,
+      ),
+    ]);
+  }
   const matrix =
     allowKeystrokes && options.keystrokeTarget !== undefined
-      ? [
-          ...(options.matrix ?? CTL_VERB_MATRIX),
-          keystrokeProbeExpectation(options.keystrokeTarget),
-        ]
-      : (options.matrix ?? CTL_VERB_MATRIX);
+      ? [...sourceMatrix, keystrokeProbeExpectation(options.keystrokeTarget)]
+      : sourceMatrix;
   const admittedMatrix = matrix.filter((row) => {
     if (row.args[1] === "close") {
       results.push(
         skip(
           `envelope:${row.verb}`,
-          "close requires a run-owned identifier; exercised by workspace cleanup only",
+          "close requires a run-owned identifier; exercised by owned-resource cleanup only",
+        ),
+      );
+      return false;
+    }
+    if (row.verb === "workspace.new" || row.verb === "terminal.spawn") {
+      results.push(
+        skip(
+          `envelope:${row.verb}`,
+          "owned resource creation is exercised by the cleanup probe",
         ),
       );
       return false;
@@ -1663,9 +3178,7 @@ export async function runCampaign(
   );
   results.push(
     allowMutations
-      ? await probeWorkspaceIdRoundTrip(options.dispatcher, {
-          elevated: options.closeWorkspaces ?? false,
-        })
+      ? await probeWorkspaceIdRoundTrip(options.dispatcher)
       : skip("workspace:id-round-trip", "requires disposable-instance consent"),
   );
   results.push(
@@ -1695,7 +3208,7 @@ export type LiveCampaignConfig = ProcessDispatcherConfig & {
   runtimeUid?: number;
   /** Injectable stat for the preflight; omit to skip the preflight probe. */
   stat?: (dir: string) => SocketDirStat | null;
-  /** Set true to also exercise workspace `close` (destructive; live only). */
+  /** Legacy explicit destructive-admission flag; owned cleanup is unconditional. */
   closeWorkspaces?: boolean;
   /**
    * Explicit opt-in for the keystroke-injection probe. Absent by default, so
