@@ -1,6 +1,5 @@
 import { describe, expect, test } from "bun:test";
 import {
-  appendFileSync,
   chmodSync,
   copyFileSync,
   existsSync,
@@ -8,7 +7,7 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
-  renameSync,
+  rmdirSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -1038,10 +1037,17 @@ process.exit(result.exitCode);`,
       authorityFtsRelatedCount,
       activeProjectName,
       guardProjectName,
-      databaseContent:
-        existsSync(currentDatabase) && statSync(currentDatabase).isFile()
-          ? readFileSync(currentDatabase).toString()
-          : undefined,
+      databaseContent: (() => {
+        // Avoid TOCTOU race: use try-catch instead of existsSync + readFileSync
+        try {
+          const stat = statSync(currentDatabase);
+          return stat.isFile()
+            ? readFileSync(currentDatabase).toString()
+            : undefined;
+        } catch {
+          return undefined;
+        }
+      })(),
       backups: backups.map((path) => ({
         path,
         content: readFileSync(path, "utf8"),
