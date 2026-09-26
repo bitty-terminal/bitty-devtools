@@ -12,7 +12,7 @@
 ## Testing
 
 - [ ] `just fmt-check` passes (Prettier 3.9.6)
-- [ ] `just lint` passes (markdownlint-cli2 0.23.1)
+- [ ] `just lint` passes (markdownlint-cli2 0.23.2)
 - [ ] `just check` passes (aggregate gate)
 
 ## Checklist
