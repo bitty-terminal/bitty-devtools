@@ -103,7 +103,7 @@ export type EventTopic = string & { readonly __brand: "EventTopic" };
 const TOPIC_RE = /^[a-z][a-z0-9_-]*\.[a-z][a-z0-9_-]*:[a-z][a-z0-9_.-]*$/;
 
 export function parseEventTopic(raw: string): EventTopic {
-  if (raw.length === 0 || raw.length > 64)
+  if (raw.length === 0 || new TextEncoder().encode(raw).length > 64)
     throw new Error("topic must be 1..64 bytes");
   if (!TOPIC_RE.test(raw)) throw new Error(`invalid topic grammar: ${raw}`);
   if (raw.startsWith("bitty.") && !raw.startsWith("bitty.panel:")) {

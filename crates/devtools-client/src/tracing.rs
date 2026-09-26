@@ -3,8 +3,8 @@
 //!
 //! Phase 2 adds filtering, structured events, retention/GC, coalescing control,
 //! deterministic wall-clock, and chunked export with preview==export. All
-//! bounds from devtools-rfc are preserved, peer-creds re-checked per privileged
-//! action via transport seam.
+//! bounds from devtools-rfc are preserved. The headless transport fixture
+//! re-checks caller-supplied peer values; the live Linux path is inspect-only.
 
 use crate::bounds::{
     BUS_BATCH_MAX_BYTES, BUS_BATCH_MAX_EVENTS, BUS_EVENT_MAX_BYTES, CHUNK_BYTES, MAX_TRACE_BYTES,
@@ -107,17 +107,17 @@ impl TraceOptions {
                     return Err(TracingError::Invalid("filter.kinds >32".to_string()));
                 }
                 for k in kinds {
-                    if k.len() > 64 {
+                    if k.is_empty() || k.len() > 64 {
                         return Err(TracingError::Invalid("filter kind 1..64".to_string()));
                     }
                 }
             }
             if let Some(ref owners) = f.owners {
-                if owners.len() > 32 {
-                    return Err(TracingError::Invalid("filter.owners >32".to_string()));
+                if owners.is_empty() || owners.len() > 32 {
+                    return Err(TracingError::Invalid("filter.owners 1..32".to_string()));
                 }
                 for o in owners {
-                    if o.len() > 64 {
+                    if o.is_empty() || o.len() > 64 {
                         return Err(TracingError::Invalid("filter owner 1..64".to_string()));
                     }
                 }
@@ -187,14 +187,61 @@ pub struct StructuredTraceEvent {
     pub wall_clock_ms: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchRecord {
+    pub owner: String,
+    pub kind: String,
+    pub payload: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct ObservabilityBatch {
     pub sequence: u64,
     pub drop_count: u64,
-    pub records: Vec<(String, String)>,
+    pub records: Vec<BatchRecord>,
     pub wall_clock_ms: u64,
     pub coalesced_count: u64,
     pub policy: DropPolicy,
+}
+
+fn json_quote(value: &str) -> String {
+    let mut output = String::with_capacity(value.len() + 2);
+    output.push('"');
+    for character in value.chars() {
+        match character {
+            '"' => output.push_str("\\\""),
+            '\\' => output.push_str("\\\\"),
+            '\u{0008}' => output.push_str("\\b"),
+            '\u{000c}' => output.push_str("\\f"),
+            '\n' => output.push_str("\\n"),
+            '\r' => output.push_str("\\r"),
+            '\t' => output.push_str("\\t"),
+            c if c <= '\u{001f}' => {
+                output.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => output.push(c),
+        }
+    }
+    output.push('"');
+    output
+}
+
+fn batch_json_bytes(records: &[BatchRecord]) -> usize {
+    let mut json = String::from("[");
+    for (index, record) in records.iter().enumerate() {
+        if index > 0 {
+            json.push(',');
+        }
+        json.push_str("{\"owner\":");
+        json.push_str(&json_quote(&record.owner));
+        json.push_str(",\"kind\":");
+        json.push_str(&json_quote(&record.kind));
+        json.push_str(",\"payload\":");
+        json.push_str(&json_quote(&record.payload));
+        json.push('}');
+    }
+    json.push(']');
+    json.len()
 }
 
 pub fn stream_events(
@@ -224,18 +271,29 @@ pub fn stream_events(
             return Err(TracingError::Invalid("event type empty".to_string()));
         }
     }
-    let records = types
-        .iter()
-        .take(max_events)
-        .map(|t| (t.clone(), "{\"count\":1}".to_string()))
-        .collect::<Vec<_>>();
-    let bytes = format!("{records:?}").len();
-    if bytes > BUS_EVENT_MAX_BYTES * 4 {
-        return Err(TracingError::Invalid("batch too large".to_string()));
+    if types.len() > 256 {
+        return Err(TracingError::Invalid("event types >256".to_string()));
     }
+    let mut records = Vec::new();
+    let mut drop_count = 0u64;
+    for kind in types.iter().take(max_events) {
+        let candidate = BatchRecord {
+            owner: "panel-1".to_string(),
+            kind: kind.clone(),
+            payload: "{\"count\":1}".to_string(),
+        };
+        let mut next = records.clone();
+        next.push(candidate.clone());
+        if batch_json_bytes(&next) > max_bytes {
+            drop_count += 1;
+            continue;
+        }
+        records = next;
+    }
+    drop_count += types.len().saturating_sub(max_events) as u64;
     Ok(ObservabilityBatch {
         sequence: 42,
-        drop_count: 0,
+        drop_count,
         records,
         wall_clock_ms: 0,
         coalesced_count: 0,
@@ -263,13 +321,12 @@ pub fn stream_filtered_events(
     if max_bytes == 0 || max_bytes > BUS_BATCH_MAX_BYTES {
         return Err(TracingError::Invalid("maxBytes 1..8192".to_string()));
     }
-    // Default kinds when filter missing
     let kinds_vec: Vec<String> = if let Some(ref k) = filter.kinds {
         if k.len() > 32 {
             return Err(TracingError::Invalid("filter.kinds >32".to_string()));
         }
-        for kk in k {
-            if kk.len() > 64 {
+        for kind in k {
+            if kind.is_empty() || kind.len() > 64 {
                 return Err(TracingError::Invalid("filter kind 1..64".to_string()));
             }
         }
@@ -277,39 +334,57 @@ pub fn stream_filtered_events(
     } else {
         vec!["bitty.panel:mounted".to_string()]
     };
+    let owner = filter
+        .owners
+        .as_ref()
+        .and_then(|owners| owners.first())
+        .cloned()
+        .unwrap_or_else(|| "panel-1".to_string());
+    if owner.is_empty() || owner.len() > 64 {
+        return Err(TracingError::Invalid("filter owner 1..64".to_string()));
+    }
+    if let Some(ref owners) = filter.owners {
+        if owners.is_empty() || owners.len() > 32 {
+            return Err(TracingError::Invalid("filter.owners 1..32".to_string()));
+        }
+        for value in owners {
+            if value.is_empty() || value.len() > 64 {
+                return Err(TracingError::Invalid("filter owner 1..64".to_string()));
+            }
+        }
+    }
     let mut seen = BTreeSet::new();
     let mut coalesced = 0u64;
     let mut records = Vec::new();
-    for k in kinds_vec {
-        if records.len() >= max_events {
-            break;
-        }
-        let owner = filter
-            .owners
-            .as_ref()
-            .and_then(|v| v.first().cloned())
-            .unwrap_or_else(|| "panel-1".to_string());
-        let key = format!("{owner}:{k}");
+    let mut drop_count = 0u64;
+    for kind in kinds_vec {
+        let key = format!("{owner}:{kind}");
         if seen.contains(&key) {
             coalesced += 1;
             continue;
         }
         seen.insert(key);
-        records.push((owner, format!("{k}:{}", "{\"count\":1}")));
-        // Actually records is (String,String) where second is payload; keep kind in first? Use owner/kind split elsewhere.
-        // For compatibility, store as (kind, payload) but we need owner. We'll encode owner in first part.
+        if records.len() >= max_events {
+            drop_count += 1;
+            continue;
+        }
+        let candidate = BatchRecord {
+            owner: owner.clone(),
+            kind,
+            payload: "{\"count\":1}".to_string(),
+        };
+        let mut next = records.clone();
+        next.push(candidate.clone());
+        if batch_json_bytes(&next) > max_bytes {
+            drop_count += 1;
+            continue;
+        }
+        records = next;
     }
-    // Rebuild to (owner,kind) style: the test helper expects (String,String) where first is type string; we keep simple.
-    let recs: Vec<(String, String)> = records;
-    let bytes = format!("{recs:?}").len();
-    if bytes > BUS_BATCH_MAX_BYTES {
-        return Err(TracingError::Invalid("batch too large".to_string()));
-    }
-    let _ = filter.kinds.as_deref().unwrap_or(&[]);
     Ok(ObservabilityBatch {
         sequence: now_ms,
-        drop_count: 0,
-        records: recs,
+        drop_count,
+        records,
         wall_clock_ms: now_ms,
         coalesced_count: coalesced,
         policy: DropPolicy::DropOldest,
@@ -368,8 +443,8 @@ impl TracingClient {
         }
         opts.validate()?;
         let retention = opts.effective_retention();
-        let id = format!("trace-{}", self.next_id);
         self.next_id += 1;
+        let id = format!("trace-{}", self.next_id);
         self.traces.insert(
             id.clone(),
             TraceState {
@@ -399,7 +474,13 @@ impl TracingClient {
         Ok((s.bytes, s.drops))
     }
 
-    pub fn append_to_trace(&mut self, trace_id: &str, data: &str) -> Result<(), TracingError> {
+    pub fn append_to_trace(
+        &mut self,
+        scope_ok: bool,
+        trace_id: &str,
+        data: &str,
+    ) -> Result<(), TracingError> {
+        self.require_trace(scope_ok)?;
         let rec = self
             .traces
             .get_mut(trace_id)
@@ -432,9 +513,11 @@ impl TracingClient {
 
     pub fn append_structured(
         &mut self,
+        scope_ok: bool,
         trace_id: &str,
         event: StructuredTraceEvent,
     ) -> Result<(), TracingError> {
+        self.require_trace(scope_ok)?;
         let rec = self
             .traces
             .get_mut(trace_id)
@@ -445,8 +528,14 @@ impl TracingClient {
                 BUS_EVENT_MAX_BYTES
             )));
         }
-        if event.kind.len() > 64 {
-            return Err(TracingError::Invalid("kind >64".to_string()));
+        if event.owner.is_empty() || event.owner.len() > 64 {
+            return Err(TracingError::Invalid("owner 1..64".to_string()));
+        }
+        if event.kind.is_empty() || event.kind.len() > 64 {
+            return Err(TracingError::Invalid("kind 1..64".to_string()));
+        }
+        if event.generation == 0 {
+            return Err(TracingError::Invalid("generation >=1".to_string()));
         }
         if let Some(ref filter) = rec.options.filter {
             if let Some(ref kinds) = filter.kinds {
@@ -514,14 +603,20 @@ impl TracingClient {
         Ok(expired)
     }
 
-    #[must_use]
-    pub fn trace_count(&self) -> usize {
-        self.traces.len()
+    pub fn trace_count(&self, scope_ok: bool) -> Result<usize, TracingError> {
+        self.require_trace(scope_ok)?;
+        Ok(self.traces.len())
     }
 
-    #[must_use]
-    pub fn list_traces(&self) -> Vec<String> {
-        self.traces.keys().cloned().collect()
+    pub fn list_traces(&self, scope_ok: bool) -> Result<Vec<String>, TracingError> {
+        self.require_trace(scope_ok)?;
+        Ok(self.traces.keys().cloned().collect())
+    }
+
+    pub fn clear_session_state(&mut self) {
+        self.traces.clear();
+        self.next_id = 0;
+        self.global_seq = 0;
     }
 }
 
@@ -568,9 +663,53 @@ mod tests {
     }
 
     #[test]
+    fn low_level_accessors_require_trace_scope() {
+        let mut client = TracingClient::new();
+        let id = client
+            .start_trace(TraceOptions::default(), true, 0)
+            .unwrap();
+        assert!(client.append_to_trace(false, &id, "x").is_err());
+        assert!(client.list_traces(false).is_err());
+        client.stop_trace(&id, true).unwrap();
+    }
+
+    #[test]
     fn batch_limits() {
         assert!(stream_events(&["a".to_string()], 33, 1024, true, false).is_err());
         assert!(stream_events(&["a".to_string()], 1, 9000, true, false).is_err());
+    }
+
+    #[test]
+    fn batch_uses_requested_bytes_and_structured_records() {
+        let record = BatchRecord {
+            owner: "panel-1".to_string(),
+            kind: "one".to_string(),
+            payload: "{\"count\":1}".to_string(),
+        };
+        let max_bytes = batch_json_bytes(std::slice::from_ref(&record));
+        let batch = stream_events(
+            &["one".to_string(), "two".to_string()],
+            2,
+            max_bytes,
+            true,
+            false,
+        )
+        .unwrap();
+        assert_eq!(batch.records.len(), 1);
+        assert_eq!(batch.records[0], record);
+        assert_eq!(batch.drop_count, 1);
+    }
+
+    #[test]
+    fn clear_session_state_removes_old_trace_ids() {
+        let mut client = TracingClient::new();
+        let id = client
+            .start_trace(TraceOptions::default(), true, 0)
+            .unwrap();
+        client.clear_session_state();
+        assert_eq!(client.trace_count(true).unwrap(), 0);
+        assert!(client.list_traces(true).unwrap().is_empty());
+        assert!(client.append_to_trace(true, &id, "late").is_err());
     }
 
     #[test]
@@ -586,10 +725,10 @@ mod tests {
                 0,
             )
             .unwrap();
-        assert_eq!(c.trace_count(), 1);
+        assert_eq!(c.trace_count(true).unwrap(), 1);
         let expired = c.gc_expired(2000, true).unwrap();
         assert_eq!(expired, vec![id]);
-        assert_eq!(c.trace_count(), 0);
+        assert_eq!(c.trace_count(true).unwrap(), 0);
     }
 
     #[test]
@@ -626,7 +765,7 @@ mod tests {
                         } else {
                             retained.push_str(record);
                         }
-                        c.append_to_trace(&id, record).unwrap();
+                        c.append_to_trace(true, &id, record).unwrap();
                         let state = c.traces.get_mut(&id).unwrap();
                         assert_eq!(state.chunks.concat(), retained);
                         assert_eq!(state.bytes, retained.len());
@@ -681,7 +820,7 @@ mod tests {
                     )
                     .unwrap();
                 let before = format!("{:?}", c.traces[&id]);
-                c.append_structured(&id, event.clone()).unwrap();
+                c.append_structured(true, &id, event.clone()).unwrap();
                 let state = c.traces.get_mut(&id).unwrap();
                 if limit < json.len() {
                     assert_eq!(state.drops, 1);
@@ -693,7 +832,7 @@ mod tests {
                     assert_eq!(state.events.len(), 1);
                     assert_eq!(state.events[0].payload, event.payload);
                     let accepted = format!("{state:?}");
-                    c.append_structured(&id, event.clone()).unwrap();
+                    c.append_structured(true, &id, event.clone()).unwrap();
                     let state = c.traces.get_mut(&id).unwrap();
                     assert_eq!(state.drops, 1);
                     state.drops = 0;
@@ -715,7 +854,7 @@ mod tests {
             generation: 1,
             wall_clock_ms: 10,
         };
-        c.append_structured(&id, event).unwrap();
+        c.append_structured(true, &id, event).unwrap();
         let state = &c.traces[&id];
         assert_eq!(state.events[0].payload, "[REDACTED]");
         assert!(state.chunks.concat().contains("\"payload\":\"[REDACTED]\""));
@@ -730,7 +869,7 @@ mod tests {
                 0,
             )
             .unwrap();
-        c.append_to_trace(&raw, "password=example").unwrap();
+        c.append_to_trace(true, &raw, "password=example").unwrap();
         assert_eq!(c.traces[&raw].chunks, vec!["[REDACTED]"]);
         assert_eq!(c.stop_trace(&raw, true).unwrap(), (10, 0));
     }
@@ -755,7 +894,7 @@ mod tests {
             generation: 1,
             wall_clock_ms: 0,
         };
-        c.append_structured(&id, ev).unwrap();
+        c.append_structured(true, &id, ev).unwrap();
         // filtered out, drops incremented
         let state = c.traces.get(&id).unwrap();
         assert_eq!(state.drops, 1);

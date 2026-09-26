@@ -20,7 +20,7 @@ import {
   MATRIX,
   REFERENCE_TERMS,
 } from "./compat-matrix.js";
-import { PROTOCOL_VERSION } from "./protocol.js";
+import { decodeResponse, PROTOCOL_VERSION } from "./protocol.js";
 import type { IpcRequest, IpcResponse } from "./transport.js";
 
 export type PluginState =
@@ -273,10 +273,14 @@ function requireNonEmptyString(
   record: Record<string, unknown>,
   key: string,
   field: string,
+  maxBytes = 256,
 ): string {
   const value = requireString(record, key, field);
   if (value.length === 0) {
     throw parseError(`${field}.${key}`, "must not be empty");
+  }
+  if (new TextEncoder().encode(value).length > maxBytes) {
+    throw parseError(`${field}.${key}`, "exceeds byte bound");
   }
   return value;
 }
@@ -311,7 +315,7 @@ function requireGeneration(
   field: string,
 ): Generation {
   const value = record[key];
-  if (typeof value !== "number" || !Number.isInteger(value) || value < 1) {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1) {
     throw parseError(`${field}.${key}`, "expected a positive integer");
   }
   return generation(value);
@@ -339,10 +343,21 @@ function requireStringArray(
   record: Record<string, unknown>,
   key: string,
   field: string,
+  maxItems = 256,
+  maxBytes = 256,
 ): string[] {
   const value = record[key];
-  if (!Array.isArray(value) || !value.every((c) => typeof c === "string")) {
-    throw parseError(`${field}.${key}`, "expected an array of strings");
+  if (!Array.isArray(value) || value.length > maxItems) {
+    throw parseError(`${field}.${key}`, "expected a bounded string array");
+  }
+  for (const [index, item] of value.entries()) {
+    if (
+      typeof item !== "string" ||
+      item.length === 0 ||
+      new TextEncoder().encode(item).length > maxBytes
+    ) {
+      throw parseError(`${field}.${key}[${index}]`, "invalid string item");
+    }
   }
   return value as string[];
 }
@@ -618,14 +633,130 @@ function focusSnapshotFrom(
 
 function pluginSummaryFrom(value: unknown, field = "plugin"): PluginSummary {
   const r = requireRecord(value, field);
+  requireOnlyKeys(
+    r,
+    ["id", "version", "generation", "state", "manifestHash", "capabilities"],
+    field,
+  );
   return {
-    id: requireNonEmptyString(r, "id", field),
-    version: requireNonEmptyString(r, "version", field),
+    id: requireNonEmptyString(r, "id", field, 256),
+    version: requireNonEmptyString(r, "version", field, 128),
     generation: requireGeneration(r, "generation", field),
     state: requirePluginState(r, "state", field),
-    manifestHash: requireNonEmptyString(r, "manifestHash", field),
-    capabilities: requireStringArray(r, "capabilities", field),
+    manifestHash: requireNonEmptyString(r, "manifestHash", field, 256),
+    capabilities: requireStringArray(r, "capabilities", field, 256, 128),
   };
+}
+
+function decodeTransportResponse(response: IpcResponse): IpcResponse {
+  let encoded: string | undefined;
+  try {
+    encoded = JSON.stringify(response);
+  } catch {
+    encoded = undefined;
+  }
+  if (encoded === undefined) {
+    throw new InspectionError("InvalidResult", "response is not serializable");
+  }
+  try {
+    return decodeResponse(encoded) as IpcResponse;
+  } catch (error) {
+    throw new InspectionError(
+      "InvalidResult",
+      error instanceof Error ? error.message : "invalid response envelope",
+    );
+  }
+}
+
+export function parseInspectionResult(
+  method: string,
+  params: Record<string, unknown>,
+  result: unknown,
+): unknown {
+  const response: IpcResponse = {
+    jsonrpc: "2.0",
+    id: 1,
+    result,
+    version: PROTOCOL_VERSION,
+  };
+  const transport: InspectionTransport = {
+    isConnected: () => true,
+    request: () => response,
+  };
+  const client = new InspectionClient(transport);
+  const stringParam = (key: string): string => {
+    const value = params[key];
+    if (typeof value !== "string") {
+      throw new InspectionError("InvalidParams", `${key} must be a string`);
+    }
+    return value;
+  };
+  switch (method) {
+    case "bitty.debug/listPlugins": {
+      const generation = params["generation"];
+      if (generation !== undefined && generation !== null) {
+        if (
+          typeof generation !== "number" ||
+          !Number.isSafeInteger(generation) ||
+          generation < 1
+        ) {
+          throw new InspectionError("InvalidParams", "generation is invalid");
+        }
+        return client.listPlugins("debug.inspect", generation as Generation);
+      }
+      return client.listPlugins("debug.inspect");
+    }
+    case "bitty.debug/getPlugin":
+      return client.getPlugin("debug.inspect", stringParam("pluginId"));
+    case "bitty.debug/listSubscriptions":
+      return client.listSubscriptions("debug.inspect", stringParam("pluginId"));
+    case "bitty.debug/getBudgets": {
+      const generation = params["generation"];
+      if (
+        typeof generation !== "number" ||
+        !Number.isSafeInteger(generation) ||
+        generation < 1
+      ) {
+        throw new InspectionError("InvalidParams", "generation is invalid");
+      }
+      return client.getBudgets(
+        "debug.inspect",
+        stringParam("pluginId"),
+        generation as Generation,
+      );
+    }
+    case "bitty.debug/getQueueSnapshot":
+      return client.getQueueSnapshot("debug.inspect", stringParam("pluginId"));
+    case "bitty.debug/getSnapshot":
+      return client.getSnapshotForTerminal(
+        "debug.inspect",
+        stringParam("terminalId"),
+        typeof params["previewText"] === "string" ? params["previewText"] : "",
+      );
+    case "bitty.debug/listHandles":
+      return client.listHandles("debug.inspect", stringParam("pluginId"));
+    case "bitty.debug/getGridText": {
+      const options: { rows?: number; cols?: number } = {};
+      if (params["rows"] !== undefined) options.rows = params["rows"] as number;
+      if (params["cols"] !== undefined) options.cols = params["cols"] as number;
+      return client.getGridText("debug.inspect", options);
+    }
+    case "bitty.debug/getInputRing": {
+      const options: { limit?: number } = {};
+      if (params["limit"] !== undefined)
+        options.limit = params["limit"] as number;
+      return client.getInputRing("debug.inspect", options);
+    }
+    case "bitty.debug/getModifiers":
+      return client.getModifiers("debug.inspect");
+    case "bitty.debug/getFocus":
+      return client.getFocus("debug.inspect");
+    default:
+      throw new InspectionError(
+        "InvalidResult",
+        `unsupported method ${method}`,
+      );
+  }
 }
 
 export class InspectionClient {
@@ -654,9 +785,11 @@ export class InspectionClient {
     }
     const id = this.nextRequestId;
     this.nextRequestId += 1;
-    const response = transport.request(
-      { id, method, params, version: PROTOCOL_VERSION },
-      Date.now(),
+    const response = decodeTransportResponse(
+      transport.request(
+        { id, method, params, version: PROTOCOL_VERSION },
+        Date.now(),
+      ),
     );
     if (response.error !== undefined) {
       throw new InspectionError(
@@ -682,6 +815,7 @@ export class InspectionClient {
         generation: generationFilter ?? null,
       });
       const envelope = requireRecord(result, "listPlugins result");
+      requireOnlyKeys(envelope, ["plugins"], "listPlugins result");
       const list = requireArray(
         envelope["plugins"],
         "listPlugins result.plugins",
@@ -715,7 +849,7 @@ export class InspectionClient {
     }
     if (this.isLive()) {
       const result = this.rpc("bitty.debug/getPlugin", { pluginId });
-      if (result === null || result === undefined) return null;
+      if (result === null) return null;
       return pluginSummaryFrom(result, "getPlugin result");
     }
     const snap = this.snapshot();
@@ -734,8 +868,8 @@ export class InspectionClient {
 
   listSubscriptions(scope: string, pluginId: string): SubscriptionInfo[] {
     this.requireInspect(scope);
-    if (pluginId.length > 128)
-      throw new InspectionError("InvalidPluginId", "pluginId too long");
+    if (pluginId.length === 0 || pluginId.length > 128)
+      throw new InspectionError("InvalidPluginId", "pluginId must be 1..128");
     if (this.isLive()) {
       const result = this.rpc("bitty.debug/listSubscriptions", { pluginId });
       const list = requireArray(result, "listSubscriptions result");
@@ -743,15 +877,20 @@ export class InspectionClient {
       return list.slice(0, MAX_SUBSCRIPTIONS).map((entry, i) => {
         const field = `listSubscriptions result[${i}]`;
         const r = requireRecord(entry, field);
-        const policy = requireNonEmptyString(r, "policy", field);
+        requireOnlyKeys(
+          r,
+          ["eventType", "queueDepth", "queuedBytes", "dropCount", "policy"],
+          field,
+        );
+        const policy = requireNonEmptyString(r, "policy", field, 32);
         if (policy !== "DropOldest" && policy !== "DropNewest") {
           throw parseError(`${field}.policy`, `unknown policy ${policy}`);
         }
         return {
-          eventType: requireNonEmptyString(r, "eventType", field),
-          queueDepth: requireNumber(r, "queueDepth", field),
-          queuedBytes: requireNumber(r, "queuedBytes", field),
-          dropCount: requireNumber(r, "dropCount", field),
+          eventType: requireNonEmptyString(r, "eventType", field, 64),
+          queueDepth: requireUnsignedInt(r, "queueDepth", field),
+          queuedBytes: requireUnsignedInt(r, "queuedBytes", field),
+          dropCount: requireUnsignedInt(r, "dropCount", field),
           policy,
         };
       });
@@ -781,8 +920,8 @@ export class InspectionClient {
 
   getBudgets(scope: string, pluginId: string, gen: Generation): BudgetSnapshot {
     this.requireInspect(scope);
-    if (pluginId.length > 128)
-      throw new InspectionError("InvalidPluginId", "pluginId too long");
+    if (pluginId.length === 0 || pluginId.length > 128)
+      throw new InspectionError("InvalidPluginId", "pluginId must be 1..128");
     if (this.isLive()) {
       const result = this.rpc("bitty.debug/getBudgets", {
         pluginId,
@@ -790,21 +929,36 @@ export class InspectionClient {
       });
       const field = "getBudgets result";
       const r = requireRecord(result, field);
+      const wouldExceedLuaLimits = requireBoolean(
+        r,
+        "would_exceed_lua_limits",
+        field,
+      );
+      requireOnlyKeys(
+        r,
+        [
+          "generation",
+          "rc1Instructions",
+          "rc1WallMs",
+          "rc2MemoryBytes",
+          "rc4Tasks",
+          "rc4Timers",
+          "rc5QueueDepth",
+          "would_exceed_lua_limits",
+        ],
+        field,
+      );
       return {
         pluginId,
         generation: requireGeneration(r, "generation", field),
-        rc1Instructions: requireNumber(r, "rc1Instructions", field),
-        rc1WallMs: requireNumber(r, "rc1WallMs", field),
-        rc2MemoryBytes: requireNumber(r, "rc2MemoryBytes", field),
-        rc4Tasks: requireNumber(r, "rc4Tasks", field),
-        rc4Timers: requireNumber(r, "rc4Timers", field),
-        rc5QueueDepth: requireNumber(r, "rc5QueueDepth", field),
+        rc1Instructions: requireUnsignedInt(r, "rc1Instructions", field),
+        rc1WallMs: requireUnsignedInt(r, "rc1WallMs", field),
+        rc2MemoryBytes: requireUnsignedInt(r, "rc2MemoryBytes", field),
+        rc4Tasks: requireUnsignedInt(r, "rc4Tasks", field),
+        rc4Timers: requireUnsignedInt(r, "rc4Timers", field),
+        rc5QueueDepth: requireUnsignedInt(r, "rc5QueueDepth", field),
         // RFC v1 verdict spelling is snake_case (devtools-rfc:341).
-        wouldExceedLuaLimits: requireBoolean(
-          r,
-          "would_exceed_lua_limits",
-          field,
-        ),
+        wouldExceedLuaLimits,
       };
     }
     return {
@@ -822,62 +976,98 @@ export class InspectionClient {
 
   getQueueSnapshot(scope: string, pluginId: string): QueueSnapshot {
     this.requireInspect(scope);
-    if (pluginId.length > 128)
-      throw new InspectionError("InvalidPluginId", "pluginId too long");
+    if (pluginId.length === 0 || pluginId.length > 128)
+      throw new InspectionError("InvalidPluginId", "pluginId must be 1..128");
     if (this.isLive()) {
       const result = this.rpc("bitty.debug/getQueueSnapshot", { pluginId });
       const field = "getQueueSnapshot result";
       const r = requireRecord(result, field);
+      const invariantQueueBounds = requireBoolean(
+        r,
+        "invariant_queue_bounds",
+        field,
+      );
+      const invariantGlobalBounds = requireBoolean(
+        r,
+        "invariant_global_bounds",
+        field,
+      );
+      requireOnlyKeys(
+        r,
+        [
+          "perSubscription",
+          "perPlugin",
+          "global",
+          "invariant_queue_bounds",
+          "invariant_global_bounds",
+        ],
+        field,
+      );
       const perSubscription = requireRecord(
         r["perSubscription"],
         `${field}.perSubscription`,
       );
+      requireOnlyKeys(
+        perSubscription,
+        ["limit", "current"],
+        `${field}.perSubscription`,
+      );
       const perPlugin = requireRecord(r["perPlugin"], `${field}.perPlugin`);
+      requireOnlyKeys(
+        perPlugin,
+        ["events", "bytes", "limitEvents", "limitBytes"],
+        `${field}.perPlugin`,
+      );
       const global = requireRecord(r["global"], `${field}.global`);
+      requireOnlyKeys(
+        global,
+        ["events", "bytes", "limitEvents", "limitBytes"],
+        `${field}.global`,
+      );
       return {
         perSubscription: {
-          limit: requireNumber(
+          limit: requireUnsignedInt(
             perSubscription,
             "limit",
             `${field}.perSubscription`,
           ),
-          current: requireNumber(
+          current: requireUnsignedInt(
             perSubscription,
             "current",
             `${field}.perSubscription`,
           ),
         },
         perPlugin: {
-          events: requireNumber(perPlugin, "events", `${field}.perPlugin`),
-          bytes: requireNumber(perPlugin, "bytes", `${field}.perPlugin`),
-          limitEvents: requireNumber(
+          events: requireUnsignedInt(perPlugin, "events", `${field}.perPlugin`),
+          bytes: requireUnsignedInt(perPlugin, "bytes", `${field}.perPlugin`),
+          limitEvents: requireUnsignedInt(
             perPlugin,
             "limitEvents",
             `${field}.perPlugin`,
           ),
-          limitBytes: requireNumber(
+          limitBytes: requireUnsignedInt(
             perPlugin,
             "limitBytes",
             `${field}.perPlugin`,
           ),
         },
         global: {
-          events: requireNumber(global, "events", `${field}.global`),
-          bytes: requireNumber(global, "bytes", `${field}.global`),
-          limitEvents: requireNumber(global, "limitEvents", `${field}.global`),
-          limitBytes: requireNumber(global, "limitBytes", `${field}.global`),
+          events: requireUnsignedInt(global, "events", `${field}.global`),
+          bytes: requireUnsignedInt(global, "bytes", `${field}.global`),
+          limitEvents: requireUnsignedInt(
+            global,
+            "limitEvents",
+            `${field}.global`,
+          ),
+          limitBytes: requireUnsignedInt(
+            global,
+            "limitBytes",
+            `${field}.global`,
+          ),
         },
         // RFC v1 verdict spelling is snake_case (devtools-rfc:340).
-        invariantQueueBounds: requireBoolean(
-          r,
-          "invariant_queue_bounds",
-          field,
-        ),
-        invariantGlobalBounds: requireBoolean(
-          r,
-          "invariant_global_bounds",
-          field,
-        ),
+        invariantQueueBounds,
+        invariantGlobalBounds,
       };
     }
     return {
@@ -930,20 +1120,26 @@ export class InspectionClient {
           "bitty.debug/getSnapshot returned the runtime-stats snapshot, not the RFC semantic snapshot; bitty must implement a semantic getSnapshot or expose a distinct method",
         );
       }
+      requireOnlyKeys(
+        r,
+        ["cursor", "modeFlags", "semanticZoneCount", "preview"],
+        field,
+      );
       const serverPreview = requireString(r, "preview", field);
       const cursor = requireRecord(r["cursor"], `${field}.cursor`);
-      const modeFlags = requireStringArray(r, "modeFlags", field);
+      requireOnlyKeys(cursor, ["row", "col"], `${field}.cursor`);
+      const modeFlags = requireStringArray(r, "modeFlags", field, 64, 64);
       const bounded = serverPreview.slice(0, MAX_PREVIEW_CHARS);
       const { text, marker } = redactPreview(bounded, "terminal.preview");
       return {
         terminalId,
         scope: "semantic",
         cursor: {
-          row: requireNumber(cursor, "row", `${field}.cursor`),
-          col: requireNumber(cursor, "col", `${field}.cursor`),
+          row: requireUnsignedInt(cursor, "row", `${field}.cursor`),
+          col: requireUnsignedInt(cursor, "col", `${field}.cursor`),
         },
         modeFlags,
-        semanticZoneCount: requireNumber(r, "semanticZoneCount", field),
+        semanticZoneCount: requireUnsignedInt(r, "semanticZoneCount", field),
         preview: text,
         redactionMarker: {
           redacted: marker.redacted,
@@ -971,8 +1167,8 @@ export class InspectionClient {
 
   listHandles(scope: string, pluginId: string): HandleInfo[] {
     this.requireInspect(scope);
-    if (pluginId.length > 128)
-      throw new InspectionError("InvalidPluginId", "pluginId too long");
+    if (pluginId.length === 0 || pluginId.length > 128)
+      throw new InspectionError("InvalidPluginId", "pluginId must be 1..128");
     if (this.isLive()) {
       const result = this.rpc("bitty.debug/listHandles", { pluginId });
       const list = requireArray(result, "listHandles result");
@@ -980,10 +1176,11 @@ export class InspectionClient {
       return list.slice(0, MAX_HANDLES).map((entry, i) => {
         const field = `listHandles result[${i}]`;
         const r = requireRecord(entry, field);
+        requireOnlyKeys(r, ["handle", "capability", "refCount"], field);
         return {
-          handle: requireNonEmptyString(r, "handle", field),
-          capability: requireNonEmptyString(r, "capability", field),
-          refCount: requireNumber(r, "refCount", field),
+          handle: requireNonEmptyString(r, "handle", field, 256),
+          capability: requireNonEmptyString(r, "capability", field, 128),
+          refCount: requireUnsignedInt(r, "refCount", field),
         };
       });
     }

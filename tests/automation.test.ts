@@ -473,7 +473,7 @@ describe("AutomationClient captureFrame", () => {
       explicitOptIn: true,
     });
     expect(frame.format).toBe("pixels");
-    expect(frame.masked).toBe(true);
+    expect((frame as { masked: boolean }).masked).toBe(true);
   });
 
   test("rejects a pixels envelope carrying a tiny non-image sentinel", () => {

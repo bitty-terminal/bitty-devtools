@@ -42,25 +42,18 @@ and this project adheres to no released version yet.
   issue's strict-envelope requirement.
 
 - **Diagnostics client phase 2 (CTX-0012)**: advanced tracing, control
-  surfaces, and real IPC socket/pipe peer-creds integration against the live
-  Bitty runtime. Reuses Panel Runtime and 14×4 compat matrix and extends
-  phase 1; bounded and `forbid(unsafe_code)`; strict TypeScript with no `any`.
-  Includes headless-testable `auth` (Unix `SO_PEERCRED` / Windows pipe ACL,
-  `0700`/`0600`, per-action re-verify, `BITTY_SOCKET` advisory, child token
-  `60s` bounded `64`) and `transport` (length-prefixed `256 KiB` frames,
-  `1 MiB` devtools logical, `RC-9` `100/s` `200` burst `16` conn, `RC-10`
-  `256 KiB` chunk, `Framer` `512 KiB` bound, `RateLimiter` deterministic,
-  `StdioTransportStub` + `IpcTransport` with `forwardTo` pipe simulation);
-  advanced `tracing` (filtering by kinds/owners `32`, coalescing `budget`,
-  structured attributable events, retention `4 MiB`/`5 min`/`4` traces,
-  GC `gcExpiredTraces`, chunked `256 KiB` export `0600` preview==export);
-  advanced `control` (pause/resume, generation exhaustion guard
-  `MAX_SAFE_INTEGER-1024`, transactional audit log `256` bounded,
-  `validateGeneration`, `listAuditLog`); client `DevtoolsClient` now
-  integrates `IpcTransport` (`connectWithTransport`, `connectLive` with
-  `XDG_RUNTIME_DIR` socket `0700`/`0600`, `isIpcConnected`,
-  per-privileged peer re-verify). TypeScript `62` tests and Rust
-  `37` tests pass; `just check` green.
+  surfaces, and a Linux-only endpoint-attested Unix-socket inspection adapter.
+  The adapter verifies the socket path, parent directory, endpoint ownership,
+  and modes before dialing, but does not authenticate a connected peer; live
+  sessions are therefore inspect-only. Windows named-pipe and macOS live
+  adapters are not implemented and fail closed. The client also retains a
+  headless transport/authentication fixture for caller-supplied values and
+  deterministic tests, not OS connectivity. Reuses Panel Runtime and the
+  14×4 compat matrix; bounded and `forbid(unsafe_code)` in Rust, strict
+  TypeScript with no `any`. `BITTY_SOCKET` and `BITTY_INSTANCE_ID` select a
+  bounded path but are not credentials or identity. Advanced tracing and
+  control remain simulation/test surfaces until a server-backed trace receipt
+  and connected-identity control contract exist.
 
 - **Diagnostics client phase 1 (CTX-0011)**: human-facing inspection,
   tracing, and control surfaces for local debugging over the accepted Panel
@@ -74,13 +67,11 @@ and this project adheres to no released version yet.
   protocol `1.0`.
 
 - **Toolchain pin (CTX-0046)**: pin `packageManager` to `bun@1.4.2` in
-  `package.json`, matching the workspace toolchain. `bun.lock` is unchanged
-  (`bun install --frozen-lockfile` passes). CI still installs Bun `1.4.0`
-  via `bun-version` (drift noted; workflow untouched by this slice).
-
-- **CI Bun version (CTX-0047)**: align `bun-version` in
-  `.github/workflows/ci.yml` with the `bun@1.4.2` toolchain pin, removing the
-  drift noted by CTX-0046.
+  `package.json`, matching the workspace toolchain. `bun.lock` is synchronized
+  with the declared dependencies; `bun install --frozen-lockfile --dry-run`
+  passes.
+- **CI Bun version (CTX-0047)**: pin CI to Bun `1.4.2` and use
+  `bun install --frozen-lockfile` in the quality and platform jobs.
 
 - **Governance scaffolding**: MIT [LICENSE](./LICENSE), contribution guide
   ([CONTRIBUTING.md](./CONTRIBUTING.md)) with the Bitty delivery lifecycle and
@@ -102,3 +93,33 @@ and this project adheres to no released version yet.
   unchanged retained state, opaque raw append distinct from typed stream
   coalescing, and `fetchTraceChunk` pagination on retained UTF-8 byte offsets.
   No code behavior changed.
+
+### Fixed
+
+- **Platform, version, and quality contracts (CTX-0080 / #141)**: the live
+  inspection path is now described as the code implements it. The live adapter
+  is Linux-only and attests the endpoint (socket path, parent directory,
+  ownership, and modes) before dialing; it does not authenticate a connected
+  peer, so live sessions stay inspect-only and `authenticated: false` is
+  reported. Windows and macOS return an explicit unsupported result and never
+  reach endpoint access. Unsupported live protocol versions and methods are
+  rejected with typed fail-closed errors before socket I/O, owned by
+  `src/protocol-boundary.ts` (live request admission only; `src/protocol.ts`
+  decoding stays with CTX-0079). `BITTY_SOCKET` and `BITTY_INSTANCE_ID` remain
+  bounded path selectors and are never credentials or identity, and no runtime
+  UID environment variable is read. CodeQL activates the checked-in
+  `.github/codeql/codeql-config.yml` for the combined `javascript-typescript,
+actions` analysis and adds a separate Rust analysis with
+  `build-mode: autobuild`; the combined job keeps its exact name because branch
+  protection on `main` requires the status context
+  `Analyze (javascript-typescript, actions)`, now mirrored in
+  `.github/required-status-checks.txt` and asserted by
+  `tests/platform-contract.test.ts`. CI installs locked dependencies before the
+  quality and platform jobs, runs the offline platform contract on Linux, macOS,
+  and Windows, and pins the actionlint image by digest; Dependabot covers the
+  Cargo workspace. The `workflow-import` fixture suite derives its per-test
+  deadline from the fixture spawn budget, because Bun's 5 s per-test default is
+  shorter than one fixture run and so reported correct runs as timeouts under
+  load; `tests/workflow-import-budget.test.ts` fails if the two budgets cross
+  again. No `Verified` or `Compatible` platform status is claimed, and no
+  interoperability, release, or distribution claim is made.

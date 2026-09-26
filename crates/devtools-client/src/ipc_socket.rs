@@ -1,4 +1,4 @@
-//! Live Unix IPC socket seam for DevTools (CTX-0036, H-DEV-06).
+//! Linux-only live Unix IPC socket seam for DevTools (CTX-0036, H-DEV-06).
 //!
 //! `transport::IpcTransport` is a headless stub: `connect()` verifies
 //! caller-supplied mode values and flips a flag without ever dialing the OS
@@ -17,26 +17,44 @@
 //!   mode `0600` and owned by the runtime UID. Anything else refuses to dial.
 //! - Responses are untrusted observation data: bounded at 256 KiB, framed
 //!   exactly once, and returned as raw bytes for the caller to decode.
-//! - Unix only. The Windows named-pipe dial stays with CTX-0043 and is not
-//!   duplicated here; on non-Unix targets every entry point fails closed.
+//! - Linux endpoint attestation is the only implemented live target. Windows
+//!   and macOS entry points fail closed; no alternate adapter is implied here.
 //! - No `unsafe`: only blocking std I/O with read/write timeouts.
 
-use crate::auth::{AuthError, DIR_MODE, SOCKET_MODE, resolve_socket_path};
-use crate::transport::{MAX_FRAME_BYTES, TransportError, decode_frame, encode_frame};
+use crate::auth::{AuthError, MAX_SOCKET_PATH_BYTES, resolve_socket_path};
+#[cfg(unix)]
+use crate::auth::{DIR_MODE, SOCKET_MODE};
+use crate::transport::TransportError;
+#[cfg(target_os = "linux")]
+use crate::transport::{MAX_FRAME_BYTES, decode_frame, encode_frame};
 
 /// Per-dial and per-response timeout (matches the TS seam).
 pub const LIVE_SOCKET_TIMEOUT_SECS: u64 = 5;
+
+pub const LIVE_SOCKET_SUPPORTED_OS: &str = "linux";
+
+#[must_use]
+pub fn live_socket_supported() -> bool {
+    cfg!(target_os = "linux")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LiveSocketIdentity {
+    pub runtime_uid: u32,
+    pub authenticated: bool,
+}
 
 /// Resolved dial target: the attested path plus the owning runtime UID.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiveSocketEndpoint {
     /// Attested socket path to dial.
     pub socket_path: String,
-    /// Owning runtime UID (endpoint owner + dialing peer).
+    /// Expected endpoint owner UID; this is not a connected peer identity.
     pub runtime_uid: u32,
 }
 
-/// Dial configuration: explicit path wins, otherwise advisory discovery.
+/// Dial configuration: explicit path wins, otherwise environment-based
+/// endpoint selection. The selector is not a credential.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct LiveSocketConfig {
     /// Explicit socket path (skips discovery).
@@ -45,14 +63,14 @@ pub struct LiveSocketConfig {
     pub runtime_uid: u32,
     /// `XDG_RUNTIME_DIR` override for discovery.
     pub xdg_runtime_dir: Option<String>,
-    /// `BITTY_SOCKET` advisory override for discovery.
+    /// `BITTY_SOCKET` path selector for discovery.
     pub bitty_socket: Option<String>,
     /// Instance id for discovery (`default` when absent).
     pub instance_id: Option<String>,
 }
 
-/// Resolve the dial target: explicit path wins, otherwise the advisory
-/// `BITTY_SOCKET` / `XDG_RUNTIME_DIR` / instance discovery from `auth`.
+/// Resolve the dial target: explicit path wins, otherwise
+/// `BITTY_SOCKET` / `XDG_RUNTIME_DIR` / instance selection from `auth`.
 pub fn resolve_live_socket_endpoint(
     config: &LiveSocketConfig,
 ) -> Result<LiveSocketEndpoint, TransportError> {
@@ -66,12 +84,27 @@ pub fn resolve_live_socket_endpoint(
         )
         .map_err(|e| TransportError::Unauthenticated(e.to_string()))?,
     };
+    if socket_path.is_empty()
+        || !socket_path.starts_with('/')
+        || socket_path.as_bytes().contains(&0)
+        || socket_path.contains('\\')
+        || socket_path
+            .split('/')
+            .skip(1)
+            .any(|part| part.is_empty() || part == "." || part == "..")
+        || socket_path.len() > MAX_SOCKET_PATH_BYTES
+    {
+        return Err(TransportError::Unauthenticated(
+            "live socket path must be an absolute bounded AF_UNIX path".to_string(),
+        ));
+    }
     Ok(LiveSocketEndpoint {
         socket_path,
         runtime_uid: config.runtime_uid,
     })
 }
 
+#[cfg(unix)]
 fn parent_dir_of(path: &str) -> &str {
     match path.rfind('/') {
         Some(0) | None => "/",
@@ -79,6 +112,19 @@ fn parent_dir_of(path: &str) -> &str {
     }
 }
 
+#[cfg(unix)]
+fn path_ancestors(path: &str) -> Vec<String> {
+    let mut current = String::new();
+    let mut ancestors = Vec::new();
+    for part in path.split('/').filter(|part| !part.is_empty()) {
+        current.push('/');
+        current.push_str(part);
+        ancestors.push(current.clone());
+    }
+    ancestors
+}
+
+#[cfg(unix)]
 fn leaf_of(path: &str) -> &str {
     match path.rfind('/') {
         Some(i) => &path[i + 1..],
@@ -86,7 +132,14 @@ fn leaf_of(path: &str) -> &str {
     }
 }
 
-/// Attest the endpoint before dialing (Unix only).
+fn unsupported_platform_error() -> TransportError {
+    TransportError::Unauthenticated(format!(
+        "live Unix socket transport is unsupported on {}; Linux endpoint attestation is the only implemented live adapter",
+        std::env::consts::OS
+    ))
+}
+
+/// Attest the endpoint before dialing (Linux only).
 ///
 /// The parent directory must be `0700` and runtime-owned, the socket must
 /// exist, be a real socket (not a symlink), be mode `0600`, and be
@@ -94,6 +147,9 @@ fn leaf_of(path: &str) -> &str {
 /// `devtools::prepare_socket_dir` / `attest_bound_socket`.
 #[cfg(unix)]
 pub fn attest_live_socket_endpoint(endpoint: &LiveSocketEndpoint) -> Result<(), TransportError> {
+    if !live_socket_supported() {
+        return Err(unsupported_platform_error());
+    }
     use std::os::unix::fs::FileTypeExt;
 
     let fail = |message: String| TransportError::Unauthenticated(message);
@@ -101,15 +157,22 @@ pub fn attest_live_socket_endpoint(endpoint: &LiveSocketEndpoint) -> Result<(), 
         return Err(fail("socket path contains NUL".to_string()));
     }
     let parent = parent_dir_of(&endpoint.socket_path);
+    for component in path_ancestors(parent) {
+        let metadata = std::fs::symlink_metadata(&component).map_err(|_| {
+            fail(format!(
+                "socket path component '{component}' does not exist"
+            ))
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err(fail(format!(
+                "socket path component '{component}' is a symlink (refusing to dial)"
+            )));
+        }
+    }
     let dir_meta = std::fs::symlink_metadata(parent)
         .map_err(|_| fail(format!("socket directory '{parent}' does not exist")))?;
     let sock_meta = std::fs::symlink_metadata(&endpoint.socket_path)
         .map_err(|_| fail(format!("socket '{}' does not exist", endpoint.socket_path)))?;
-    if dir_meta.file_type().is_symlink() {
-        return Err(fail(format!(
-            "socket directory '{parent}' is a symlink (refusing to dial)"
-        )));
-    }
     if sock_meta.file_type().is_symlink() {
         return Err(fail(format!(
             "socket '{}' is a symlink (refusing to dial)",
@@ -153,31 +216,35 @@ pub fn attest_live_socket_endpoint(endpoint: &LiveSocketEndpoint) -> Result<(), 
     Ok(())
 }
 
-/// Non-Unix stub: there is no `AF_UNIX` dial here (named pipe stays with
-/// CTX-0043), so attestation always fails closed.
+/// Non-Linux stub: there is no verified live adapter, so attestation always
+/// fails closed.
 #[cfg(not(unix))]
 pub fn attest_live_socket_endpoint(endpoint: &LiveSocketEndpoint) -> Result<(), TransportError> {
-    Err(TransportError::Unauthenticated(format!(
-        "live Unix socket dial is unsupported on this platform (refusing '{}')",
-        endpoint.socket_path
-    )))
+    let _ = endpoint;
+    Err(unsupported_platform_error())
 }
 
-/// One live `AF_UNIX` connection (Unix only): owns the stream, frames one
+/// One live `AF_UNIX` connection (Linux only): owns the stream, frames one
 /// request/response round trip, and closes on drop.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[derive(Debug)]
 pub struct LiveSocketConnection {
     stream: std::os::unix::net::UnixStream,
     socket_path: String,
+    identity: LiveSocketIdentity,
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 impl LiveSocketConnection {
     /// The attested path this connection dialed.
     #[must_use]
     pub fn socket_path(&self) -> &str {
         &self.socket_path
+    }
+
+    #[must_use]
+    pub fn identity(&self) -> LiveSocketIdentity {
+        self.identity
     }
 
     /// Write one framed request and read the next framed response payload
@@ -235,15 +302,18 @@ impl LiveSocketConnection {
     }
 }
 
-/// Dial the live socket (Unix only). Attests the endpoint first (fail
+/// Dial the live socket (Linux only). Attests the endpoint first (fail
 /// closed), then opens one blocking `AF_UNIX` connection with timeouts.
 /// The caller owns the connection.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 pub fn connect_live_socket(
     config: &LiveSocketConfig,
 ) -> Result<LiveSocketConnection, TransportError> {
     use std::time::Duration;
 
+    if !live_socket_supported() {
+        return Err(unsupported_platform_error());
+    }
     let endpoint = resolve_live_socket_endpoint(config)?;
     attest_live_socket_endpoint(&endpoint)?;
     let stream = std::os::unix::net::UnixStream::connect(&endpoint.socket_path)
@@ -256,14 +326,24 @@ pub fn connect_live_socket(
         .map_err(|_| TransportError::TransportClosed)?;
     Ok(LiveSocketConnection {
         stream,
-        socket_path: endpoint.socket_path,
+        socket_path: endpoint.socket_path.clone(),
+        identity: LiveSocketIdentity {
+            runtime_uid: endpoint.runtime_uid,
+            authenticated: false,
+        },
     })
 }
 
-/// Non-Unix stub: no `AF_UNIX` dial here, fail closed.
-#[cfg(not(unix))]
-pub fn connect_live_socket(_config: &LiveSocketConfig) -> Result<(), TransportError> {
-    Err(TransportError::TransportClosed)
+/// Non-Linux connection type retained for cross-target API compatibility.
+#[cfg(not(target_os = "linux"))]
+#[derive(Debug)]
+pub struct LiveSocketConnection;
+
+#[cfg(not(target_os = "linux"))]
+pub fn connect_live_socket(
+    _config: &LiveSocketConfig,
+) -> Result<LiveSocketConnection, TransportError> {
+    Err(unsupported_platform_error())
 }
 
 impl From<AuthError> for TransportError {
@@ -272,7 +352,7 @@ impl From<AuthError> for TransportError {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
     use std::io::{Read, Write};
@@ -333,12 +413,24 @@ mod tests {
         };
         let mut conn = connect_live_socket(&config).unwrap();
         assert_eq!(conn.socket_path(), endpoint.socket_path);
+        assert_eq!(conn.identity().runtime_uid, uid);
+        assert!(!conn.identity().authenticated);
         let request = br#"{"id":7,"method":"bitty.debug/listPlugins","params":{},"version":"1.0"}"#;
         let raw = conn.request_response(request, 0).unwrap();
         let decoded: serde_like::JsonResponse = serde_like::parse(&raw);
         assert_eq!(decoded.id, 7);
         server.join().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn live_path_rejects_dot_segments() {
+        let config = LiveSocketConfig {
+            socket_path: Some("/run/user/1000/bitty/../other.sock".to_string()),
+            runtime_uid: 1000,
+            ..LiveSocketConfig::default()
+        };
+        assert!(resolve_live_socket_endpoint(&config).is_err());
     }
 
     #[test]

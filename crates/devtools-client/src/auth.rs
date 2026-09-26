@@ -1,11 +1,13 @@
 #![forbid(unsafe_code)]
-//! Peer-credential authentication for IPC (phase 2, live runtime).
+//! Headless authentication and endpoint-policy helpers for DevTools.
 //!
-//! Mirrors `bitty-ipc` auth contract: Unix socket 0700/0600, Windows named
-//! pipe ACL, peer UID equality via `SO_PEERCRED` paradigm. Verification is
-//! headless and bounded, requiring no `unsafe`. The platform seam that
-//! extracts `PeerCredentials` via `getsockopt(SO_PEERCRED)` lives outside
-//! this crate; here we only verify already-extracted triples.
+//! Mirrors `bitty-ipc` policy values: Unix socket 0700/0600, Windows named
+//! pipe ACL, and peer UID equality. Verification is bounded and requires no
+//! `unsafe`. This module does not extract `SO_PEERCRED` or
+//! `GetNamedPipeClientProcessId` values and does not establish a live peer
+//! identity; it verifies caller-supplied triples in the headless fixture.
+//! The implemented live adapter separately attests endpoint ownership and
+//! mode and remains inspect-only.
 
 pub const DIR_MODE: u32 = 0o700;
 pub const SOCKET_MODE: u32 = 0o600;
@@ -149,7 +151,8 @@ pub fn short_instance_hash(instance: &str) -> String {
 /// Resolve the Unix socket path with `bitty-ipc` precedence and a portable
 /// `AF_UNIX` bound.
 ///
-/// Precedence: non-empty `BITTY_SOCKET` (advisory) wins verbatim; otherwise
+/// Precedence: non-empty `BITTY_SOCKET` (the explicit dial target) wins
+/// verbatim; otherwise
 /// `<base>/bitty/<instance>.sock` where `base` is `XDG_RUNTIME_DIR` or
 /// `/run/user/<uid>`, and `instance` is `BITTY_INSTANCE_ID` or `default`.
 ///

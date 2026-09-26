@@ -15,8 +15,39 @@ permissions:
   contents: read
 
 jobs:
+  # Branch protection on main requires the status context
+  # "Analyze (javascript-typescript, actions)" under this exact name, so the
+  # combined analysis stays a single job with its historical name. Splitting it
+  # into a per-language matrix renames every check and blocks every pull
+  # request. Change the required context in branch protection before renaming
+  # this job. The emitted names are guarded by
+  # tests/platform-contract.test.ts against
+  # .github/required-status-checks.txt.
   analyze:
     name: Analyze (javascript-typescript, actions)
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@1c5b675653bb5c22dbe9b12b556ec555138e09fd # v4
+        with:
+          languages: javascript-typescript, actions
+          build-mode: none
+          config-file: .github/codeql/codeql-config.yml
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@1c5b675653bb5c22dbe9b12b556ec555138e09fd # v4
+        with:
+          category: "/language:javascript-typescript,actions"
+
+  # Rust is a second language in this repository, analysed separately so the
+  # required combined context above is never renamed.
+  analyze-rust:
+    name: Analyze (rust)
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -27,6 +58,10 @@ jobs:
       - name: Initialize CodeQL
         uses: github/codeql-action/init@1c5b675653bb5c22dbe9b12b556ec555138e09fd # v4
         with:
-          languages: javascript-typescript, actions
+          languages: rust
+          build-mode: autobuild
+          config-file: .github/codeql/codeql-config.yml
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@1c5b675653bb5c22dbe9b12b556ec555138e09fd # v4
+        with:
+          category: "/language:rust"

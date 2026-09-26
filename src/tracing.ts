@@ -3,15 +3,15 @@
  *
  * Reuses the observability pipeline envelope from devtools-rfc: per-subscription
  * 64, per-plugin 1024/256 KiB, global 8192/2 MiB, DropOldest default, batch
- * 32/8 KiB, chunked at 256 KiB to user-only storage (0600). Minimization by
- * default, input markers require explicit includeInput:true plus typed redaction.
- * Preview equals export before transmission.
+ * 32/8 KiB, and 256 KiB continuation chunks in memory. Minimization is the
+ * default; input markers require explicit `includeInput: true` plus typed
+ * redaction. Preview equals export before transmission.
  *
  * Phase 2 adds: advanced filtering, structured attributable events, retention
  * and GC policy, coalescing control, deterministic wall-clock, export preview
  * with chunked continuation, and DropOldest/DropNewest policies. All bounds are
- * preserved and peer-creds are re-checked per privileged action via the IPC
- * transport seam.
+ * preserved. The headless transport fixture re-checks caller-supplied peer
+ * values per privileged action; the Linux live socket path is inspect-only.
  */
 
 import { BOUNDS, assertBounded, assertStringBounded } from "./bounds.js";
@@ -49,7 +49,8 @@ export type TraceRetention = {
 
 export type TraceStartResult = {
   traceId: string;
-  spoolPath: string;
+  spoolPath: null;
+  storage: "memory";
   chunkBytes: number;
   startWallClockMs: number;
   filter?: TraceFilter;
@@ -63,7 +64,7 @@ export type TraceStopResult = {
   previews: string[];
   exportBytesEstimate: number;
   truncated: boolean;
-  spoolMode: string;
+  spoolMode: "memory";
 };
 
 export type TraceChunk = {
@@ -85,10 +86,16 @@ export type StructuredTraceEvent = {
   coalesced?: boolean;
 };
 
+export type ObservabilityBatchRecord = {
+  owner: string;
+  kind: string;
+  payload: string;
+};
+
 export type ObservabilityBatch = {
   sequence: number;
   dropCount: number;
-  records: Array<{ owner: string; kind: string; payload: string }>;
+  records: ObservabilityBatchRecord[];
   wallClockMs: number;
   coalescedCount: number;
   policy: "DropOldest" | "DropNewest";
@@ -119,6 +126,41 @@ const DEFAULT_RETENTION: Required<TraceRetention> = {
   maxTraces: MAX_TRACES_PER_SESSION,
 };
 
+function validateBatch(batch: { maxEvents: number; maxBytes: number }): void {
+  if (!Number.isSafeInteger(batch.maxEvents) || batch.maxEvents <= 0) {
+    throw new TracingError(
+      "InvalidBatch",
+      "maxEvents must be a positive integer",
+    );
+  }
+  if (!Number.isSafeInteger(batch.maxBytes) || batch.maxBytes <= 0) {
+    throw new TracingError(
+      "InvalidBatch",
+      "maxBytes must be a positive integer",
+    );
+  }
+  assertBounded("maxEvents", batch.maxEvents, BOUNDS.BUS_BATCH_MAX_EVENTS);
+  assertBounded("maxBytes", batch.maxBytes, BOUNDS.BUS_BATCH_MAX_BYTES);
+}
+
+function admitBatchRecords(
+  records: ObservabilityBatchRecord[],
+  maxBytes: number,
+): { records: ObservabilityBatchRecord[]; dropCount: number } {
+  const encoder = new TextEncoder();
+  const admitted: ObservabilityBatchRecord[] = [];
+  let dropCount = 0;
+  for (const record of records) {
+    const candidate = [...admitted, record];
+    if (encoder.encode(JSON.stringify(candidate)).length > maxBytes) {
+      dropCount += 1;
+      continue;
+    }
+    admitted.push(record);
+  }
+  return { records: admitted, dropCount };
+}
+
 export class TracingClient {
   private traces = new Map<
     string,
@@ -141,7 +183,7 @@ export class TracingClient {
   private globalSequence = 0;
 
   private requireTrace(scope: string): void {
-    if (scope !== "debug.trace" && scope !== "debug.control") {
+    if (scope !== "debug.trace") {
       throw new TracingError("ScopeDenied", "debug.trace scope required");
     }
   }
@@ -162,11 +204,33 @@ export class TracingClient {
     const filter = opts.filter;
     if (filter?.kinds !== undefined) {
       assertBounded("filter.kinds", filter.kinds.length, 32);
-      for (const k of filter.kinds) assertStringBounded("filter kind", k, 64);
+      for (const k of filter.kinds) {
+        assertStringBounded("filter kind", k, 64);
+        if (k.length === 0) {
+          throw new TracingError(
+            "InvalidFilter",
+            "filter kind must not be empty",
+          );
+        }
+      }
     }
     if (filter?.owners !== undefined) {
       assertBounded("filter.owners", filter.owners.length, 32);
-      for (const o of filter.owners) assertStringBounded("filter owner", o, 64);
+      if (filter.owners.length === 0) {
+        throw new TracingError(
+          "InvalidFilter",
+          "filter.owners must not be empty",
+        );
+      }
+      for (const o of filter.owners) {
+        assertStringBounded("filter owner", o, 64);
+        if (o.length === 0) {
+          throw new TracingError(
+            "InvalidFilter",
+            "filter owner must not be empty",
+          );
+        }
+      }
     }
     const retention: Required<TraceRetention> = {
       maxBytes:
@@ -232,7 +296,6 @@ export class TracingClient {
     }
     const validated = this.validateOptions(opts);
     const traceId = `trace-${this.nextTrace++}`;
-    const spoolPath = `/tmp/bitty-traces/${traceId}.jsonl`;
     const startWallClockMs = Date.now();
     this.traces.set(traceId, {
       options: validated,
@@ -250,7 +313,8 @@ export class TracingClient {
     });
     return {
       traceId,
-      spoolPath,
+      spoolPath: null,
+      storage: "memory",
       chunkBytes: BOUNDS.CHUNK_BYTES,
       startWallClockMs,
       filter: validated.filter,
@@ -274,7 +338,6 @@ export class TracingClient {
     }
     const validated = this.validateOptions(opts);
     const traceId = `trace-${this.nextTrace++}`;
-    const spoolPath = `/run/user/1000/bitty/traces/${traceId}.jsonl`;
     this.traces.set(traceId, {
       options: validated,
       bytes: 0,
@@ -291,7 +354,8 @@ export class TracingClient {
     });
     return {
       traceId,
-      spoolPath,
+      spoolPath: null,
+      storage: "memory",
       chunkBytes: BOUNDS.CHUNK_BYTES,
       startWallClockMs: wall,
       filter: validated.filter,
@@ -317,7 +381,7 @@ export class TracingClient {
       previews,
       exportBytesEstimate,
       truncated,
-      spoolMode: "0600",
+      spoolMode: "memory",
     };
     this.traces.delete(traceId);
     return result;
@@ -330,27 +394,27 @@ export class TracingClient {
     signal?: AbortSignal,
   ): ObservabilityBatch {
     this.requireTrace(scope);
-    if (signal?.aborted)
+    if (signal?.aborted) {
       throw new TracingError("Cancelled", "stream cancelled");
-    assertBounded("maxEvents", batch.maxEvents, BOUNDS.BUS_BATCH_MAX_EVENTS);
-    assertBounded("maxBytes", batch.maxBytes, BOUNDS.BUS_BATCH_MAX_BYTES);
+    }
+    validateBatch(batch);
+    assertBounded("event types", types.length, 256);
     for (const t of types) {
       assertStringBounded("eventType", t, 64);
-      if (t.length === 0)
+      if (t.length === 0) {
         throw new TracingError("InvalidType", "event type must not be empty");
+      }
     }
-    const records = types.slice(0, batch.maxEvents).map((t) => ({
+    const candidates = types.slice(0, batch.maxEvents).map((t) => ({
       owner: "panel-1",
       kind: t,
       payload: JSON.stringify({ count: 1 }),
     }));
-    const bytes = new TextEncoder().encode(JSON.stringify(records)).length;
-    assertBounded("batch bytes", bytes, BOUNDS.BUS_BATCH_MAX_BYTES);
-    const dropCount = 0;
+    const admitted = admitBatchRecords(candidates, batch.maxBytes);
     return {
       sequence: this.globalSequence++,
-      dropCount,
-      records,
+      dropCount: types.length - admitted.records.length,
+      records: admitted.records,
       wallClockMs: Date.now(),
       coalescedCount: 0,
       policy: "DropOldest",
@@ -366,35 +430,55 @@ export class TracingClient {
     signal?: AbortSignal,
   ): ObservabilityBatch {
     this.requireTrace(scope);
-    if (signal?.aborted)
+    if (signal?.aborted) {
       throw new TracingError("Cancelled", "stream cancelled");
-    assertBounded("maxEvents", batch.maxEvents, BOUNDS.BUS_BATCH_MAX_EVENTS);
-    assertBounded("maxBytes", batch.maxBytes, BOUNDS.BUS_BATCH_MAX_BYTES);
+    }
+    validateBatch(batch);
     const kinds = filter.kinds ?? ["bitty.panel:mounted"];
+    const owners = filter.owners ?? ["panel-1"];
     assertBounded("filter.kinds", kinds.length, 32);
-    for (const k of kinds) assertStringBounded("eventType", k, 64);
-    const wall = nowMs ?? Date.now();
-    // Coalescing: merge successive budget records from same owner
-    const seen = new Map<string, number>();
-    let coalescedCount = 0;
-    const records: Array<{ owner: string; kind: string; payload: string }> = [];
+    assertBounded("filter.owners", owners.length, 32);
+    if (owners.length === 0) {
+      throw new TracingError(
+        "InvalidFilter",
+        "filter.owners must not be empty",
+      );
+    }
+
     for (const k of kinds) {
-      if (records.length >= batch.maxEvents) break;
-      const owner = filter.owners?.[0] ?? "panel-1";
-      const key = `${owner}:${k}`;
+      assertStringBounded("eventType", k, 64);
+      if (k.length === 0) {
+        throw new TracingError("InvalidType", "event type must not be empty");
+      }
+    }
+    for (const owner of owners) {
+      assertStringBounded("event owner", owner, 64);
+      if (owner.length === 0) {
+        throw new TracingError("InvalidType", "event owner must not be empty");
+      }
+    }
+    const owner = owners[0] ?? "panel-1";
+    const wall = nowMs ?? Date.now();
+    const seen = new Set<string>();
+    let coalescedCount = 0;
+    const candidates: ObservabilityBatchRecord[] = [];
+    for (const kind of kinds) {
+      const key = `${owner}:${kind}`;
       if (seen.has(key)) {
         coalescedCount += 1;
         continue;
       }
-      seen.set(key, 1);
-      records.push({ owner, kind: k, payload: JSON.stringify({ count: 1 }) });
+      seen.add(key);
+      candidates.push({ owner, kind, payload: JSON.stringify({ count: 1 }) });
     }
-    const bytes = new TextEncoder().encode(JSON.stringify(records)).length;
-    assertBounded("batch bytes", bytes, BOUNDS.BUS_BATCH_MAX_BYTES);
+    const admitted = admitBatchRecords(
+      candidates.slice(0, batch.maxEvents),
+      batch.maxBytes,
+    );
     return {
       sequence: this.globalSequence++,
-      dropCount: 0,
-      records,
+      dropCount: candidates.length - admitted.records.length,
+      records: admitted.records,
       wallClockMs: wall,
       coalescedCount,
       policy: "DropOldest",
@@ -456,7 +540,8 @@ export class TracingClient {
   }
 
   /** Append bounded records to a trace (internal, for testing). Bounded 8 KiB per record. */
-  appendToTrace(traceId: string, data: string): void {
+  appendToTrace(scope: string, traceId: string, data: string): void {
+    this.requireTrace(scope);
     const rec = this.traces.get(traceId);
     if (rec === undefined)
       throw new TracingError("NotFound", `trace ${traceId} not found`);
@@ -500,7 +585,12 @@ export class TracingClient {
   }
 
   /** Phase 2: append structured attributable event (bounded). */
-  appendStructuredEvent(traceId: string, event: StructuredTraceEvent): void {
+  appendStructuredEvent(
+    scope: string,
+    traceId: string,
+    event: StructuredTraceEvent,
+  ): void {
+    this.requireTrace(scope);
     const rec = this.traces.get(traceId);
     if (rec === undefined)
       throw new TracingError("NotFound", `trace ${traceId} not found`);
@@ -509,12 +599,32 @@ export class TracingClient {
       event.payload,
       BOUNDS.BUS_EVENT_MAX_BYTES,
     );
+    assertStringBounded("structured event owner", event.owner, 64);
     assertStringBounded("structured event kind", event.kind, 64);
-    assertBounded(
-      "structured event generation",
-      event.generation,
-      Number.MAX_SAFE_INTEGER,
-    );
+    if (event.owner.length === 0 || event.kind.length === 0) {
+      throw new TracingError(
+        "InvalidEvent",
+        "owner and kind must not be empty",
+      );
+    }
+    if (!Number.isSafeInteger(event.sequence) || event.sequence < 0) {
+      throw new TracingError(
+        "InvalidEvent",
+        "sequence must be a nonnegative safe integer",
+      );
+    }
+    if (!Number.isSafeInteger(event.generation) || event.generation < 1) {
+      throw new TracingError(
+        "InvalidEvent",
+        "generation must be a positive safe integer",
+      );
+    }
+    if (!Number.isSafeInteger(event.wallClockMs) || event.wallClockMs < 0) {
+      throw new TracingError(
+        "InvalidEvent",
+        "wallClockMs must be a nonnegative safe integer",
+      );
+    }
     // Filter enforcement
     if (
       rec.filter?.kinds !== undefined &&
@@ -566,7 +676,8 @@ export class TracingClient {
   }
 
   /** Phase 2: retention and GC. */
-  getRetention(traceId: string): TraceRetentionPolicy {
+  getRetention(scope: string, traceId: string): TraceRetentionPolicy {
+    this.requireTrace(scope);
     const rec = this.traces.get(traceId);
     if (rec === undefined)
       throw new TracingError("NotFound", `trace ${traceId} not found`);
@@ -579,8 +690,8 @@ export class TracingClient {
     };
   }
 
-  gcExpiredTraces(nowMs: number, scope?: string): string[] {
-    if (scope !== undefined) this.requireTrace(scope);
+  gcExpiredTraces(nowMs: number, scope: string): string[] {
+    this.requireTrace(scope);
     const expired: string[] = [];
     for (const [id, rec] of this.traces) {
       if (nowMs - rec.startMs >= rec.retention.maxDurationMs) {
@@ -605,16 +716,24 @@ export class TracingClient {
     // H-DEV-02 (CTX-0032): was `previewEqualsExport(text, text)`, a
     // self-comparison that always passed; re-derive from the export bytes.
     assertPreviewMatchesExport(text, preview);
-    return { preview: text, exportBytes: rec.bytes, spoolMode: "0600" };
+    return { preview: text, exportBytes: rec.bytes, spoolMode: "memory" };
   }
 
   /** For diagnostics: remaining traces count. Bounded. */
-  traceCount(): number {
+  traceCount(scope: string): number {
+    this.requireTrace(scope);
     return this.traces.size;
   }
 
-  listTraces(): string[] {
+  listTraces(scope: string): string[] {
+    this.requireTrace(scope);
     return [...this.traces.keys()];
+  }
+
+  clearSessionState(): void {
+    this.traces.clear();
+    this.nextTrace = 1;
+    this.globalSequence = 0;
   }
 }
 

@@ -6,12 +6,16 @@
  * type-checked module; the runner receives an explicit runtime.
  */
 
-import { runCli } from "../src/cli.js";
+import { runCliLive } from "../src/cli.js";
 
 const uid = typeof process.getuid === "function" ? process.getuid() : 0;
 const gid = typeof process.getgid === "function" ? process.getgid() : 0;
+const controller = new AbortController();
+const abort = (): void => controller.abort();
+process.once("SIGINT", abort);
+process.once("SIGTERM", abort);
 
-const code = runCli(process.argv.slice(2), {
+const code = await runCliLive(process.argv.slice(2), {
   runtime: {
     env: process.env,
     uid,
@@ -25,6 +29,9 @@ const code = runCli(process.argv.slice(2), {
       process.stderr.write(text);
     },
   },
+  watch: { signal: controller.signal },
 });
 
+process.removeListener("SIGINT", abort);
+process.removeListener("SIGTERM", abort);
 process.exit(code);

@@ -3,8 +3,9 @@
  *
  * Provides suspend/resume/dispose for diagnosis plus phase 2 advanced control
  * surfaces: per-generation ownership checks, generation exhaustion guard,
- * transactional audit log, reactivation requirements, and peer-creds re-verification
- * hooks for live runtime. Each invocation is audited with caller identity and
+ * transactional audit log, reactivation requirements, and peer-value
+ * re-verification hooks for the headless transport fixture. Each invocation is
+ * audited with caller identity and
  * affects only the owning (PanelId, generation). Cannot bypass a capability or
  * budget gate, never widens sibling authority, uses transactional fail-closed
  * semantics. Host-side budget/capability gates remain authoritative; this client

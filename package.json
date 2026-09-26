@@ -2,7 +2,7 @@
   "name": "bitty-devtools",
   "private": true,
   "version": "0.0.1",
-  "description": "Human-facing diagnostics client for local debugging over Panel Runtime and compat matrix (phase 2, live IPC via Unix socket 0600 / Windows pipe with peer-creds, advanced tracing and control).",
+  "description": "Human-facing diagnostics client for local debugging over Panel Runtime and compat matrix (phase 2, Linux-only endpoint-attested live inspection, advanced tracing and control).",
   "type": "module",
   "packageManager": "bun@1.4.2",
   "exports": {
@@ -16,8 +16,8 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "test": "bun test",
-    "check:types": "tsc -p tsconfig.json --noEmit",
+    "test": "bun test --max-concurrency=1",
+    "check:types": "tsc -p tsconfig.check.json --noEmit",
     "fmt:check": "prettier --check . --ignore-unknown",
     "lint": "markdownlint-cli2"
   },

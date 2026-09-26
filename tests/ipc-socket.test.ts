@@ -240,6 +240,36 @@ describe("in-memory physical stream frames (#97)", () => {
   }
 });
 
+describe("CTX-0080 live request ownership", () => {
+  test("correlates concurrent responses by request id", async () => {
+    await withMemoryConnection(async (connection, receive) => {
+      const first = connection.requestResponse(firstPayload, 0, 1);
+      const second = connection.requestResponse(secondPayload, 1, 2);
+      receive(secondFrame);
+      receive(firstFrame);
+      expect(await second).toEqual(secondPayload);
+      expect(await first).toEqual(firstPayload);
+    });
+  });
+
+  test("abort settles the request and closes the connection", async () => {
+    await withMemoryConnection(async (connection) => {
+      const controller = new AbortController();
+      const pending = connection.requestResponse(
+        firstPayload,
+        0,
+        1,
+        controller.signal,
+      );
+      controller.abort();
+      await expect(pending).rejects.toMatchObject({
+        code: "TransportClosed",
+      });
+      expect(connection.isOpen()).toBe(false);
+    });
+  });
+});
+
 describe("live Unix IPC socket (CTX-0036)", () => {
   test("connect -> request -> response round trip over a loopback socket", async () => {
     if (!isLiveSocketSupported()) return;
@@ -284,6 +314,28 @@ describe("live Unix IPC socket (CTX-0036)", () => {
     } finally {
       loopback.stop();
     }
+  });
+
+  test("rejects relative or oversized live paths before endpoint access", async () => {
+    if (!isLiveSocketSupported()) return;
+    await expect(
+      attestLiveSocketEndpoint({
+        socketPath: "relative.sock",
+        runtimeUid: 1000,
+      }),
+    ).rejects.toThrow("absolute");
+    await expect(
+      connectLiveSocket({
+        socketPath: "/run/user/1000/bitty/../other.sock",
+        runtimeUid: 1000,
+      }),
+    ).rejects.toThrow("absolute");
+    await expect(
+      connectLiveSocket({
+        socketPath: `/${"a".repeat(256)}`,
+        runtimeUid: 1000,
+      }),
+    ).rejects.toThrow("bounded");
   });
 
   test("symlink at the socket path refuses to attest", async () => {

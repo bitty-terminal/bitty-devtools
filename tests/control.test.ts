@@ -29,7 +29,7 @@ describe("control (debug.control, audited, no bypass)", () => {
     );
     expect(receipt.audited.caller).toBe("tester");
     expect(receipt.audited.action).toBe("suspendHandler");
-    expect(receipt.generation).toBe(2);
+    expect(Number(receipt.generation)).toBe(2);
   });
 
   test("resume cannot bypass budget gate (typed receipt)", () => {
@@ -37,7 +37,7 @@ describe("control (debug.control, audited, no bypass)", () => {
     c.connect();
     c.grantScope("debug.control");
     const r = c.resumePlugin(panelId(1), 1 as never);
-    expect(r.newGeneration).toBe(2);
+    expect(Number(r.newGeneration)).toBe(2);
   });
 
   test("disposeGeneration reclaims bounded", () => {

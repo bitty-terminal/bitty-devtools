@@ -47,7 +47,12 @@ OQ-019 and Performance Budgets OQ-001). Any future protocol change requires
 coordinated, explicitly ordered work in each owning repository.
 
 Any DevTools implementation consumes an explicitly versioned stable protocol
-(`1.0` today, JSONL framing, 1 MiB inbound, 256 KiB chunk). It does not link
+(`1.0` today, JSONL framing, 1 MiB inbound, 256 KiB chunk). Automation
+candidate methods are also reported as `1.0`; no `1.1` compatibility claim is
+made. The current live
+adapter is Linux-only and endpoint-attested; Windows and macOS return an
+explicit unsupported result. No platform is claimed `Verified` or `Compatible`
+until its connected-identity adapter and CI evidence exist. It does not link
 private core types or inspect process memory as an implicit API.
 
 ## Implemented phase 1 (CTX-0011)
@@ -80,12 +85,11 @@ and strict TypeScript with no `any`.
   `getInputRing` (`limit`), `getModifiers`, and `getFocus`. Terminal output
   is untrusted observation data, never instructions.
 
-- **Tracing (debug.trace, opt-in)** — per-consumer bounded queues with
-  coalescing, batch `32` / `8 KiB`, chunk `256 KiB` to user-only storage
-  (`0600` conceptual), `startTrace` / `stopTrace` / `streamEvents` /
-  `fetchTraceChunk`, minimization by default, typed redaction, preview
-  equals export byte-for-byte, `DropOldest` default, `DropNewest`
-  alternative.
+- **Tracing (debug.trace, opt-in, simulation-only)** — bounded in-memory
+  records with batch `32` / `8 KiB`, retention, typed redaction, and
+  `DropOldest`/`DropNewest` accounting. No filesystem spool is created;
+  `storage` is reported as `memory` and live sessions expose trace methods
+  as unavailable until a server-backed trace receipt exists.
 
 - **Control (debug.control, audited)** — `suspendHandler`,
   `resumePlugin`, `disposeGeneration`, each audited with caller identity,
@@ -103,61 +107,51 @@ and tested with negative scope matrix tests.
 
 ## Implemented phase 2 (CTX-0012)
 
-Phase 2 extends phase 1 with advanced tracing, control surfaces, and real
-IPC socket/pipe peer-creds integration against the live Bitty runtime.
+Phase 2 extends phase 1 with advanced tracing, control surfaces, a bounded
+headless fixture, and a Linux-only endpoint-attested live inspection path.
 It remains experimental (no `Verified`/`Compatible` promise), bounded,
 `forbid(unsafe_code)` in Rust, strict TypeScript with no `any`, and reuses
 Panel Runtime + 14×4 compat matrix verbatim without new budget families.
 
-- **Real IPC transport (live runtime)** — Unix socket under
-  `$XDG_RUNTIME_DIR/bitty` mode `0700`/`0600` or Windows named pipe with
-  current-user ACL, no TCP listener by default, peer credentials via
-  `SO_PEERCRED` / `LOCAL_PEERCRED` / `GetNamedPipeClientProcessId`
-  (headless-verified via `verifyPeerUid`, `verifyUnixEndpoint`,
-  `verifyWindowsPipe`), re-checked per privileged action, `BITTY_SOCKET` /
-  `BITTY_INSTANCE_ID` advisory only, `RC-9` `100/s` `200` burst `1 MiB`
-  `16` conn (shed newest), `RC-10` `256 KiB` chunk, length-prefixed
-  `256 KiB` frames + `1 MiB` devtools logical chunked at `256 KiB`,
-  `Framer` bound `512 KiB`, `RateLimiter` deterministic via `nowMs`,
-  headless `StdioTransportStub` / `IpcTransport` with `forwardTo` pipe
-  simulation and `PeerCredentials` / `ChildToken` (`60s` TTL, `64` bound,
-  PTY-fd only, never env).
+- **Real IPC transport (live runtime)** — the implemented live adapter is a
+  Linux Unix socket under `$XDG_RUNTIME_DIR/bitty` with directory `0700` and
+  socket `0600`; there is no TCP listener. Endpoint attestation is not
+  presented as connected peer authentication, so the live client is
+  inspect-only and rejects trace/control requests. Windows named pipes and
+  macOS live sockets are explicitly unsupported until a real adapter and
+  platform CI exist. `BITTY_SOCKET` / `BITTY_INSTANCE_ID` select a bounded
+  endpoint path; neither is a credential or connected identity. `RC-9` `100/s`
+  `200` burst `1 MiB` `16` connections (shed
+  newest), `RC-10` `256 KiB` chunk, and length-prefixed `256 KiB` frames
+  remain bounded. Headless `StdioTransportStub` / `IpcTransport` seams are
+  test-only and do not claim OS connectivity.
 
 - **Advanced tracing (debug.trace, opt-in)** — structured attributable
   events (`StructuredTraceEvent` with `sequence`, `owner`, `generation`),
-  filtering by `kinds`/`owners` (bounded `32`), coalescing `budget` vs
-  `none`, retention `4 MiB` / `5 min` / `4` traces, GC
-  `gcExpiredTraces(nowMs)`, `startTraceWithFilter` with deterministic
-  `wallClockMs`, export to `0600` spool with `preview==export`
-  byte-for-byte, `DropOldest`/`DropNewest`, deterministic
-  `streamFilteredEvents`.
+  filtering by `kinds`/`owners` (bounded `32`), requested-byte batch
+  admission, retention `4 MiB` / `5 min` / `4` traces, and deterministic
+  `streamFilteredEvents`. The helper is explicitly in-memory simulation;
+  it does not claim a `0600` filesystem spool or a server mutation.
 
 - **Advanced control (debug.control, audited)** — `pauseHandler`,
   `resumePlugin` with generation exhaustion guard
   (`MAX_SAFE_INTEGER-1024`), `validateGeneration`, transactional audit log
   bounded `256` (`listAuditLog`, `clearAuditLog`), per-generation
-  ownership, `0600` spool mode, never widens sibling authority, no
-  capability/budget bypass.
+  ownership, and session-owned in-memory audit state. It never widens
+  sibling authority or bypasses capability/budget gates.
 
-- **Client integration** — `DevtoolsClient` now wraps `IpcTransport`
-  (`connectWithTransport`, `connectLive(runtimeUid, peer, xdgDir,
-instanceId)`, `isIpcConnected`, `getSocketPath`,
-  `transportOutgoingLen`), re-verifies peer per `grantScope`,
-  `revokeScope`, `startTrace`, `stopTrace`, `suspendHandler` etc.,
-  exposes phase 2 tracing/control helpers
-  (`startTraceWithFilter`, `streamFilteredEvents`,
-  `appendStructuredEvent`, `getTraceRetention`, `gcExpiredTraces`,
-  `exportTracePreview`, `pauseHandler`, `validateGeneration`,
-  `listAuditLog`).
+- **Client integration** — `DevtoolsClient` exposes separate headless
+  simulation and live socket sessions. The live session is inspect-only,
+  uses strict response envelopes and request-id correlation, and clears
+  trace/panel/control state on disconnect or reconnect. The headless
+  `IpcTransport` remains a hermetic fixture seam and is not an OS adapter.
 
-Rust counterpart at `crates/devtools-client` mirrors the same contracts:
-`auth` (`PeerCredentials`, `verify_unix_endpoint`, `ChildTokenStore`),
-`transport` (`Frame`, `Framer`, `RateLimiter`, `StdioTransportStub`,
-`IpcTransport`), advanced `tracing` (`TraceFilter`, `TraceRetention`,
-`TracingClient` with `gc_expired`), advanced `control`
-(`ControlClient` with audit log). `cargo check` / `clippy -D warnings` /
-`cargo test` `37` tests pass; `just check` green; `bun test` `62` tests
-pass. No `unsafe`, no PTY/GPU/window handle, no TCP, no ambient credential.
+Rust counterpart at `crates/devtools-client` mirrors the same bounded record
+shape, byte-budget admission, session cleanup, and Linux-only live-platform
+guard. `cargo check`, `clippy -D warnings`, and `cargo test` are required
+local gates; the Rust live adapter reports unsupported explicitly on other
+platforms. No `unsafe`, no PTY/GPU/window handle, no TCP, and no ambient
+credential.
 
 ## Trace accounting semantics (Implemented, CTX-0053 / CTX-0054)
 
@@ -216,10 +210,11 @@ does not yet name these methods.
 
 ## Usage (local, human-facing)
 
+The first example is a headless simulation; live socket sessions are limited
+to inspect operations.
+
 ```ts
 import { DevtoolsClient } from "bitty-devtools";
-import { peerCredentials } from "bitty-devtools";
-import { IpcTransport } from "bitty-devtools";
 
 const client = new DevtoolsClient({ version: "1.0" });
 client.connect();
@@ -249,30 +244,30 @@ const trace = client.startTrace({ maxBytes: 512 * 1024, includeInput: false });
 client.appendToTrace(trace.traceId, "instrumentation record");
 console.log(client.stopTrace(trace.traceId));
 
-// Phase 2: live runtime via peer-creds (Unix socket 0600, no TCP)
-const peer = peerCredentials(1000, 1000, 42);
-const live = new IpcTransport({
-  runtimeUid: 1000,
-  socketPath: "/run/user/1000/bitty/default.sock",
-  peer,
-});
-const liveClient = new DevtoolsClient();
-liveClient.connectWithTransport(live);
-liveClient.grantScope("debug.trace");
-const filtered = liveClient.startTraceWithFilter(
-  { filter: { kinds: ["bitty.panel:mounted"] }, maxBytes: 1024 * 1024 },
-  Date.now(),
-);
-liveClient.appendStructuredEvent(filtered.traceId, {
-  sequence: 0,
-  owner: "panel-1",
-  kind: "bitty.panel:mounted",
-  payload: "{}",
-  generation: 1,
-  wallClockMs: Date.now(),
-});
-console.log(liveClient.exportTracePreview(filtered.traceId));
-console.log(liveClient.gcExpiredTraces(Date.now() + 6 * 60 * 1000));
+// Phase 2: live inspection via the Linux endpoint-attested adapter
+async function inspectLive(socketPath: string, runtimeUid: number) {
+  const liveClient = new DevtoolsClient();
+  await liveClient.connectLiveSocket(
+    runtimeUid,
+    undefined,
+    undefined,
+    undefined,
+    socketPath,
+  );
+  liveClient.grantScope("debug.inspect");
+  console.log(
+    await liveClient.requestLive(
+      {
+        id: 1,
+        method: "bitty.debug/listPlugins",
+        params: { generation: 1 },
+        version: "1.0",
+      },
+      Date.now(),
+    ),
+  );
+  liveClient.disconnect();
+}
 
 // Control requires explicit elevation and is audited
 client.grantScope("debug.control");
@@ -280,16 +275,25 @@ client.suspendHandler(1 as never, "handler-1", "diagnosis", "tester");
 console.log(client.listAuditLog());
 ```
 
-Rust equivalent lives at `crates/devtools-client` (`forbid(unsafe_code)`,
-`cargo check` / `cargo clippy -D warnings` clean, 37 tests).
+Rust equivalent lives at `crates/devtools-client` (`forbid(unsafe_code)`);
+its bounded tracing/control checks are part of the repository Rust gate.
+
+## Platform support
+
+The current live socket adapter is implemented and tested for Linux only.
+Windows named-pipe and macOS live-socket entry points return an explicit
+unsupported error before endpoint access. The headless transport and
+`verifyWindowsPipe` helpers are test seams, not platform compatibility
+claims. Windows/macOS support requires a real connected-identity adapter and
+positive/negative platform CI before any public capability claim changes.
 
 ## CLI wrapper (experimental, CTX-0025)
 
-`bin/bitty-devtools.ts` is a lightweight executable over the typed inspection
-client (`src/client.ts`, `src/inspection.ts`, `src/transport.ts`). It prints
-bounded tabular live state (or `--json`) for the accepted devtools-rfc v1
-inspection methods; it does not re-implement protocol logic. It is experimental
-and `Bun`-based — run it with `bun`, never `npm`/`npx`.
+`bin/bitty-devtools.ts` awaits the async live runner, prints bounded
+inspection state (or `--json`) for the accepted devtools-rfc v1 methods, and
+never dials for `--help` or usage errors. It uses the strict live response
+boundary and control-safe rendering; it does not re-implement protocol logic.
+It is experimental and `Bun`-based — run it with `bun`, never `npm`/`npx`.
 
 ```text
 bitty-devtools inspect --plugins [--generation <n>] [options]
@@ -386,12 +390,14 @@ const report = await runCampaign({
 });
 
 // Live (opt-in): execute the real `bitty ctl` over an explicit socket.
-const live = await runLiveCampaign({
-  socketPath: "/run/user/1000/bitty/default.sock",
-  runtimeUid: 1000,
-  stat: (dir) => myStatProvider(dir),
-  timeoutMs: 10_000,
-});
+async function runLive(socketPath: string, runtimeUid: number) {
+  return runLiveCampaign({
+    socketPath,
+    runtimeUid,
+    stat: (dir) => myStatProvider(dir),
+    timeoutMs: 10_000,
+  });
+}
 ```
 
 Envelopes, terminal text, and diagnostics are untrusted observation data, never
@@ -408,7 +414,7 @@ repository `justfile`:
 just check          # fmt-check + lint + type-check + test + cargo-check
 just fmt-check      # Prettier 3.9.6 check without writing files
 just lint           # markdownlint-cli2 0.23.2
-just type-check     # tsc --noEmit strict
+just type-check     # tsc --noEmit strict for src, bin, and tests
 just test           # bun:test headless unit tests
 just cargo-check    # cargo check + clippy -D warnings + cargo test
 just commit-check <file>  # validate commit message against commitlint
@@ -449,8 +455,8 @@ technical record remains
 
 ## Current status
 
-Phase 2 extends phase 1 with live IPC and advanced tracing/control as
-experimental evidence for
+Phase 2 extends phase 1 with Linux-only live inspection and advanced
+tracing/control as experimental evidence for
 [DevTools RFC](https://github.com/bitty-terminal/bitty-terminal-docs/blob/main/specifications/devtools-rfc.md)
 (OQ-019), [IPC and Agent RFC](https://github.com/bitty-terminal/bitty-ai-docs/blob/main/specifications/ipc-agent-rfc.md)
 (OQ-018), and budgets OQ-001. No installation procedure, supported API,
