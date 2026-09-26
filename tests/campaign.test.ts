@@ -1,10 +1,11 @@
 import { describe, expect, test } from "bun:test";
+import * as campaignModule from "../src/campaign.js";
 import {
+  CAMPAIGN_CHILD_ENV_ALLOWLIST,
   CTL_VERB_MATRIX,
   KEYSTROKE_PROBE_PAYLOAD,
   KEYSTROKE_PROBE_VERB,
   CampaignError,
-  DEFAULT_ELEVATION_SCOPES,
   EXIT_CONFLICT,
   assertKeystrokeProbeTarget,
   assertSafeWorkspaceId,
@@ -14,9 +15,15 @@ import {
   EXIT_RUNTIME,
   EXIT_TIMEOUT,
   EXIT_USAGE,
+  MAX_CAMPAIGN_ARRAY_ITEMS,
+  MAX_CAMPAIGN_MATRIX_ROWS,
+  MAX_CAMPAIGN_OUTPUT_BYTES,
+  MAX_CAMPAIGN_REPORT_EVIDENCE_ITEMS,
+  MAX_CAMPAIGN_REPORT_RESULTS,
   NO_INSTANCE_VIEW_LIST,
   ProcessCtlDispatcher,
   ScriptedCtlDispatcher,
+  buildCampaignChildEnvironment,
   detectDebugDump,
   expectedExitForError,
   isKeystrokeProbeRow,
@@ -37,7 +44,6 @@ import {
   probeWorkspaceIdRoundTrip,
   runCampaign,
   summarizeCampaign,
-  terminalTextFrom,
   validateEnvelopeShape,
   workspaceCreatedFrom,
   workspaceIdCandidates,
@@ -47,6 +53,12 @@ import {
   type ProcessDispatcherConfig,
   type SocketDirStat,
 } from "../src/campaign.js";
+import { ProtocolErrorImpl, decodeResponse } from "../src/protocol.js";
+import {
+  isNormalizationSeparator,
+  redactSensitiveText,
+  sanitizeTerminalOutput,
+} from "../src/redaction.js";
 
 const DENIED = {
   class: "Denied",
@@ -61,24 +73,231 @@ const UNAVAILABLE = {
 };
 const NOTFOUND = { class: "NotFound", code: "NotFound", message: "missing" };
 
+function workspaceListResult(workspaces: string[], activeIndex: number) {
+  return {
+    workspaces,
+    names: workspaces.map(() => ""),
+    active: activeIndex,
+    active_id: workspaces[activeIndex - 1] ?? "",
+    count: workspaces.length,
+    tabline: "",
+  };
+}
+
+function successResultFor(verb: string): Record<string, unknown> {
+  switch (verb) {
+    case "instance.list":
+      return { instances: [] };
+    case "window.list":
+      return { windows: [{ id: "w:1" }] };
+    case "view.list":
+      return { views: [{ id: "v:1", focused: true }] };
+    case "terminal.list":
+      return { terminals: [{ id: "t:1", has_pane_session: false }] };
+    case "terminal.text":
+      return { terminal_id: "t:1", text: "$ echo hi\nhi\n" };
+    case "workspace.list":
+      return workspaceListResult(["ws:1"], 1);
+    case "workspace.new":
+      return { created: "ws:2", tabline: "" };
+    case "workspace.focus":
+      return { focused: "ws:2", tabline: "" };
+    case "view.split":
+      return { split: "right", new_view: "v:2" };
+    case "view.focus":
+      return { focused: "v:1" };
+    case "terminal.spawn":
+      return { spawned: true, terminal_id: "t:2", view_id: "v:2" };
+    case "terminal.close":
+      return { closed: "t:2" };
+    case "workspace.close":
+      return { closed: "ws:2", killed: false, tabline: "" };
+    case "terminal.send":
+      return { sent_to: "t:42", bytes: 2 };
+    case "config.reload":
+      return {
+        probed: true,
+        applied: false,
+        path: "(defaults; no file)",
+        hot_swap: "follow-up",
+      };
+    default:
+      throw new Error(`missing success projection for ${verb}`);
+  }
+}
+
+function controlInterleavedAuthorizationCases(marker: string): string[] {
+  const controls = ["\u001b", "\u009b"];
+  const cases = new Set<string>();
+  const insert = (value: string, control: string, index: number): string =>
+    `${value.slice(0, index)}${control}${value.slice(index)}`;
+
+  for (const authorizationControl of controls) {
+    for (
+      let authorizationIndex = 0;
+      authorizationIndex <= "Authorization".length;
+      authorizationIndex += 1
+    ) {
+      const authorization = insert(
+        "Authorization",
+        authorizationControl,
+        authorizationIndex,
+      );
+      for (const bearerControl of controls) {
+        for (
+          let bearerIndex = 0;
+          bearerIndex <= "Bearer".length;
+          bearerIndex += 1
+        ) {
+          const bearer = insert("Bearer", bearerControl, bearerIndex);
+          cases.add(`${authorization}: ${bearer} ${marker}`);
+        }
+      }
+    }
+  }
+
+  for (const valueControl of controls) {
+    for (let markerIndex = 0; markerIndex <= marker.length; markerIndex += 1) {
+      const value = insert(marker, valueControl, markerIndex);
+      cases.add(`Authorization: Bearer ${value}`);
+    }
+  }
+
+  for (const authorizationControl of controls) {
+    for (const bearerControl of controls) {
+      for (const valueControl of controls) {
+        cases.add(
+          `${insert("Authorization", authorizationControl, 6)}: ${insert("Bearer", bearerControl, 3)} ${insert(marker, valueControl, 10)}`,
+        );
+      }
+    }
+  }
+  return [...cases];
+}
+
+function allControlUnexpectedFieldNames(marker: string): string[] {
+  const controls = [
+    ...Array.from({ length: 0x20 }, (_, code) => String.fromCharCode(code)),
+    String.fromCharCode(0x7f),
+    ...Array.from({ length: 0x20 }, (_, index) =>
+      String.fromCharCode(0x80 + index),
+    ),
+  ];
+  const cases = new Set<string>();
+  const insert = (value: string, control: string, index: number): string =>
+    `${value.slice(0, index)}${control}${value.slice(index)}`;
+
+  for (const control of controls) {
+    for (let index = 0; index <= "Authorization".length; index += 1) {
+      const authorization = insert("Authorization", control, index);
+      cases.add(`${authorization}: Bearer ${marker}`);
+      cases.add(`Proxy-${authorization}: Bearer ${marker}`);
+    }
+    for (let index = 0; index <= "Bearer".length; index += 1) {
+      cases.add(`Authorization: ${insert("Bearer", control, index)} ${marker}`);
+    }
+    for (let index = 0; index <= marker.length; index += 1) {
+      cases.add(`Authorization: Bearer ${insert(marker, control, index)}`);
+    }
+  }
+  for (const authorizationControl of controls) {
+    for (const bearerControl of controls) {
+      cases.add(
+        `${insert("Authorization", authorizationControl, 6)}: ${insert("Bearer", bearerControl, 3)} ${marker}`,
+      );
+    }
+  }
+  return [...cases];
+}
+
+const UNICODE_FORMAT_SEPARATORS = [
+  "\u00a0",
+  "\u00ad",
+  "\u034f",
+  "\u061c",
+  "\u115f",
+  "\u1160",
+  "\u180e",
+  "\u200b",
+  "\u200c",
+  "\u200d",
+  "\u200e",
+  "\u200f",
+  "\u2028",
+  "\u202a",
+  "\u202b",
+  "\u202c",
+  "\u202d",
+  "\u202e",
+  "\u202f",
+  "\u2060",
+  "\u2066",
+  "\u2067",
+  "\u2068",
+  "\u2069",
+  "\u3000",
+  "\u3164",
+  "\ufe0f",
+  "\ufeff",
+  "\uffa0",
+  "\u{e0001}",
+  "\u{e0100}",
+] as const;
+
+function formatSeparatorCredentialFields(marker: string): string[] {
+  const cases = new Set<string>([
+    `Authorization: Bearer ${marker}`,
+    `Proxy-Authorization: Bearer ${marker}`,
+    `Bearer ${marker}`,
+    `api_key: ${marker}`,
+  ]);
+  const insert = (value: string, separator: string, index: number): string =>
+    `${value.slice(0, index)}${separator}${value.slice(index)}`;
+
+  for (const separator of UNICODE_FORMAT_SEPARATORS) {
+    for (let index = 0; index <= "Authorization".length; index += 1) {
+      const authorization = insert("Authorization", separator, index);
+      cases.add(`${authorization}: Bearer ${marker}`);
+      cases.add(`Proxy-${authorization}: Bearer ${marker}`);
+    }
+    for (let index = 0; index <= "Bearer".length; index += 1) {
+      cases.add(
+        `Authorization: ${insert("Bearer", separator, index)} ${marker}`,
+      );
+    }
+    for (let index = 0; index <= marker.length; index += 1) {
+      cases.add(`Authorization: Bearer ${insert(marker, separator, index)}`);
+    }
+    cases.add(`api${separator}key: ${marker}`);
+    cases.add(
+      `${insert("Authorization", separator, 6)}: ${insert("Bearer", separator, 3)} ${insert(marker, separator, 10)}`,
+    );
+  }
+  return [...cases];
+}
+
 function specialResult(invocation: CtlInvocation): CtlResult | undefined {
   switch (invocation.verb) {
     case "workspace.list.baseline":
-      return makeOkResult("core.workspace.list", {
-        workspaces: ["ws1"],
-        active: 1,
-        count: 1,
-      });
+      return makeOkResult(
+        "core.workspace.list",
+        workspaceListResult(["ws1"], 1),
+      );
     case "workspace.new":
-      return makeOkResult("core.workspace.new", { created: "ws:2" });
-    case "workspace.list.after-new":
-      return makeOkResult("core.workspace.list", {
-        workspaces: ["ws1", "ws:2"],
-        active: 2,
-        count: 2,
+      return makeOkResult("core.workspace.new", {
+        created: "ws:2",
+        tabline: "",
       });
+    case "workspace.list.after-new":
+      return makeOkResult(
+        "core.workspace.list",
+        workspaceListResult(["ws1", "ws:2"], 2),
+      );
     case "workspace.focus":
-      return makeOkResult("core.workspace.focus", { focused: "ws:2" });
+      return makeOkResult("core.workspace.focus", {
+        focused: invocation.args[2] ?? "ws:2",
+        tabline: "",
+      });
     case "terminal.text":
       return makeOkResult("core.terminal.text", {
         terminal_id: "t:1",
@@ -95,8 +314,8 @@ function specialResult(invocation: CtlInvocation): CtlResult | undefined {
     case "view.list.after":
       return makeOkResult("core.view.list", {
         views: [
-          { id: "v:1", focused: true },
-          { id: "v:2", focused: false },
+          { id: "v:1", focused: false },
+          { id: "v:2", focused: true },
         ],
       });
     case "terminal.list.after":
@@ -116,17 +335,18 @@ function resultFor(invocation: CtlInvocation): CtlResult {
   if (special !== undefined) return special;
   const command = `core.${invocation.verb}`;
   const expectation = CTL_VERB_MATRIX.find((v) => v.verb === invocation.verb);
+  if (invocation.verb === "terminal.spawn" && invocation.elevated) {
+    return makeOkResult(command, {
+      spawned: true,
+      terminal_id: "t:2",
+      view_id: "v:2",
+    });
+  }
   if (expectation !== undefined) {
-    if (invocation.elevated && expectation.outcome === "denied") {
-      return makeOkResult(command, {
-        spawned: true,
-        closed: true,
-        reloaded: true,
-      });
+    if (invocation.elevated || expectation.outcome === "ok") {
+      return makeOkResult(command, successResultFor(invocation.verb));
     }
     switch (expectation.outcome) {
-      case "ok":
-        return makeOkResult(command, { ok: true });
       case "denied":
         return makeErrorResult(command, DENIED, EXIT_PERM);
       case "conflict":
@@ -244,6 +464,22 @@ describe("campaign envelope conformance (v1 shape + exit codes)", () => {
     expect(results[0]?.status).toBe("pass");
   });
 
+  test("error class and code must both match", async () => {
+    const dispatcher = campaignDispatcher({
+      "terminal.spawn": makeErrorResult(
+        "core.terminal.spawn",
+        { class: "Denied", code: "SyntheticWrongCode", message: "synthetic" },
+        EXIT_PERM,
+      ),
+    });
+    const results = await probeEnvelopeConformance(dispatcher);
+    const spawn = results.find(
+      (result) => result.name === "envelope:terminal.spawn",
+    );
+    expect(spawn?.status).toBe("fail");
+    expect(spawn?.detail).toBe("error class/code did not match expectation");
+  });
+
   test("wrong exit code is a conformance failure", async () => {
     const dispatcher = campaignDispatcher({
       "terminal.spawn": makeErrorResult("core.terminal.spawn", DENIED, EXIT_OK),
@@ -288,27 +524,30 @@ describe("workspace id round-trip guard (D2)", () => {
     const dispatcher = new ScriptedCtlDispatcher((inv) => {
       seen.push(inv);
       if (inv.verb === "workspace.list.baseline") {
-        return makeOkResult("core.workspace.list", {
-          workspaces: ["ws1"],
-          active: 1,
-          count: 1,
-        });
+        return makeOkResult(
+          "core.workspace.list",
+          workspaceListResult(["ws1"], 1),
+        );
       }
       if (inv.verb === "workspace.new") {
-        return makeOkResult("core.workspace.new", { created: "ws:2" });
+        return makeOkResult("core.workspace.new", {
+          created: "ws:2",
+          tabline: "",
+        });
       }
       if (inv.verb === "workspace.list.after-new") {
-        return makeOkResult("core.workspace.list", {
-          workspaces: ["--socket=/tmp/evil.sock"],
-          active: 1,
-          count: 1,
-        });
+        return makeOkResult(
+          "core.workspace.list",
+          workspaceListResult(["--socket=/tmp/evil.sock"], 1),
+        );
       }
       throw new Error(`unexpected dispatch ${inv.verb}`);
     });
     const result = await probeWorkspaceIdRoundTrip(dispatcher);
     expect(result.status).toBe("fail");
-    expect(result.detail).toContain("is not a workspace id");
+    expect(result.detail).toContain(
+      "workspace post-create projection is invalid",
+    );
     expect(seen.some((inv) => inv.verb === "workspace.focus")).toBe(false);
   });
 
@@ -318,27 +557,30 @@ describe("workspace id round-trip guard (D2)", () => {
       const dispatcher = new ScriptedCtlDispatcher((inv) => {
         seen.push(inv);
         if (inv.verb === "workspace.list.baseline") {
-          return makeOkResult("core.workspace.list", {
-            workspaces: ["ws1"],
-            active: 1,
-            count: 1,
-          });
+          return makeOkResult(
+            "core.workspace.list",
+            workspaceListResult(["ws1"], 1),
+          );
         }
         if (inv.verb === "workspace.new") {
-          return makeOkResult("core.workspace.new", { created: "ws:2" });
+          return makeOkResult("core.workspace.new", {
+            created: "ws:2",
+            tabline: "",
+          });
         }
         if (inv.verb === "workspace.list.after-new") {
-          return makeOkResult("core.workspace.list", {
-            workspaces: [hostile],
-            active: 1,
-            count: 1,
-          });
+          return makeOkResult(
+            "core.workspace.list",
+            workspaceListResult([hostile], 1),
+          );
         }
         throw new Error(`unexpected dispatch ${inv.verb}`);
       });
       const result = await probeWorkspaceIdRoundTrip(dispatcher);
       expect(result.status).toBe("fail");
-      expect(result.detail).toContain("is not a workspace id");
+      expect(result.detail).toContain(
+        "workspace post-create projection is invalid",
+      );
       expect(seen.some((inv) => inv.verb === "workspace.focus")).toBe(false);
     }
   });
@@ -365,11 +607,10 @@ describe("workspace id round-trip guard (D2)", () => {
 
   test("fails when a listed id is rejected by focus (D2 repro)", async () => {
     const dispatcher = campaignDispatcher({
-      "workspace.list.after-new": makeOkResult("core.workspace.list", {
-        workspaces: ["ws1", "ws4"],
-        active: 2,
-        count: 2,
-      }),
+      "workspace.list.after-new": makeOkResult(
+        "core.workspace.list",
+        workspaceListResult(["ws1", "ws4"], 2),
+      ),
       "workspace.focus": makeErrorResult(
         "core.workspace.focus",
         NOTFOUND,
@@ -378,7 +619,7 @@ describe("workspace id round-trip guard (D2)", () => {
     });
     const result = await probeWorkspaceIdRoundTrip(dispatcher);
     expect(result.status).toBe("fail");
-    expect(result.detail).toContain("rejected by focus");
+    expect(result.detail).toContain("was rejected");
   });
 
   test("created id must be a ws:<n> id", () => {
@@ -387,7 +628,7 @@ describe("workspace id round-trip guard (D2)", () => {
         v: 1,
         command: "core.workspace.new",
         ok: true,
-        result: { created: "ws2" },
+        result: { created: "ws2", tabline: "" },
       }),
     );
     expect(workspaceCreatedFrom(bad)).toBe("ws2");
@@ -396,7 +637,7 @@ describe("workspace id round-trip guard (D2)", () => {
         v: 1,
         command: "core.workspace.list",
         ok: true,
-        result: { workspaces: ["ws1"] },
+        result: workspaceListResult(["ws1"], 1),
       }),
     );
     expect(workspaceNamesFrom(names)).toEqual(["ws1"]);
@@ -429,16 +670,17 @@ describe("terminal text shape guard (D1)", () => {
     expect(result.detail).toContain("Debug dump");
   });
 
-  test("terminalTextFrom requires a string", () => {
-    const envelope = parseCtlEnvelope(
-      JSON.stringify({
-        v: 1,
-        command: "core.terminal.text",
-        ok: true,
-        result: {},
-      }),
-    );
-    expect(() => terminalTextFrom(envelope)).toThrow(CampaignError);
+  test("terminal text projection requires a string", () => {
+    expect(() =>
+      parseCtlEnvelope(
+        JSON.stringify({
+          v: 1,
+          command: "core.terminal.text",
+          ok: true,
+          result: {},
+        }),
+      ),
+    ).toThrow(CampaignError);
   });
 });
 
@@ -448,13 +690,19 @@ describe("terminal spawn observability guard (D3)", () => {
     expect(result.status).toBe("pass");
   });
 
-  test("passes when only has_pane_session flips", async () => {
+  test("passes when the created terminal owns the flipped pane session", async () => {
     const dispatcher = campaignDispatcher({
       "view.list.after": makeOkResult("core.view.list", {
-        views: [{ id: "v:1", focused: true }],
+        views: [
+          { id: "v:1", focused: false },
+          { id: "v:2", focused: true },
+        ],
       }),
       "terminal.list.after": makeOkResult("core.terminal.list", {
-        terminals: [{ id: "t:1", has_pane_session: true }],
+        terminals: [
+          { id: "t:1", has_pane_session: true },
+          { id: "t:2", has_pane_session: true },
+        ],
       }),
     });
     const result = await probeTerminalSpawnObservability(dispatcher);
@@ -472,7 +720,7 @@ describe("terminal spawn observability guard (D3)", () => {
     });
     const result = await probeTerminalSpawnObservability(dispatcher);
     expect(result.status).toBe("fail");
-    expect(result.detail).toContain("no view/terminal");
+    expect(result.detail).toContain("was not observable");
   });
 });
 
@@ -569,8 +817,8 @@ describe("durable dispatcher seam", () => {
       baseArgs: ["ctl"],
     });
     await dispatcher.dispatch({
-      verb: "view.list",
-      args: ["view", "list"],
+      verb: "terminal.spawn",
+      args: ["terminal", "spawn"],
       elevated: true,
     });
     expect(calls[0]?.program).toBe("bitty");
@@ -578,14 +826,14 @@ describe("durable dispatcher seam", () => {
       "ctl",
       "--socket",
       "/run/bitty/default.sock",
-      "view",
-      "list",
+      "terminal",
+      "spawn",
     ]);
-    expect(calls[0]?.env["BITTY_CTL_ELEVATE"]).toBe(DEFAULT_ELEVATION_SCOPES);
+    expect(calls[0]?.env["BITTY_CTL_ELEVATE"]).toBe("terminal.manage");
 
     await dispatcher.dispatch({
-      verb: "view.list",
-      args: ["view", "list"],
+      verb: "terminal.spawn",
+      args: ["terminal", "spawn"],
       elevated: false,
     });
     expect(calls[1]?.env["BITTY_CTL_ELEVATE"]).toBeUndefined();
@@ -599,7 +847,7 @@ describe("durable dispatcher seam", () => {
       elevated: true,
     });
     const announced = calls[0]?.env["BITTY_CTL_ELEVATE"];
-    expect(announced).toBe("terminal.manage,config.modify");
+    expect(announced).toBe("terminal.manage");
     expect(announced).not.toBe("1");
     expect(announced?.split(",")).toContain("terminal.manage");
   });
@@ -732,7 +980,7 @@ describe("campaign admission and ownership", () => {
       expect(report.ok).toBe(false);
       expect(
         report.results.find((r) => r.name === "campaign:admission")?.detail,
-      ).toBe(String(thrown));
+      ).toBe("campaign operation failed");
       expect(dispatcher.seen()).toEqual([]);
     });
     test(`preflight reports thrown ${String(thrown)} without dispatch`, async () => {
@@ -748,7 +996,7 @@ describe("campaign admission and ownership", () => {
         },
       });
       expect(report.ok).toBe(false);
-      expect(report.results[0]?.detail).toContain(String(thrown));
+      expect(report.results[0]?.detail).toBe("campaign operation failed");
       expect(dispatcher.seen()).toEqual([]);
     });
 
@@ -766,7 +1014,7 @@ describe("campaign admission and ownership", () => {
       });
       expect(result.status).toBe("fail");
       expect(result.detail).toBe(
-        `${String(thrown)}; owned workspace cleanup failed: ${String(thrown)}`,
+        "campaign operation failed; owned workspace cleanup failed: campaign operation failed",
       );
       expect(
         dispatcher
@@ -820,7 +1068,7 @@ describe("campaign admission and ownership", () => {
       elevated: true,
     });
     expect(result.status).toBe("fail");
-    expect(result.detail).toContain("rejected by close");
+    expect(result.detail).toContain("cleanup response did not match");
     expect(
       dispatcher
         .seen()
@@ -918,37 +1166,47 @@ describe("campaign admission and ownership", () => {
     expect(
       dispatcher
         .seen()
-        .filter((inv) => inv.args[1] === "close")
-        .map((inv) => inv.args[2]),
-    ).toEqual(["ws:2"]);
-  });
-
-  test("cleanup closes only the created workspace, not newly listed or baseline IDs", async () => {
-    const dispatcher = campaignDispatcher({
-      "workspace.list.after-new": makeOkResult("core.workspace.list", {
-        workspaces: ["ws1", "ws2", "ws:3", "ws:2"],
-      }),
-    });
-    await probeWorkspaceIdRoundTrip(dispatcher, { elevated: true });
-    expect(
-      dispatcher
-        .seen()
         .filter((inv) => inv.verb === "workspace.close")
         .map((inv) => inv.args[2]),
     ).toEqual(["ws:2"]);
   });
 
-  test("a created ID already present under a baseline alias is never closed", async () => {
+  test("workspace cleanup is complete and idempotent across listed new ids", async () => {
     const dispatcher = campaignDispatcher({
-      "workspace.new": makeOkResult("core.workspace.new", { created: "ws:01" }),
+      "workspace.list.after-new": makeOkResult(
+        "core.workspace.list",
+        workspaceListResult(["ws1", "ws2", "ws:3", "ws:2"], 3),
+      ),
     });
     const result = await probeWorkspaceIdRoundTrip(dispatcher, {
       elevated: true,
     });
     expect(result.status).toBe("fail");
     expect(
-      dispatcher.seen().some((inv) => inv.verb === "workspace.close"),
-    ).toBe(false);
+      dispatcher
+        .seen()
+        .filter((inv) => inv.verb === "workspace.close")
+        .map((inv) => inv.args[2]),
+    ).toEqual(["ws:2", "ws:3"]);
+  });
+
+  test("a created ID already present under a baseline alias is never closed", async () => {
+    const dispatcher = campaignDispatcher({
+      "workspace.new": makeOkResult("core.workspace.new", {
+        created: "ws:01",
+        tabline: "",
+      }),
+    });
+    const result = await probeWorkspaceIdRoundTrip(dispatcher, {
+      elevated: true,
+    });
+    expect(result.status).toBe("fail");
+    expect(
+      dispatcher
+        .seen()
+        .filter((inv) => inv.verb === "workspace.close")
+        .map((inv) => inv.args[2]),
+    ).toEqual(["ws:2"]);
   });
 
   test("owned cleanup runs after a later observation failure", async () => {
@@ -1065,7 +1323,10 @@ describe("keystroke-injection probe gating (H-DEV-04)", () => {
     let dispatched = 0;
     const dispatcher = new ScriptedCtlDispatcher(() => {
       dispatched += 1;
-      return makeOkResult("core.terminal.send", { ok: true });
+      return makeOkResult("core.terminal.send", {
+        sent_to: "t:42",
+        bytes: 2,
+      });
     });
     const results = await probeEnvelopeConformance(dispatcher, [
       {
@@ -1093,7 +1354,10 @@ describe("keystroke-injection probe gating (H-DEV-04)", () => {
     let dispatched = 0;
     const dispatcher = new ScriptedCtlDispatcher(() => {
       dispatched += 1;
-      return makeOkResult("core.terminal.send", { ok: true });
+      return makeOkResult("core.terminal.send", {
+        sent_to: "t:42",
+        bytes: 2,
+      });
     });
     const results = await probeEnvelopeConformance(dispatcher, [
       {
@@ -1112,7 +1376,7 @@ describe("keystroke-injection probe gating (H-DEV-04)", () => {
     const seen: string[] = [];
     const dispatcher = new ScriptedCtlDispatcher((inv) => {
       seen.push(inv.verb);
-      return makeOkResult(`core.${inv.verb}`, { ok: true });
+      return makeOkResult(`core.${inv.verb}`, successResultFor(inv.verb));
     });
     await runCampaign({ dispatcher });
     expect(seen).not.toContain(KEYSTROKE_PROBE_VERB);
@@ -1151,7 +1415,7 @@ describe("keystroke-injection probe gating (H-DEV-04)", () => {
     const dispatcher = attestFixtureDispatcher(
       new ScriptedCtlDispatcher((inv) => {
         seen.push(inv.args);
-        return makeOkResult(`core.${inv.verb}`, { ok: true });
+        return makeOkResult(`core.${inv.verb}`, successResultFor(inv.verb));
       }),
     );
     await runCampaign({
@@ -1162,5 +1426,1245 @@ describe("keystroke-injection probe gating (H-DEV-04)", () => {
     const sends = seen.filter((args) => args[1] === "send");
     expect(sends.length).toBe(1);
     expect(sends[0]).toContain("t:42");
+  });
+});
+
+describe("campaign child environment and producer bounds", () => {
+  const syntheticSecret = "SYNTHETIC_AMBIENT_SECRET_DO_NOT_PERSIST";
+
+  test("low-level spawn helper is private and combined elevation is rejected", () => {
+    expect(campaignModule).not.toHaveProperty("defaultSpawnSync");
+    expect(() =>
+      buildCampaignChildEnvironment(
+        {},
+        { BITTY_CTL_ELEVATE: "terminal.manage,config.modify" },
+      ),
+    ).toThrow(CampaignError);
+  });
+
+  test("child environment is rebuilt from an explicit allowlist", () => {
+    const env = buildCampaignChildEnvironment(
+      {
+        PATH: "/synthetic/bin",
+        XDG_RUNTIME_DIR: "/synthetic/runtime",
+        BITTY_CTL_ELEVATE: "config.modify",
+        SSH_AUTH_SOCK: "/synthetic/agent",
+        [syntheticSecret]: syntheticSecret,
+      },
+      {
+        BITTY_CTL_ELEVATE: undefined,
+        XDG_RUNTIME_DIR: "/synthetic/explicit-runtime",
+        ANOTHER_SYNTHETIC_SECRET: syntheticSecret,
+      },
+    );
+
+    expect(env["PATH"]).toBe("/synthetic/bin");
+    expect(env["XDG_RUNTIME_DIR"]).toBe("/synthetic/explicit-runtime");
+    expect(env["BITTY_CTL_ELEVATE"]).toBeUndefined();
+    expect(env["SSH_AUTH_SOCK"]).toBeUndefined();
+    expect(env[syntheticSecret]).toBeUndefined();
+    expect(env["ANOTHER_SYNTHETIC_SECRET"]).toBeUndefined();
+    expect(
+      Object.keys(env).every((key) =>
+        [...CAMPAIGN_CHILD_ENV_ALLOWLIST, "BITTY_CTL_ELEVATE"].includes(key),
+      ),
+    ).toBe(true);
+  });
+
+  test("fake spawn receives maxBuffer and no ambient marker", async () => {
+    type FakeSpawnOptions = {
+      cmd: string[];
+      env?: Record<string, string | undefined>;
+      maxBuffer?: number;
+    };
+    type FakeSpawnResult = {
+      exitCode: number | null;
+      stdout: { byteLength: number; toString(): string };
+      stderr: { byteLength: number; toString(): string };
+      signalCode: null;
+    };
+    const runtime = globalThis as unknown as {
+      Bun: {
+        spawnSync(options: FakeSpawnOptions): FakeSpawnResult;
+      };
+    };
+    const original = runtime.Bun.spawnSync;
+    let seen: FakeSpawnOptions | undefined;
+    runtime.Bun.spawnSync = (options) => {
+      seen = options;
+      const stdout = JSON.stringify({
+        v: 1,
+        command: "core.view.list",
+        ok: true,
+        result: { views: [] },
+      });
+      return {
+        exitCode: 0,
+        stdout: {
+          byteLength: new TextEncoder().encode(stdout).length,
+          toString: () => stdout,
+        },
+        stderr: { byteLength: 0, toString: () => "" },
+        signalCode: null,
+      };
+    };
+
+    try {
+      const dispatcher = new ProcessCtlDispatcher({
+        env: { [syntheticSecret]: syntheticSecret },
+      });
+      const result = await dispatcher.dispatch({
+        verb: "view.list",
+        args: ["view", "list"],
+        elevated: false,
+      });
+      expect(result.exitCode).toBe(EXIT_OK);
+      expect(seen?.maxBuffer).toBe(MAX_CAMPAIGN_OUTPUT_BYTES);
+      expect(seen?.env?.[syntheticSecret]).toBeUndefined();
+    } finally {
+      runtime.Bun.spawnSync = original;
+    }
+  });
+
+  test("oversized producer output is rejected without string materialization", async () => {
+    type FakeSpawnResult = {
+      exitCode: number;
+      stdout: { byteLength: number; toString(): string };
+      stderr: { byteLength: number; toString(): string };
+    };
+    const runtime = globalThis as unknown as {
+      Bun: {
+        spawnSync(options: unknown): FakeSpawnResult;
+      };
+    };
+    const original = runtime.Bun.spawnSync;
+    let materialized = false;
+    runtime.Bun.spawnSync = () => ({
+      exitCode: 0,
+      stdout: {
+        byteLength: MAX_CAMPAIGN_OUTPUT_BYTES + 1,
+        toString: () => {
+          materialized = true;
+          return "synthetic";
+        },
+      },
+      stderr: { byteLength: 0, toString: () => "" },
+    });
+
+    try {
+      const dispatcher = new ProcessCtlDispatcher();
+      await expect(
+        dispatcher.dispatch({
+          verb: "view.list",
+          args: ["view", "list"],
+          elevated: false,
+        }),
+      ).rejects.toThrow("exceeds");
+      expect(materialized).toBe(false);
+    } finally {
+      runtime.Bun.spawnSync = original;
+    }
+  });
+});
+
+describe("campaign envelope and observation bounds", () => {
+  test("requires exactly one closed envelope branch", () => {
+    const success = {
+      v: 1,
+      command: "core.view.list",
+      ok: true,
+      result: { views: [] },
+    };
+    expect(() => parseCtlEnvelope(`${JSON.stringify(success)}\n{}\n`)).toThrow(
+      CampaignError,
+    );
+    expect(
+      validateEnvelopeShape({ ...success, extra: true }).some((problem) =>
+        problem.includes("unexpected field"),
+      ),
+    ).toBe(true);
+    expect(
+      validateEnvelopeShape({ ...success, error: DENIED }).some((problem) =>
+        problem.includes("exclusive"),
+      ),
+    ).toBe(true);
+    expect(
+      validateEnvelopeShape({
+        v: 1,
+        command: "core.view.list",
+        ok: false,
+      }).some((problem) => problem.includes("exclusive")),
+    ).toBe(true);
+  });
+
+  test("rejects oversized bytes, arrays, strings, and nesting before use", () => {
+    expect(() =>
+      parseCtlEnvelope("x".repeat(MAX_CAMPAIGN_OUTPUT_BYTES + 1)),
+    ).toThrow(CampaignError);
+    expect(() =>
+      parseCtlEnvelope(
+        JSON.stringify({
+          v: 1,
+          command: "core.workspace.list",
+          ok: true,
+          result: {
+            workspaces: Array(MAX_CAMPAIGN_ARRAY_ITEMS + 1).fill("ws:1"),
+          },
+        }),
+      ),
+    ).toThrow(CampaignError);
+    expect(() =>
+      parseCtlEnvelope(
+        JSON.stringify({
+          v: 1,
+          command: "c".repeat(2048),
+          ok: true,
+          result: {},
+        }),
+      ),
+    ).toThrow(CampaignError);
+
+    let nested: unknown = "synthetic";
+    for (let index = 0; index < 32; index += 1) nested = [nested];
+    expect(() =>
+      parseCtlEnvelope(
+        JSON.stringify({
+          v: 1,
+          command: "core.view.list",
+          ok: true,
+          result: nested,
+        }),
+      ),
+    ).toThrow(CampaignError);
+  });
+
+  test("mixed workspace arrays fail before create, focus, or cleanup", async () => {
+    const dispatcher = new ScriptedCtlDispatcher((invocation) => {
+      if (invocation.verb === "workspace.list.baseline") {
+        return makeOkResult("core.workspace.list", {
+          workspaces: ["ws:1", 7],
+        });
+      }
+      throw new Error(`unexpected dispatch ${invocation.verb}`);
+    });
+    const result = await probeWorkspaceIdRoundTrip(dispatcher);
+    expect(result.status).toBe("fail");
+    expect(dispatcher.seen().map((invocation) => invocation.verb)).toEqual([
+      "workspace.list.baseline",
+    ]);
+  });
+
+  test("malformed view and terminal arrays fail before spawn", async () => {
+    for (const overrides of [
+      {
+        "view.list.before": makeOkResult("core.view.list", {
+          views: [{ focused: true }],
+        }),
+      },
+      {
+        "terminal.list.before": makeOkResult("core.terminal.list", {
+          terminals: [{ id: "t:1" }],
+        }),
+      },
+      {
+        "view.list.before": makeOkResult("core.view.list", {
+          views: [
+            { id: "v:1", focused: true },
+            { id: "v:1", focused: false },
+          ],
+        }),
+      },
+      {
+        "terminal.list.before": makeOkResult("core.terminal.list", {
+          terminals: [
+            { id: "t:1", has_pane_session: false },
+            { id: "t:1", has_pane_session: false },
+          ],
+        }),
+      },
+      {
+        "terminal.list.before": makeOkResult("core.terminal.list", {
+          terminals: [
+            { id: "t:1", has_pane_session: false },
+            { id: "t:2", has_pane_session: false },
+          ],
+        }),
+      },
+    ]) {
+      const dispatcher = campaignDispatcher(overrides);
+      const result = await probeTerminalSpawnObservability(dispatcher);
+      expect(result.status).toBe("fail");
+      expect(
+        dispatcher
+          .seen()
+          .some((invocation) => invocation.verb === "terminal.spawn"),
+      ).toBe(false);
+    }
+  });
+
+  test("matrix cardinality is bounded before any dispatch", async () => {
+    const dispatcher = new ScriptedCtlDispatcher(() =>
+      makeOkResult("core.oversized", { ok: true }),
+    );
+    const matrix = Array.from(
+      { length: MAX_CAMPAIGN_MATRIX_ROWS + 1 },
+      (_, index) => ({
+        verb: `oversized.${index}`,
+        args: ["oversized"],
+        outcome: "ok" as const,
+        elevated: false,
+        note: "synthetic",
+      }),
+    );
+    const results = await probeEnvelopeConformance(dispatcher, matrix);
+    expect(results).toHaveLength(1);
+    expect(results[0]?.status).toBe("fail");
+    expect(dispatcher.seen()).toEqual([]);
+  });
+
+  test("runCampaign rejects oversized matrices before reading or filtering rows", async () => {
+    let argsReads = 0;
+    const matrix = Array.from({ length: 1000 }, () => ({
+      verb: "view.list",
+      get args(): string[] {
+        argsReads += 1;
+        return ["view", "list", "--format", "json"];
+      },
+      outcome: "ok" as const,
+      elevated: false,
+      note: "synthetic",
+    }));
+    const report = await runCampaign({
+      ...admittedCampaign,
+      dispatcher: campaignDispatcher(),
+      matrix,
+    });
+    expect(argsReads).toBe(0);
+    expect(report.results).toHaveLength(1);
+    expect(report.results[0]).toMatchObject({
+      name: "campaign:matrix-limit",
+      status: "fail",
+    });
+  });
+
+  test("malformed matrix rows fail closed without property dereferences", async () => {
+    const dispatcher = new ScriptedCtlDispatcher(() =>
+      makeOkResult("core.invalid", {}),
+    );
+    const results = await probeEnvelopeConformance(dispatcher, [null] as never);
+    expect(results).toHaveLength(1);
+    expect(results[0]?.status).toBe("fail");
+    expect(dispatcher.seen()).toEqual([]);
+  });
+
+  test("null matrices fail closed in probe and campaign entry points", async () => {
+    const dispatcher = campaignDispatcher();
+    const probeResults = await probeEnvelopeConformance(
+      dispatcher,
+      null as never,
+    );
+    expect(probeResults).toHaveLength(1);
+    expect(probeResults[0]?.status).toBe("fail");
+
+    const report = await runCampaign({
+      ...admittedCampaign,
+      dispatcher,
+      matrix: null as never,
+    });
+    expect(report.results).toHaveLength(1);
+    expect(report.results[0]).toMatchObject({
+      name: "campaign:matrix-invalid",
+      status: "fail",
+    });
+    expect(dispatcher.seen()).toEqual([]);
+  });
+
+  test("invalid matrix values fail before filtering or dispatch", async () => {
+    const valid = {
+      verb: "view.list",
+      args: ["view", "list", "--format", "json"],
+      outcome: "ok" as const,
+      elevated: false,
+      note: "synthetic",
+    };
+    for (const invalid of [
+      { ...valid, outcome: null },
+      { ...valid, args: [null] },
+      { ...valid, note: null },
+      { ...valid, elevated: null },
+    ]) {
+      const dispatcher = campaignDispatcher();
+      const report = await runCampaign({
+        ...admittedCampaign,
+        dispatcher,
+        matrix: [invalid] as never,
+      });
+      expect(report.ok).toBe(false);
+      expect(report.results[0]?.name).toBe("campaign:matrix-invalid");
+      expect(dispatcher.seen()).toEqual([]);
+    }
+  });
+
+  test("per-verb result projections reject unknown success fields", async () => {
+    expect(() =>
+      parseCtlEnvelope(
+        JSON.stringify({
+          v: 1,
+          command: "core.instance.list",
+          ok: true,
+          result: { unexpected: true },
+        }),
+      ),
+    ).toThrow(CampaignError);
+    const dispatcher = new ScriptedCtlDispatcher(() =>
+      makeOkResult("core.instance.list", {
+        unexpected: "\u001b[31m",
+      }),
+    );
+    const results = await probeEnvelopeConformance(dispatcher, [
+      {
+        verb: "instance.list",
+        args: ["instance", "list", "--format", "json"],
+        outcome: "ok",
+        elevated: false,
+        note: "synthetic",
+      },
+    ]);
+    expect(results[0]?.status).toBe("fail");
+    expect(results[0]?.detail).toContain("projection");
+  });
+
+  test("ctl envelopes reject duplicate keys before interpretation", () => {
+    expect(() =>
+      parseCtlEnvelope(
+        '{"v":1,"command":"core.instance.list","ok":true,"result":{"instances":[]},"result":{"unexpected":true}}',
+      ),
+    ).toThrow(CampaignError);
+    expect(() =>
+      parseCtlEnvelope(
+        '{"v":1,"command":"core.instance.list","ok":true,"result":{"outer":{"value":1,"value":2}}}',
+      ),
+    ).toThrow(CampaignError);
+  });
+  test("ctl validation and parser diagnostics redact every typed control matrix", () => {
+    const marker = "SYNTHETIC_OPAQUE_123456";
+    const diagnostics: string[] = [];
+    for (const field of allControlUnexpectedFieldNames(marker)) {
+      const value = {
+        v: 1,
+        command: "core.view.list",
+        ok: true,
+        result: {},
+        [field]: true,
+      };
+      diagnostics.push(...validateEnvelopeShape(value));
+      try {
+        parseCtlEnvelope(JSON.stringify(value));
+      } catch (error) {
+        diagnostics.push((error as Error).message);
+      }
+    }
+    let errorPayloads = 0;
+    let rejectedErrorPayloads = 0;
+    for (const field of [
+      ...allControlUnexpectedFieldNames(marker),
+      `Authorization: Bearer ${marker}`,
+      `Proxy-Authorization: Bearer ${marker}`,
+      `Bearer ${marker}`,
+    ]) {
+      for (const carrier of ["class", "code", "message"] as const) {
+        errorPayloads += 1;
+        const value = {
+          v: 1,
+          command: "core.terminal.spawn",
+          ok: false,
+          error: {
+            class: "Denied",
+            code: "ScopeDenied",
+            message: "synthetic",
+            [carrier]: field,
+          },
+        };
+        diagnostics.push(...validateEnvelopeShape(value));
+        try {
+          parseCtlEnvelope(JSON.stringify(value));
+        } catch (error) {
+          rejectedErrorPayloads += 1;
+          diagnostics.push((error as Error).message);
+        }
+      }
+    }
+    expect(rejectedErrorPayloads).toBe(errorPayloads);
+    for (const command of [
+      `core.Authorization: Bearer ${marker}`,
+      `core.Proxy-Authorization: Bearer ${marker}`,
+      `core.Bearer ${marker}`,
+    ]) {
+      try {
+        parseCtlEnvelope(
+          JSON.stringify({
+            v: 1,
+            command,
+            ok: true,
+            result: {},
+          }),
+        );
+      } catch (error) {
+        diagnostics.push((error as Error).message);
+      }
+    }
+    const serialized = diagnostics.join("");
+    expect(serialized).not.toContain(marker);
+    expect(/[\u0000-\u001f\u007f-\u009f]/u.test(serialized)).toBe(false);
+  });
+  test("ctl diagnostics reject unicode-interleaved typed fields", () => {
+    const marker = "SYNTHETIC_OPAQUE_123456";
+    const diagnostics: string[] = [];
+    let rejected = 0;
+    for (const field of formatSeparatorCredentialFields(marker)) {
+      const values: unknown[] = [
+        {
+          v: 1,
+          command: "core.view.list",
+          ok: true,
+          result: {},
+          [field]: true,
+        },
+        ...["class", "code", "message"].map((carrier) => ({
+          v: 1,
+          command: "core.terminal.spawn",
+          ok: false,
+          error: {
+            class: "Denied",
+            code: "ScopeDenied",
+            message: "synthetic",
+            [carrier]: field,
+          },
+        })),
+      ];
+      for (const value of values) {
+        diagnostics.push(...validateEnvelopeShape(value));
+        try {
+          parseCtlEnvelope(JSON.stringify(value));
+        } catch (error) {
+          rejected += 1;
+          diagnostics.push((error as Error).message);
+        }
+      }
+    }
+    expect(rejected).toBe(formatSeparatorCredentialFields(marker).length * 4);
+    const serialized = diagnostics.join("");
+    expect(serialized).not.toContain(marker);
+    for (const separator of UNICODE_FORMAT_SEPARATORS) {
+      expect(serialized).not.toContain(separator);
+    }
+  });
+});
+
+describe("campaign report privacy and control safety", () => {
+  const syntheticSecret = "SYNTHETIC_SECRET_DO_NOT_PERSIST";
+
+  test("terminal output sanitizer escapes C0, DEL, and C1 bytes", () => {
+    const sanitized = sanitizeTerminalOutput(
+      `safe\u0000\u001b[31m\u007f\u0085\u009b${syntheticSecret}\n`,
+      1024,
+    );
+    expect(sanitized).toContain("\\u0000");
+    expect(sanitized).toContain("\\u001b");
+    expect(sanitized).toContain("\\u007f");
+    expect(sanitized).toContain("\\u0085");
+    expect(sanitized).toContain("\\u009b");
+    expect(sanitized).toContain("\\n");
+    expect(/[\u0000-\u001f\u007f-\u009f]/u.test(sanitized)).toBe(false);
+    expect(new TextEncoder().encode(sanitized).length).toBeLessThanOrEqual(
+      1024,
+    );
+  });
+
+  test("unicode format separators are removed before redaction and reporting", () => {
+    const marker = "SYNTHETIC_OPAQUE_123456";
+    for (const separator of UNICODE_FORMAT_SEPARATORS) {
+      expect(sanitizeTerminalOutput(`a${separator}b`, 128)).toBe("ab");
+    }
+    const redacted =
+      formatSeparatorCredentialFields(marker).map(redactSensitiveText);
+    const report = summarizeCampaign(
+      redacted.map((detail) => ({
+        name: "unicode-format",
+        status: "fail" as const,
+        detail,
+        evidence: [`Proxy-${detail}`],
+      })),
+    );
+    const serialized = JSON.stringify(report);
+    expect(serialized).not.toContain(marker);
+    for (const separator of UNICODE_FORMAT_SEPARATORS) {
+      expect(serialized).not.toContain(separator);
+    }
+  });
+
+  test("shared differential corpus redacts in TypeScript", async () => {
+    const corpus = await Bun.file(
+      "tests/fixtures/redaction-separator-corpus.txt",
+    ).text();
+    let cases = 0;
+    for (const line of corpus.split("\n")) {
+      if (line.length === 0 || line.startsWith("#")) continue;
+      const [id, hex, expected] = line.split("\t");
+      if (id === undefined || hex === undefined || expected === undefined) {
+        throw new Error(`invalid corpus row: ${line}`);
+      }
+      const bytes = Uint8Array.from(
+        (hex.match(/.{2}/gu) ?? []).map((byte) => Number.parseInt(byte, 16)),
+      );
+      const input = new TextDecoder().decode(bytes);
+      const actual = redactSensitiveText(input);
+      const wanted = expected === "true" ? "[REDACTED]" : input;
+      expect(actual, id).toBe(wanted);
+      cases += 1;
+    }
+    // Exact count, not a floor: a silently dropped fixture must fail here as
+    // loudly as a wrong expectation, and the Rust suite asserts the same total.
+    expect(cases).toBe(2298);
+  });
+
+  test("NORM-1 normalization class matches the shared membership pin", async () => {
+    const pin = await Bun.file(
+      "tests/fixtures/redaction-normalization-class.txt",
+    ).text();
+    let members = 0;
+    let nonMembers = 0;
+    for (const line of pin.split("\n")) {
+      if (line.length === 0 || line.startsWith("#")) continue;
+      const [kind, hex] = line.split("\t");
+      if (kind === undefined || hex === undefined) {
+        throw new Error(`invalid class pin row: ${line}`);
+      }
+      const codePoint = Number.parseInt(hex, 16);
+      const label = `U+${hex}`;
+      expect(isNormalizationSeparator(codePoint), `${label} ${kind}`).toBe(
+        kind === "member",
+      );
+      if (kind === "member") members += 1;
+      else nonMembers += 1;
+    }
+    expect(members).toBe(4225);
+    expect(nonMembers).toBe(266);
+  });
+
+  test("NORM-1 class property definition matches the shared membership pin", async () => {
+    // The pin is the contract; the predicate is the implementation. Deriving
+    // the class a second time from the three Unicode properties and comparing
+    // it to the pin catches a pinned row that no longer follows from the
+    // definition, which the membership test above cannot see.
+    const pin = await Bun.file(
+      "tests/fixtures/redaction-normalization-class.txt",
+    ).text();
+    const pinned = new Set<number>();
+    for (const line of pin.split("\n")) {
+      if (!line.startsWith("member\t")) continue;
+      pinned.add(Number.parseInt(line.split("\t")[1] as string, 16));
+    }
+    const defaultIgnorable = /\p{Default_Ignorable_Code_Point}/u;
+    const otherFormat = /\p{Cf}/u;
+    const whiteSpace = /\p{White_Space}/u;
+    const derived = new Set<number>();
+    for (let codePoint = 0; codePoint <= 0x10ffff; codePoint += 1) {
+      if (codePoint >= 0xd800 && codePoint <= 0xdfff) continue;
+      const character = String.fromCodePoint(codePoint);
+      if (
+        codePoint > 0x7f &&
+        (defaultIgnorable.test(character) ||
+          otherFormat.test(character) ||
+          whiteSpace.test(character))
+      ) {
+        derived.add(codePoint);
+      }
+    }
+    const missing = [...derived].filter((codePoint) => !pinned.has(codePoint));
+    const extra = [...pinned].filter((codePoint) => !derived.has(codePoint));
+    expect(
+      { missing: missing.length, extra: extra.length },
+      `missing U+${missing[0]?.toString(16)} extra U+${extra[0]?.toString(16)}`,
+    ).toEqual({ missing: 0, extra: 0 });
+  });
+
+  test("P1 regression: a capitalized or upper-case key is redacted", () => {
+    const marker = "SYNTHETIC_OPAQUE_123456";
+    for (const key of [
+      "Authorization",
+      "AUTHORIZATION",
+      "AuThOrIzAtIoN",
+      "Token",
+      "TOKEN",
+      "ToKeN",
+      "API_KEY",
+      "Cookie",
+      "COOKIE",
+      "Credential",
+      "Password",
+      "Secret",
+      "Auth",
+      "Access_Token",
+      "Proxy-Authorization",
+      "Passwd",
+    ]) {
+      for (const delimiter of [": ", "= "]) {
+        const input = `${key}${delimiter}${marker}`;
+        expect(redactSensitiveText(input), input).toBe("[REDACTED]");
+      }
+    }
+  });
+
+  test("P1 regression: prose that mentions a key name survives", () => {
+    for (const text of [
+      "the password is required to log in",
+      "set the secret before you start the server",
+      "The Authorization header is optional",
+      "Tokens expire after one hour",
+      "my_secret",
+      "github_token",
+      "api_key",
+      "Token",
+      "Secret",
+      "SECRETARY",
+      "TOKENS",
+      "PKI_KEYSTORE",
+    ]) {
+      expect(redactSensitiveText(text), text).toBe(text);
+    }
+  });
+
+  test("report names, details, and evidence are redacted, escaped, and capped", () => {
+    const report = summarizeCampaign([
+      {
+        name: `probe\u001b[31m${syntheticSecret}`,
+        status: "fail",
+        detail: `token=${syntheticSecret}\u009b31m`,
+        evidence: Array.from(
+          { length: MAX_CAMPAIGN_REPORT_EVIDENCE_ITEMS + 20 },
+          () => `password=${syntheticSecret}\u0000`,
+        ),
+      },
+    ]);
+    const serialized = JSON.stringify(report);
+    expect(serialized).not.toContain(syntheticSecret);
+    expect(/[\u0000-\u001f\u007f-\u009f]/u.test(serialized)).toBe(false);
+    expect(report.results[0]?.detail).toContain("[REDACTED]");
+    expect(report.results[0]?.evidence.length).toBe(
+      MAX_CAMPAIGN_REPORT_EVIDENCE_ITEMS,
+    );
+  });
+
+  test("report redaction removes complete bearer credentials", () => {
+    const credential = "opaque-value-123456";
+    const report = summarizeCampaign([
+      {
+        name: "bearer",
+        status: "fail",
+        detail: `Authorization: Bearer ${credential}`,
+        evidence: [`Proxy-Authorization: Bearer proxy-${credential}`],
+      },
+    ]);
+    const serialized = JSON.stringify(report);
+    expect(serialized).not.toContain(credential);
+    expect(serialized).toContain("[REDACTED]");
+  });
+
+  test("report redaction removes control-interleaved bearer credentials", () => {
+    const credential = "SYNTHETIC_OPAQUE_123456";
+    const report = summarizeCampaign([
+      {
+        name: "interleaved-bearer",
+        status: "fail",
+        detail: `Authorization:\u001bBearer ${credential}`,
+        evidence: [`Proxy-Authorization:\u009bBearer ${credential}`],
+      },
+    ]);
+    const serialized = JSON.stringify(report);
+    expect(serialized).not.toContain(credential);
+    expect(serialized).toContain("[REDACTED]");
+    expect(/[\u0000-\u001f\u007f-\u009f]/u.test(serialized)).toBe(false);
+  });
+
+  test("report redaction covers every typed credential control insertion", () => {
+    const marker = "SYNTHETIC_OPAQUE_123456";
+    const serialized = controlInterleavedAuthorizationCases(marker)
+      .map((text) =>
+        JSON.stringify(
+          summarizeCampaign([
+            {
+              name: "typed-credential",
+              status: "fail",
+              detail: text,
+              evidence: [`Proxy-${text}`],
+            },
+          ]),
+        ),
+      )
+      .join("");
+    expect(serialized).not.toContain(marker);
+    expect(/[\u0000-\u001f\u007f-\u009f]/u.test(serialized)).toBe(false);
+  });
+
+  test("oversized reports retain an explicit limit failure", () => {
+    const report = summarizeCampaign(
+      Array.from({ length: MAX_CAMPAIGN_REPORT_RESULTS + 10 }, (_, index) => ({
+        name: `probe.${index}`,
+        status: "pass" as const,
+        detail: "ok",
+        evidence: [],
+      })),
+    );
+    expect(report.results).toHaveLength(MAX_CAMPAIGN_REPORT_RESULTS + 1);
+    expect(report.results.at(-1)).toMatchObject({
+      name: "campaign:report-limit",
+      status: "fail",
+    });
+    expect(report.ok).toBe(false);
+  });
+
+  test("target error fields and thrown secret messages never enter a report", async () => {
+    const marker = `SYNTHETIC_SECRET_DO_NOT_PERSIST\u001b]8;;`;
+    const dispatcher = new ScriptedCtlDispatcher(() =>
+      makeErrorResult(
+        "core.terminal.spawn",
+        {
+          class: marker,
+          code: `\u009b${marker}`,
+          message: `authorization=${marker}`,
+        },
+        EXIT_PERM,
+      ),
+    );
+    const results = await probeEnvelopeConformance(dispatcher, [
+      {
+        verb: "terminal.spawn",
+        args: ["terminal", "spawn"],
+        outcome: "ok",
+        elevated: false,
+        note: "synthetic",
+      },
+    ]);
+    const serialized = JSON.stringify(results);
+    expect(serialized).not.toContain("SYNTHETIC_SECRET_DO_NOT_PERSIST");
+    expect(/[\u0000-\u001f\u007f-\u009f]/u.test(serialized)).toBe(false);
+
+    const thrown = new ScriptedCtlDispatcher(() => {
+      throw new Error(`authorization=${marker}\u001b[31m`);
+    });
+    const thrownResults = await probeEnvelopeConformance(thrown, [
+      {
+        verb: "terminal.spawn",
+        args: ["terminal", "spawn"],
+        outcome: "ok",
+        elevated: false,
+        note: "synthetic",
+      },
+    ]);
+    const thrownSerialized = JSON.stringify(thrownResults);
+    expect(thrownSerialized).not.toContain("SYNTHETIC_SECRET_DO_NOT_PERSIST");
+    expect(/[\u0000-\u001f\u007f-\u009f]/u.test(thrownSerialized)).toBe(false);
+  });
+});
+
+describe("campaign owned-resource cleanup and per-verb authority", () => {
+  test("workspace cleanup always runs for the exact created id", async () => {
+    const dispatcher = campaignDispatcher();
+    const result = await probeWorkspaceIdRoundTrip(dispatcher);
+    expect(result.status).toBe("pass");
+    expect(
+      dispatcher
+        .seen()
+        .filter((invocation) => invocation.verb === "workspace.close")
+        .map((invocation) => invocation.args[2]),
+    ).toEqual(["ws:2"]);
+  });
+
+  test("workspace cleanup survives malformed post-create observations", async () => {
+    const dispatcher = campaignDispatcher({
+      "workspace.list.after-new": makeOkResult("core.workspace.list", {
+        workspaces: ["ws:2", 7],
+      }),
+    });
+    const result = await probeWorkspaceIdRoundTrip(dispatcher);
+    expect(result.status).toBe("fail");
+    expect(
+      dispatcher
+        .seen()
+        .filter((invocation) => invocation.verb === "workspace.close")
+        .map((invocation) => invocation.args[2]),
+    ).toEqual(["ws:2"]);
+  });
+
+  test("malformed workspace create responses still reconcile and clean new ids", async () => {
+    const dispatcher = campaignDispatcher({
+      "workspace.new": makeOkResult("core.workspace.new", {
+        created: "opaque-create-response",
+      }),
+    });
+    const result = await probeWorkspaceIdRoundTrip(dispatcher);
+    expect(result.status).toBe("fail");
+    expect(
+      dispatcher
+        .seen()
+        .filter((invocation) => invocation.verb === "workspace.close")
+        .map((invocation) => invocation.args[2]),
+    ).toEqual(["ws:2"]);
+  });
+
+  test("workspace cleanup closes every unexpected new id exactly once", async () => {
+    const dispatcher = campaignDispatcher({
+      "workspace.list.after-new": makeOkResult("core.workspace.list", {
+        workspaces: ["ws1", "ws2", "ws3", "ws3"],
+        names: ["", "", "", ""],
+        active: 4,
+        active_id: "ws:3",
+        count: 4,
+        tabline: "",
+      }),
+    });
+    const result = await probeWorkspaceIdRoundTrip(dispatcher);
+    expect(result.status).toBe("fail");
+    expect(
+      dispatcher
+        .seen()
+        .filter((invocation) => invocation.verb === "workspace.close")
+        .map((invocation) => invocation.args[2]),
+    ).toEqual(["ws:2", "ws:3"]);
+  });
+
+  test("workspace cleanup continues after one owned id fails", async () => {
+    const overrides: Record<string, CtlResult> = {
+      "workspace.list.after-new": makeOkResult(
+        "core.workspace.list",
+        workspaceListResult(["ws1", "ws:2", "ws:3"], 3),
+      ),
+    };
+    const dispatcher = attestFixtureDispatcher(
+      new ScriptedCtlDispatcher((invocation) => {
+        if (
+          invocation.verb === "workspace.close" &&
+          invocation.args[2] === "ws:2"
+        ) {
+          return makeErrorResult(
+            "core.workspace.close",
+            CONFLICT,
+            EXIT_CONFLICT,
+          );
+        }
+        return overrides[invocation.verb] ?? resultFor(invocation);
+      }),
+    );
+    const result = await probeWorkspaceIdRoundTrip(dispatcher);
+    expect(result.status).toBe("fail");
+    expect(
+      dispatcher
+        .seen()
+        .filter((invocation) => invocation.verb === "workspace.close")
+        .map((invocation) => invocation.args[2]),
+    ).toEqual(["ws:2", "ws:3"]);
+  });
+
+  test("workspace focus and cleanup responses must match requested ids", async () => {
+    for (const overrides of [
+      {
+        "workspace.focus": makeOkResult("core.workspace.focus", {
+          focused: "ws:9",
+          tabline: "",
+        }),
+      },
+      {
+        "workspace.close": makeOkResult("core.workspace.close", {
+          closed: "ws:9",
+          killed: false,
+          tabline: "",
+        }),
+      },
+    ]) {
+      const result = await probeWorkspaceIdRoundTrip(
+        campaignDispatcher(overrides),
+      );
+      expect(result.status).toBe("fail");
+    }
+  });
+
+  test("terminal cleanup closes only the created id and restores focus", async () => {
+    const dispatcher = campaignDispatcher();
+    const result = await probeTerminalSpawnObservability(dispatcher);
+    expect(result.status).toBe("pass");
+    expect(
+      dispatcher
+        .seen()
+        .filter((invocation) => invocation.verb === "terminal.close")
+        .map((invocation) => invocation.args[2]),
+    ).toEqual(["t:2"]);
+    expect(
+      dispatcher
+        .seen()
+        .filter((invocation) => invocation.verb === "view.focus")
+        .map((invocation) => invocation.args[2]),
+    ).toEqual(["v:1"]);
+  });
+
+  test("terminal close and focus responses must match requested ids", async () => {
+    for (const overrides of [
+      {
+        "terminal.close": makeOkResult("core.terminal.close", {
+          closed: "t:9",
+        }),
+      },
+      {
+        "view.focus": makeOkResult("core.view.focus", {
+          focused: "v:9",
+        }),
+      },
+    ]) {
+      const result = await probeTerminalSpawnObservability(
+        campaignDispatcher(overrides),
+      );
+      expect(result.status).toBe("fail");
+    }
+  });
+
+  test("extra post-spawn view deltas are rejected", async () => {
+    const dispatcher = campaignDispatcher({
+      "view.list.after": makeOkResult("core.view.list", {
+        views: [
+          { id: "v:1", focused: false },
+          { id: "v:2", focused: true },
+          { id: "v:3", focused: false },
+        ],
+      }),
+    });
+    const result = await probeTerminalSpawnObservability(dispatcher);
+    expect(result.status).toBe("fail");
+  });
+
+  test("terminal cleanup survives malformed post-spawn observations", async () => {
+    const dispatcher = campaignDispatcher({
+      "view.list.after": makeOkResult("core.view.list", {
+        views: [{ id: "v:2" }],
+      }),
+    });
+    const result = await probeTerminalSpawnObservability(dispatcher);
+    expect(result.status).toBe("fail");
+    expect(
+      dispatcher
+        .seen()
+        .filter((invocation) => invocation.verb === "terminal.close")
+        .map((invocation) => invocation.args[2]),
+    ).toEqual(["t:2"]);
+  });
+
+  test("malformed terminal spawn responses still reconcile and clean new ids", async () => {
+    const dispatcher = campaignDispatcher({
+      "terminal.spawn": makeOkResult("core.terminal.spawn", {
+        spawned: true,
+      }),
+    });
+    const result = await probeTerminalSpawnObservability(dispatcher);
+    expect(result.status).toBe("fail");
+    expect(
+      dispatcher
+        .seen()
+        .filter((invocation) => invocation.verb === "terminal.close")
+        .map((invocation) => invocation.args[2]),
+    ).toEqual(["t:2"]);
+  });
+
+  test("terminal cleanup closes every unexpected new id exactly once", async () => {
+    const dispatcher = campaignDispatcher({
+      "view.list.after": makeOkResult("core.view.list", {
+        views: [
+          { id: "v:1", focused: false },
+          { id: "v:2", focused: true },
+          { id: "v:3", focused: false },
+        ],
+      }),
+      "terminal.list.after": makeOkResult("core.terminal.list", {
+        terminals: [
+          { id: "t:1", has_pane_session: false },
+          { id: "t:2", has_pane_session: true },
+          { id: "t:3", has_pane_session: true },
+        ],
+      }),
+    });
+    const result = await probeTerminalSpawnObservability(dispatcher);
+    expect(result.status).toBe("fail");
+    expect(
+      dispatcher
+        .seen()
+        .filter((invocation) => invocation.verb === "terminal.close")
+        .map((invocation) => invocation.args[2]),
+    ).toEqual(["t:2", "t:3"]);
+  });
+
+  test("terminal cleanup continues after one owned id fails", async () => {
+    const overrides: Record<string, CtlResult> = {
+      "view.list.after": makeOkResult("core.view.list", {
+        views: [
+          { id: "v:1", focused: false },
+          { id: "v:2", focused: true },
+          { id: "v:3", focused: false },
+        ],
+      }),
+      "terminal.list.after": makeOkResult("core.terminal.list", {
+        terminals: [
+          { id: "t:1", has_pane_session: false },
+          { id: "t:2", has_pane_session: true },
+          { id: "t:3", has_pane_session: true },
+        ],
+      }),
+    };
+    const dispatcher = attestFixtureDispatcher(
+      new ScriptedCtlDispatcher((invocation) => {
+        if (
+          invocation.verb === "terminal.close" &&
+          invocation.args[2] === "t:2"
+        ) {
+          return makeErrorResult(
+            "core.terminal.close",
+            CONFLICT,
+            EXIT_CONFLICT,
+          );
+        }
+        return overrides[invocation.verb] ?? resultFor(invocation);
+      }),
+    );
+    const result = await probeTerminalSpawnObservability(dispatcher);
+    expect(result.status).toBe("fail");
+    expect(
+      dispatcher
+        .seen()
+        .filter((invocation) => invocation.verb === "terminal.close")
+        .map((invocation) => invocation.args[2]),
+    ).toEqual(["t:2", "t:3"]);
+  });
+
+  test("inconsistent spawn identifiers still clean the new terminal", async () => {
+    const dispatcher = campaignDispatcher({
+      "terminal.spawn": makeOkResult("core.terminal.spawn", {
+        spawned: true,
+        terminal_id: "t:2",
+        view_id: "v:1",
+      }),
+    });
+    const result = await probeTerminalSpawnObservability(dispatcher);
+    expect(result.status).toBe("fail");
+    expect(
+      dispatcher
+        .seen()
+        .filter((invocation) => invocation.verb === "terminal.close")
+        .map((invocation) => invocation.args[2]),
+    ).toEqual(["t:2"]);
+  });
+
+  test("a baseline terminal reported by spawn is preserved while new ids are cleaned", async () => {
+    const dispatcher = campaignDispatcher({
+      "terminal.spawn": makeOkResult("core.terminal.spawn", {
+        spawned: true,
+        terminal_id: "t:1",
+        view_id: "v:1",
+      }),
+    });
+    const result = await probeTerminalSpawnObservability(dispatcher);
+    expect(result.status).toBe("fail");
+    expect(
+      dispatcher
+        .seen()
+        .filter((invocation) => invocation.verb === "terminal.close")
+        .map((invocation) => invocation.args[2]),
+    ).toEqual(["t:2"]);
+  });
+
+  test("full admitted campaign delegates creates once and cleans both resources", async () => {
+    const dispatcher = campaignDispatcher();
+    const report = await runCampaign({ ...admittedCampaign, dispatcher });
+    expect(report.ok).toBe(true);
+    expect(
+      dispatcher
+        .seen()
+        .filter((invocation) => invocation.verb === "workspace.new"),
+    ).toHaveLength(1);
+    expect(
+      dispatcher
+        .seen()
+        .filter((invocation) => invocation.verb === "terminal.spawn"),
+    ).toHaveLength(1);
+    expect(
+      dispatcher
+        .seen()
+        .filter((invocation) => invocation.verb === "workspace.close")
+        .map((invocation) => invocation.args[2]),
+    ).toEqual(["ws:2"]);
+    expect(
+      dispatcher
+        .seen()
+        .filter((invocation) => invocation.verb === "terminal.close")
+        .map((invocation) => invocation.args[2]),
+    ).toEqual(["t:2"]);
+  });
+
+  test("configured scope allowlist refuses unrelated elevated verbs", async () => {
+    let dispatches = 0;
+    const dispatcher = new ProcessCtlDispatcher(
+      { elevationScopes: "config.modify" },
+      () => {
+        dispatches += 1;
+        return makeOkResult("core.terminal.spawn", {
+          spawned: true,
+          terminal_id: "t:2",
+          view_id: "v:2",
+        });
+      },
+    );
+    await expect(
+      dispatcher.dispatch({
+        verb: "terminal.spawn",
+        args: ["terminal", "spawn"],
+        elevated: true,
+      }),
+    ).rejects.toThrow(CampaignError);
+    expect(dispatches).toBe(0);
+  });
+
+  test("elevated announcements are selected per verb and unknown verbs fail closed", async () => {
+    const calls: Record<string, string | undefined>[] = [];
+    const dispatcher = new ProcessCtlDispatcher(
+      {},
+      (_program, _args, options) => {
+        calls.push(options.env);
+        return makeOkResult("core.terminal.spawn", {
+          spawned: true,
+          terminal_id: "t:2",
+          view_id: "v:2",
+        });
+      },
+    );
+
+    await dispatcher.dispatch({
+      verb: "terminal.spawn",
+      args: ["terminal", "spawn"],
+      elevated: true,
+    });
+    await dispatcher.dispatch({
+      verb: "config.reload",
+      args: ["config", "reload"],
+      elevated: true,
+    });
+    expect(calls[0]?.["BITTY_CTL_ELEVATE"]).toBe("terminal.manage");
+    expect(calls[1]?.["BITTY_CTL_ELEVATE"]).toBe("config.modify");
+    expect(calls[0]?.["BITTY_CTL_ELEVATE"]).not.toContain("config.modify");
+    expect(calls[1]?.["BITTY_CTL_ELEVATE"]).not.toContain("terminal.manage");
+
+    await expect(
+      dispatcher.dispatch({
+        verb: "unknown.elevated",
+        args: ["unknown"],
+        elevated: true,
+      }),
+    ).rejects.toThrow(CampaignError);
+    expect(calls).toHaveLength(2);
   });
 });

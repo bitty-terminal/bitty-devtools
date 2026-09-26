@@ -1,16 +1,95 @@
 #![forbid(unsafe_code)]
 //! Typed redaction for previews and traces.
 
+use std::borrow::Cow;
+
 use crate::bounds::{PREVIEW_MAX_BYTES, truncate_to_bytes};
 
+/// NORM-1 normalization class (normative; the single definition shared with
+/// `src/redaction.ts`).
+///
+/// The class is every code point above U+007F that Unicode classifies as
+/// `Default_Ignorable_Code_Point`, as general category `Cf`
+/// (Other_Format), or as `White_Space`. Membership is decided by Unicode
+/// character properties only; this table is generated from that definition,
+/// never hand-curated, and both language test suites execute
+/// `tests/fixtures/redaction-normalization-class.txt` to pin the exact set.
+///
+/// Rationale: every member renders as nothing at all (a format control or a
+/// default-ignorable code point) or as blank (a non-ASCII space separator), so
+/// a hostile producer can inject any of them to break a literal credential
+/// pattern match without changing what the operator sees on screen. They are
+/// therefore removed before secret matching. Membership is 4225 code points in
+/// 29 ranges for Unicode 17.0.
+///
+/// C0, DEL, and C1 controls are deliberately not in the class: they are
+/// escaped for rendering, not silently deleted, so an escape is never
+/// swallowed. U+0085 is the one code point in both sets (Cc and White_Space);
+/// `normalize_for_matching` removes it for matching and the renderer escapes
+/// it, matching `sanitizeTerminalOutput` in `src/redaction.ts`.
+const NORM_1_RANGES: &[(char, char)] = &[
+    ('\u{85}', '\u{85}'),       // U+85
+    ('\u{a0}', '\u{a0}'),       // U+A0
+    ('\u{ad}', '\u{ad}'),       // U+AD
+    ('\u{34f}', '\u{34f}'),     // U+34F
+    ('\u{600}', '\u{605}'),     // U+600-U+605
+    ('\u{61c}', '\u{61c}'),     // U+61C
+    ('\u{6dd}', '\u{6dd}'),     // U+6DD
+    ('\u{70f}', '\u{70f}'),     // U+70F
+    ('\u{890}', '\u{891}'),     // U+890-U+891
+    ('\u{8e2}', '\u{8e2}'),     // U+8E2
+    ('\u{115f}', '\u{1160}'),   // U+115F-U+1160
+    ('\u{1680}', '\u{1680}'),   // U+1680
+    ('\u{17b4}', '\u{17b5}'),   // U+17B4-U+17B5
+    ('\u{180b}', '\u{180f}'),   // U+180B-U+180F
+    ('\u{2000}', '\u{200f}'),   // U+2000-U+200F
+    ('\u{2028}', '\u{202f}'),   // U+2028-U+202F
+    ('\u{205f}', '\u{206f}'),   // U+205F-U+206F
+    ('\u{3000}', '\u{3000}'),   // U+3000
+    ('\u{3164}', '\u{3164}'),   // U+3164
+    ('\u{fe00}', '\u{fe0f}'),   // U+FE00-U+FE0F
+    ('\u{feff}', '\u{feff}'),   // U+FEFF
+    ('\u{ffa0}', '\u{ffa0}'),   // U+FFA0
+    ('\u{fff0}', '\u{fffb}'),   // U+FFF0-U+FFFB
+    ('\u{110bd}', '\u{110bd}'), // U+110BD
+    ('\u{110cd}', '\u{110cd}'), // U+110CD
+    ('\u{13430}', '\u{1343f}'), // U+13430-U+1343F
+    ('\u{1bca0}', '\u{1bca3}'), // U+1BCA0-U+1BCA3
+    ('\u{1d173}', '\u{1d17a}'), // U+1D173-U+1D17A
+    ('\u{e0000}', '\u{e0fff}'), // U+E0000-U+E0FFF
+];
+
+fn is_unicode_format_separator(character: char) -> bool {
+    NORM_1_RANGES
+        .iter()
+        .any(|(low, high)| character >= *low && character <= *high)
+}
+
+fn normalize_for_matching(value: &str) -> Cow<'_, str> {
+    if !value
+        .chars()
+        .any(|character| character.is_control() || is_unicode_format_separator(character))
+    {
+        return Cow::Borrowed(value);
+    }
+    Cow::Owned(
+        value
+            .chars()
+            .filter(|character| !character.is_control() && !is_unicode_format_separator(*character))
+            .collect(),
+    )
+}
+
 pub fn is_sensitive_field(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
+    let normalized = normalize_for_matching(name);
+    let lower = normalized.to_ascii_lowercase();
     [
         "password",
         "secret",
         "token",
         "api_key",
         "api-key",
+        "apikey",
         "authorization",
         "cookie",
     ]
@@ -51,18 +130,38 @@ fn contains_phrase(value: &str, needle: &str) -> bool {
     contains_lower(value, needle)
 }
 
-/// Scan for `key [=:] secret` assignment phrases (password, secret,
-/// api-key, auth/access token) and `bearer <token>` phrases, in any case.
+/// Case-insensitive prefilter for `key[0]`: the scan must reach every ASCII
+/// spelling of the first byte, otherwise the `eq_ignore_ascii_case` verification
+/// below is unreachable for a capitalized, upper-case, or mixed-case key.
+fn starts_key_candidate(bytes: &[u8], key_first: u8) -> Option<usize> {
+    let lowered = key_first.to_ascii_lowercase();
+    bytes
+        .iter()
+        .position(|byte| byte.to_ascii_lowercase() == lowered)
+}
+
+/// Scan for `key [=:] secret` assignment phrases and bearer token phrases.
 fn contains_secret_phrase(value: &str) -> bool {
-    const KEYS: [&str; 6] = [
-        "password", "passwd", "secret", "api_key", "api-key", "apikey",
+    const KEYS: [&str; 12] = [
+        "password",
+        "passwd",
+        "secret",
+        "api_key",
+        "api-key",
+        "apikey",
+        "authorization",
+        "auth",
+        "token",
+        "access_token",
+        "cookie",
+        "credential",
     ];
     let bytes = value.as_bytes();
     for key in KEYS {
         let key = key.as_bytes();
         let mut start = 0;
         while start + key.len() <= bytes.len() {
-            let Some(rel) = bytes[start..].iter().position(|b| *b == key[0]) else {
+            let Some(rel) = starts_key_candidate(&bytes[start..], key[0]) else {
                 break;
             };
             let i = start + rel;
@@ -81,7 +180,7 @@ fn contains_secret_phrase(value: &str) -> bool {
             return true;
         }
     }
-    contains_bearer_token(value)
+    contains_bearer_token(value) || contains_credential_name(value)
 }
 
 /// Check whether `rest` (text after a matched key) is an assignment: optional
@@ -135,11 +234,12 @@ fn contains_key_assignment(value: &str, key: &str) -> bool {
     false
 }
 
-/// Match `bearer <token>` (any case) where the token is a non-space run.
+/// Match `bearer <token>` and normalized joined `bearer<token>` forms.
 fn contains_bearer_token(value: &str) -> bool {
     const KEY: &str = "bearer";
+    const MIN_JOINED_TOKEN: usize = 8;
     let vb = value.as_bytes();
-    if KEY.len() + 2 > vb.len() {
+    if KEY.len() >= vb.len() {
         return false;
     }
     for i in 0..=vb.len() - KEY.len() {
@@ -149,12 +249,23 @@ fn contains_bearer_token(value: &str) -> bool {
         let Some(after) = value.get(i + KEY.len()..) else {
             continue;
         };
-        let mut chars = after.chars();
-        match chars.next() {
-            Some(' ') | Some('\t') => {}
-            _ => continue,
+        let after_bytes = after.as_bytes();
+        if matches!(after_bytes.first(), Some(b' ' | b'\t')) {
+            if after_bytes
+                .iter()
+                .skip_while(|byte| matches!(**byte, b' ' | b'\t'))
+                .any(|byte| !byte.is_ascii_whitespace())
+            {
+                return true;
+            }
+            continue;
         }
-        if chars.any(|c| !c.is_whitespace()) {
+        if after_bytes
+            .iter()
+            .take_while(|byte| is_joined_bearer_char(**byte))
+            .count()
+            >= MIN_JOINED_TOKEN
+        {
             return true;
         }
     }
@@ -163,6 +274,96 @@ fn contains_bearer_token(value: &str) -> bool {
 
 fn is_bearer_char(b: u8) -> bool {
     b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~' | b'+' | b'/')
+}
+
+/// Token characters for the joined `bearer<token>` scan. This is the
+/// `assignmentOrBearerPattern` character class in `src/redaction.ts`, which
+/// also admits `=`; `=` is a base64 pad character, so a joined token shorter
+/// than eight characters before its padding is still a token. Kept separate
+/// from [`is_bearer_char`] because `is_bearer_char` also delimits JWT parts,
+/// where admitting `=` would swallow the padding into a part and lose the
+/// shape.
+fn is_joined_bearer_char(b: u8) -> bool {
+    is_bearer_char(b) || b == b'='
+}
+
+fn is_name_separator(b: u8) -> bool {
+    matches!(b, b'-' | b'_')
+}
+
+fn is_name_run_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || is_name_separator(b)
+}
+
+/// True when `bytes[from..]` is optional space/tab then `:` or `=`. This is
+/// the `(?!\s*[:=])` lookahead of the credential-name rule, and it is
+/// deliberately weaker than [`is_assignment_after`]: the name rule only has to
+/// know that a value delimiter follows, not that a value is present.
+fn followed_by_assignment_delimiter(bytes: &[u8], from: usize) -> bool {
+    let mut index = from;
+    while matches!(bytes.get(index), Some(b' ' | b'\t')) {
+        index += 1;
+    }
+    matches!(bytes.get(index), Some(b':' | b'='))
+}
+
+/// A bare credential-bearing configuration name (`GITHUB_TOKEN`, `API_KEY`,
+/// `MY_SECRET_VALUE`) is itself sensitive even with no value beside it.
+///
+/// Mirrors `credentialNamePattern` in `src/redaction.ts`, and is deliberately
+/// case-SENSITIVE on the credential name: only the SCREAMING_SNAKE spelling is
+/// a finding, so "the password is required to log in" and "Tokens expire after
+/// one hour" stay intact. The case-insensitive rule that *is* wanted lives in
+/// [`contains_secret_phrase`], which requires an assignment delimiter.
+///
+/// The match is a segment-aligned credential name inside a maximal
+/// `[A-Za-z0-9_-]` run, with the name ending a segment (or the run). The
+/// negative lookahead is only consulted when the name ends the run, because any
+/// earlier window end sits inside the run and is therefore followed by an
+/// alphanumeric or a separator, which never satisfies `\s*[:=]`. A run whose
+/// internal separator structure is irregular still reports here and not in
+/// TypeScript, so this rule is a superset and never weaker.
+fn contains_credential_name(value: &str) -> bool {
+    const NAMES: [&[u8]; 5] = [b"SECRET", b"TOKEN", b"PASSWORD", b"CREDENTIAL", b"API_KEY"];
+    let bytes = value.as_bytes();
+    let mut run_start = 0;
+    while run_start < bytes.len() {
+        if !is_name_run_char(bytes[run_start]) {
+            run_start += 1;
+            continue;
+        }
+        let mut run_end = run_start;
+        while run_end < bytes.len() && is_name_run_char(bytes[run_end]) {
+            run_end += 1;
+        }
+        let run = &bytes[run_start..run_end];
+        'names: for name in NAMES {
+            if run.len() < name.len() {
+                continue;
+            }
+            for at in 0..=run.len() - name.len() {
+                if run[at..at + name.len()] != *name {
+                    continue;
+                }
+                if at != 0 && !is_name_separator(run[at - 1]) {
+                    continue;
+                }
+                let after = at + name.len();
+                if after < run.len() {
+                    if is_name_separator(run[after]) {
+                        return true;
+                    }
+                    continue;
+                }
+                if !followed_by_assignment_delimiter(bytes, run_end) {
+                    return true;
+                }
+                continue 'names;
+            }
+        }
+        run_start = run_end;
+    }
+    false
 }
 
 fn is_token_char(b: u8) -> bool {
@@ -192,7 +393,7 @@ fn contains_secret_token(value: &str) -> bool {
         let prefix = prefix.as_bytes();
         let mut start = 0;
         while start + prefix.len() <= bytes.len() {
-            let Some(rel) = bytes[start..].iter().position(|b| *b == prefix[0]) else {
+            let Some(rel) = starts_key_candidate(&bytes[start..], prefix[0]) else {
                 break;
             };
             let i = start + rel;
@@ -394,7 +595,8 @@ fn contains_secret(value: &str) -> bool {
 /// Value-side secret scan: embedded credential shapes and high-entropy
 /// tokens, regardless of field name.
 pub fn looks_secret(value: &str) -> bool {
-    contains_secret(value) || looks_like_high_entropy_secret(value)
+    let normalized = normalize_for_matching(value);
+    contains_secret(&normalized) || looks_like_high_entropy_secret(&normalized)
 }
 
 pub struct RedactionMarker {
@@ -437,6 +639,219 @@ pub fn preview_equals_export(preview: &str, export: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const REDACTION_SEPARATOR_CORPUS: &str =
+        include_str!("../../../tests/fixtures/redaction-separator-corpus.txt");
+    const REDACTION_NORMALIZATION_CLASS: &str =
+        include_str!("../../../tests/fixtures/redaction-normalization-class.txt");
+
+    /// Every code point the NORM-1 class must contain, and the near-miss
+    /// code points it must not contain. The fixture is shared with the
+    /// TypeScript suite, so class membership cannot drift between languages
+    /// without failing a gate on both sides.
+    #[test]
+    fn norm_1_normalization_class_matches_shared_pin() {
+        let mut members = 0usize;
+        let mut non_members = 0usize;
+        for line in REDACTION_NORMALIZATION_CLASS.lines() {
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let mut columns = line.split('\t');
+            let kind = columns.next().expect("class row kind");
+            let code_point = columns.next().expect("class row code point");
+            assert!(columns.next().is_none(), "unexpected class row column");
+            let parsed = u32::from_str_radix(code_point, 16).expect("valid hex");
+            let character = char::from_u32(parsed)
+                .unwrap_or_else(|| panic!("class row {code_point} is not a scalar value"));
+            let actual = is_unicode_format_separator(character);
+            match kind {
+                "member" => {
+                    assert!(actual, "class row U+{code_point} must be normalized");
+                    members += 1;
+                }
+                "nonmember" => {
+                    assert!(!actual, "class row U+{code_point} must be preserved");
+                    non_members += 1;
+                }
+                other => panic!("unknown class row kind {other}"),
+            }
+        }
+        assert_eq!(members, 4225, "NORM-1 membership pin is complete");
+        assert!(non_members >= 256, "NORM-1 boundary pin is present");
+    }
+
+    /// The class is a superset of every spelling either language used before,
+    /// and the table and the pin agree on every code point in the fixture.
+    #[test]
+    fn norm_1_table_covers_all_class_members() {
+        let mut counted = 0usize;
+        for line in REDACTION_NORMALIZATION_CLASS.lines() {
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let mut columns = line.split('\t');
+            if columns.next() != Some("member") {
+                continue;
+            }
+            let code_point = columns.next().expect("class row code point");
+            let parsed = u32::from_str_radix(code_point, 16).expect("valid hex");
+            let Some(character) = char::from_u32(parsed) else {
+                continue;
+            };
+            assert!(
+                NORM_1_RANGES
+                    .iter()
+                    .any(|(low, high)| character >= *low && character <= *high),
+                "U+{code_point} is pinned as a member but no table range covers it"
+            );
+            counted += 1;
+        }
+        assert_eq!(counted, 4225);
+        assert_eq!(NORM_1_RANGES.len(), 29, "NORM-1 is 29 ranges");
+    }
+
+    fn decode_hex_corpus_value(hex: &str) -> Vec<u8> {
+        assert_eq!(hex.len() % 2, 0, "invalid hex corpus value");
+        hex.as_bytes()
+            .chunks_exact(2)
+            .map(|pair| {
+                let text = std::str::from_utf8(pair).expect("corpus hex is ASCII");
+                u8::from_str_radix(text, 16).expect("corpus hex is valid")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn px_0514_shared_differential_corpus() {
+        let mut cases = 0;
+        for line in REDACTION_SEPARATOR_CORPUS.lines() {
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let mut columns = line.split('\t');
+            let id = columns.next().expect("corpus id");
+            let hex = columns.next().expect("corpus hex");
+            let expected = columns.next().expect("corpus expectation");
+            assert!(columns.next().is_none(), "unexpected corpus column");
+            let input = String::from_utf8(decode_hex_corpus_value(hex))
+                .expect("corpus value is valid UTF-8");
+            let actual = redact_value(input.clone(), "notes");
+            let wanted = if expected == "true" {
+                "[REDACTED]".to_string()
+            } else {
+                input
+            };
+            assert_eq!(actual, wanted, "corpus case {id}");
+            cases += 1;
+        }
+        // Exact count, not a floor: a silently dropped fixture row must fail
+        // here as loudly as a wrong expectation. The TypeScript suite asserts
+        // the same total, so a fixture that only one language reads fails both.
+        assert_eq!(cases, 2298, "shared corpus must be fully executed");
+    }
+
+    /// P1 regression: the candidate key-position prefilter must be ASCII
+    /// case-insensitive, otherwise the `eq_ignore_ascii_case` verification is
+    /// unreachable for any key whose first byte is not already lowercase.
+    #[test]
+    fn p1_key_position_prefilter_is_case_insensitive() {
+        const MARKER: &str = "SYNTHETIC_OPAQUE_123456";
+        const KEYS: [&str; 17] = [
+            "password",
+            "passwd",
+            "secret",
+            "api_key",
+            "api-key",
+            "apikey",
+            "authorization",
+            "proxy-authorization",
+            "proxy_authorization",
+            "auth",
+            "token",
+            "access_token",
+            "access-token",
+            "auth_token",
+            "auth-token",
+            "cookie",
+            "credential",
+        ];
+        let spellings = |key: &str| -> Vec<String> {
+            let mut forms = vec![key.to_string(), key.to_uppercase()];
+            let mut mixed = String::new();
+            for (index, character) in key.chars().enumerate() {
+                if index % 2 == 0 {
+                    mixed.extend(character.to_uppercase());
+                } else {
+                    mixed.push(character);
+                }
+            }
+            forms.push(mixed);
+            let mut title = String::new();
+            let mut capitalize = true;
+            for character in key.chars() {
+                if character == '_' || character == '-' {
+                    title.push(character);
+                    capitalize = true;
+                    continue;
+                }
+                if capitalize {
+                    title.extend(character.to_uppercase());
+                    capitalize = false;
+                } else {
+                    title.push(character);
+                }
+            }
+            forms.push(title);
+            forms
+        };
+        for key in KEYS {
+            for spelling in spellings(key) {
+                for separator in [": ", "= ", ":", "=", " : ", " = ", "\t= "] {
+                    let input = format!("{spelling}{separator}{MARKER}");
+                    assert_eq!(
+                        redact_value(input.clone(), "notes"),
+                        "[REDACTED]",
+                        "assignment phrase must redact: {input:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The provider-token prefilter has the same defect class and the same
+    /// fix: a lower-case spelling of a mixed-case prefix must still be found.
+    #[test]
+    fn p1_token_prefix_prefilter_is_case_insensitive() {
+        for (spelling, marker) in [
+            ("AIza", "aizasyndheticopaque123456"),
+            ("aiza", "aizasyndheticopaque123456"),
+            ("AKIA", "akiaIOSFODNN7EXAMPLE"),
+            ("akia", "akiaIOSFODNN7EXAMPLE"),
+        ] {
+            let input = format!("{spelling}{marker}");
+            assert_eq!(
+                redact_value(input.clone(), "notes"),
+                "[REDACTED]",
+                "provider token must redact: {input:?}"
+            );
+        }
+    }
+
+    /// Sentence-style prose that merely mentions a key name must survive.
+    #[test]
+    fn p1_case_insensitive_prefilter_does_not_widen_prose() {
+        for text in [
+            "Passwords are required to log in",
+            "The Authorization header is optional",
+            "Tokens expire after one hour",
+            "release 1.2.3",
+            "thequickbrownfoxjumpsoverthelazydogagainx",
+            "src/components/VeryLongComponentName/index.ts",
+        ] {
+            assert_eq!(redact_value(text.to_string(), "notes"), text);
+        }
+    }
 
     #[test]
     fn sensitive_detection() {
