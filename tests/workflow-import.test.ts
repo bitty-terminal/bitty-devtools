@@ -1,6 +1,5 @@
 import { describe, expect, test } from "bun:test";
 import {
-  appendFileSync,
   chmodSync,
   copyFileSync,
   existsSync,
@@ -8,7 +7,6 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
-  renameSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -274,7 +272,11 @@ function createDisposableCurrentDatabase(
   copyFileSync(authorityDatabase, path);
   for (const suffix of ["-wal", "-shm"]) {
     const source = `${authorityDatabase}${suffix}`;
-    if (existsSync(source)) copyFileSync(source, `${path}${suffix}`);
+    try {
+      copyFileSync(source, `${path}${suffix}`);
+    } catch {
+      // Source may not exist or may have been removed - ignore
+    }
   }
   const modes = [
     options.fts ? "fts" : "",
@@ -568,7 +570,13 @@ if (sql.includes("VACUUM INTO")) {
   if (mode === "dump-error") process.exit(1);
   const match = sql.match(/\\.parameter set @out '([^']+)'/);
   if (!match) process.exit(1);
-  const content = existsSync(last) ? readFileSync(last).toString("base64") : "";
+  const content = (() => {
+    try {
+      return readFileSync(last).toString("base64");
+    } catch {
+      return "";
+    }
+  })();
   writeFileSync(match[1], content);
   process.exit(0);
 }
@@ -720,11 +728,19 @@ if (stage === "init" && authority) {
   if (process.env.FIXTURE_AUTHORITY_FAILURE === "1") process.exit(9);
   const destination = join(project, ".git/carryctx/state.sqlite");
   mkdirSync(dirname(destination), { recursive: true });
-  if (process.env.FIXTURE_AUTHORITY_DB && existsSync(process.env.FIXTURE_AUTHORITY_DB)) {
-    copyFileSync(process.env.FIXTURE_AUTHORITY_DB, destination);
+  if (process.env.FIXTURE_AUTHORITY_DB) {
+    try {
+      copyFileSync(process.env.FIXTURE_AUTHORITY_DB, destination);
+    } catch {
+      // Source may not exist - skip
+    }
     for (const suffix of ["-wal", "-shm"]) {
       const source = process.env.FIXTURE_AUTHORITY_DB + suffix;
-      if (existsSync(source)) copyFileSync(source, destination + suffix);
+      try {
+        copyFileSync(source, destination + suffix);
+      } catch {
+        // Source may not exist or may have been removed - ignore
+      }
     }
   } else {
     writeFileSync(destination, "authority");
@@ -749,9 +765,13 @@ if (stage === "stats" && process.env.FIXTURE_RACE === "guard-after-validation") 
   const restoreIndex = process.argv.indexOf("restore");
   const source = process.argv[restoreIndex + 1];
   const destination = join(stateRoot, "carryctx/state.sqlite");
-  if (source && existsSync(source)) {
-    mkdirSync(dirname(destination), { recursive: true });
-    copyFileSync(source, destination);
+  if (source) {
+    try {
+      mkdirSync(dirname(destination), { recursive: true });
+      copyFileSync(source, destination);
+    } catch {
+      // Source may not exist or may have been removed - ignore
+    }
   }
   process.exit(0);
 }
@@ -761,29 +781,51 @@ if (stage === "init" || stage === "import") {
   if (stage === "import") {
      const state = join(stateRoot, "carryctx/state.sqlite");
      const raceState = staging ? join(process.env.FIXTURE_COMMON, "carryctx/state.sqlite") : state;
-     if (process.env.FIXTURE_RACE === "import-inode" && existsSync(raceState)) {
+     if (process.env.FIXTURE_RACE === "import-inode") {
        const replacement = raceState + ".inode";
-       copyFileSync(raceState, replacement);
+       try {
+         copyFileSync(raceState, replacement);
+       } catch {
+         // raceState may have been removed - continue without copying
+       }
        for (const suffix of ["-wal", "-shm"]) {
-         if (existsSync(raceState + suffix)) copyFileSync(raceState + suffix, replacement + suffix);
+         try {
+           copyFileSync(raceState + suffix, replacement + suffix);
+         } catch {
+           // Source may not exist or may have been removed - ignore
+         }
        }
        renameSync(replacement, raceState);
        for (const suffix of ["-wal", "-shm"]) {
-         if (existsSync(replacement + suffix)) {
+         try {
            copyFileSync(replacement + suffix, raceState + suffix);
            rmSync(replacement + suffix, { force: true });
+         } catch {
+           // File may not exist - ignore
          }
        }
      }
-     if (process.env.FIXTURE_RACE === "import" && existsSync(raceState)) appendFileSync(raceState, "import-race");
+     if (process.env.FIXTURE_RACE === "import") {
+       try {
+         appendFileSync(raceState, "import-race");
+       } catch {
+         // raceState may not exist or may have been removed - ignore
+       }
+     }
      importBackup = join(stateRoot, "carryctx/backups/pre_import_fixture.sqlite");
     mkdirSync(dirname(importBackup), { recursive: true });
-     if (existsSync(state)) {
+     try {
        copyFileSync(state, importBackup);
        for (const suffix of ["-wal", "-shm"]) {
-         if (existsSync(state + suffix)) copyFileSync(state + suffix, importBackup + suffix);
+         try {
+           copyFileSync(state + suffix, importBackup + suffix);
+         } catch {
+           // Source may not exist or may have been removed - ignore
+         }
        }
-     } else writeFileSync(importBackup, "absent");
+     } catch {
+       writeFileSync(importBackup, "absent");
+     }
      if (process.env.FIXTURE_RACE === "import-path") {
        const replacement = raceState + ".replacement";
        writeFileSync(replacement, "replacement");
@@ -995,14 +1037,18 @@ process.exit(result.exitCode);`,
     };
     const activeProjectName = readProjectName(currentDatabase);
     const stateDirectory = dirname(currentDatabase);
-    const guardFile = existsSync(stateDirectory)
-      ? readdirSync(stateDirectory).find(
+    const guardFile = (() => {
+      try {
+        return readdirSync(stateDirectory).find(
           (name) =>
             name.startsWith(".workflow-import-original.") &&
             !name.endsWith("-wal") &&
             !name.endsWith("-shm"),
-        )
-      : undefined;
+        );
+      } catch {
+        return undefined;
+      }
+    })();
     const guardProjectName = guardFile
       ? readProjectName(join(stateDirectory, guardFile))
       : undefined;
@@ -1010,8 +1056,20 @@ process.exit(result.exitCode);`,
       exitCode: result.exitCode,
       stdout: result.stdout.toString(),
       stderr: result.stderr.toString(),
-      commands: existsSync(log) ? readFileSync(log, "utf8") : "",
-      config: existsSync(config) ? readFileSync(config, "utf8") : undefined,
+      commands: (() => {
+        try {
+          return readFileSync(log, "utf8");
+        } catch {
+          return "";
+        }
+      })(),
+      config: (() => {
+        try {
+          return readFileSync(config, "utf8");
+        } catch {
+          return undefined;
+        }
+      })(),
       descendantLeak: existsSync(join(root, "descendant-leak.marker")),
       tempEntries: readdirSync(temp),
       databaseStable,
@@ -1038,10 +1096,14 @@ process.exit(result.exitCode);`,
       authorityFtsRelatedCount,
       activeProjectName,
       guardProjectName,
-      databaseContent:
-        existsSync(currentDatabase) && statSync(currentDatabase).isFile()
-          ? readFileSync(currentDatabase).toString()
-          : undefined,
+      databaseContent: (() => {
+        // Avoid TOCTOU race: read directly and catch errors
+        try {
+          return readFileSync(currentDatabase).toString();
+        } catch {
+          return undefined;
+        }
+      })(),
       backups: backups.map((path) => ({
         path,
         content: readFileSync(path, "utf8"),

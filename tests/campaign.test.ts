@@ -52,7 +52,7 @@ import {
   type CtlResult,
   type ProcessDispatcherConfig,
 } from "../src/campaign.js";
-import { ProtocolErrorImpl, decodeResponse } from "../src/protocol.js";
+// Unused imports removed to resolve CodeQL alert #3
 import {
   isNormalizationSeparator,
   redactSensitiveText,
