@@ -567,7 +567,13 @@ if (sql.includes("VACUUM INTO")) {
   if (mode === "dump-error") process.exit(1);
   const match = sql.match(/\\.parameter set @out '([^']+)'/);
   if (!match) process.exit(1);
-  const content = existsSync(last) ? readFileSync(last).toString("base64") : "";
+  const content = (() => {
+    try {
+      return readFileSync(last).toString("base64");
+    } catch {
+      return "";
+    }
+  })();
   writeFileSync(match[1], content);
   process.exit(0);
 }
@@ -1009,8 +1015,20 @@ process.exit(result.exitCode);`,
       exitCode: result.exitCode,
       stdout: result.stdout.toString(),
       stderr: result.stderr.toString(),
-      commands: existsSync(log) ? readFileSync(log, "utf8") : "",
-      config: existsSync(config) ? readFileSync(config, "utf8") : undefined,
+      commands: (() => {
+        try {
+          return readFileSync(log, "utf8");
+        } catch {
+          return "";
+        }
+      })(),
+      config: (() => {
+        try {
+          return readFileSync(config, "utf8");
+        } catch {
+          return undefined;
+        }
+      })(),
       descendantLeak: existsSync(join(root, "descendant-leak.marker")),
       tempEntries: readdirSync(temp),
       databaseStable,
@@ -1038,12 +1056,9 @@ process.exit(result.exitCode);`,
       activeProjectName,
       guardProjectName,
       databaseContent: (() => {
-        // Avoid TOCTOU race: use try-catch instead of existsSync + readFileSync
+        // Avoid TOCTOU race: read directly and catch errors
         try {
-          const stat = statSync(currentDatabase);
-          return stat.isFile()
-            ? readFileSync(currentDatabase).toString()
-            : undefined;
+          return readFileSync(currentDatabase).toString();
         } catch {
           return undefined;
         }
