@@ -619,6 +619,29 @@ export class IpcTransport {
     return chunks;
   }
 
+  /**
+   * Encode exactly one physical frame for a live request, or fail closed.
+   *
+   * `encodeRequest` splits an oversized logical request into RC-10 chunks for
+   * the headless streaming transport. The live path must never use that split:
+   * `bitty` reads one complete frame per exchange and defines no inbound
+   * request continuation identity, so a fragmented request would become
+   * several independent exchanges with partial side effects. Until the server
+   * continuation contract lands in `bitty`, a request above
+   * {@link MAX_FRAME_BYTES} is rejected with `FrameTooLarge` before any byte
+   * reaches the socket.
+   */
+  encodeSingleLiveRequest(req: IpcRequest): Uint8Array {
+    const frames = this.encodeRequest(req);
+    if (frames.length !== 1) {
+      throw new TransportError(
+        "FrameTooLarge",
+        "live request requires a server continuation contract",
+      );
+    }
+    return frames[0]!;
+  }
+
   sendRequest(req: IpcRequest, nowMs: number): void {
     if (this.stub.isClosed()) {
       this.disconnect();

@@ -1,10 +1,12 @@
 /**
  * CTX-0080 live request admission boundary.
  *
- * CTX-0079 owns src/protocol.ts decoding, duplicate-key handling, payload
- * bounds, and redaction. This module owns only the live request admission
- * checks added by CTX-0080: supported protocol version, registered method,
- * exact scope, and the shared protocol encoder's size/shape validation.
+ * src/protocol.ts owns debug-protocol response decoding, duplicate-key
+ * rejection (shared scanner in src/json-guard.ts), payload bounds, and error
+ * shaping; it does not own redaction. This module owns only the live request
+ * admission checks added by CTX-0080: supported protocol version, registered
+ * method, exact scope, and the shared protocol encoder's size/shape
+ * validation.
  */
 
 import {

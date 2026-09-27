@@ -621,15 +621,9 @@ export class DevtoolsClient {
       throw new TransportError("TransportClosed", "request cancelled");
     }
     transport.getRateLimiter().check(nowMs);
-    const frames = transport.encodeRequest(req);
-    if (frames.length !== 1) {
-      throw new TransportError(
-        "FrameTooLarge",
-        "live request requires a server continuation contract",
-      );
-    }
+    const frame = transport.encodeSingleLiveRequest(req);
     const raw = await live.requestResponse(
-      frames[0]!.slice(4),
+      frame.slice(4),
       nowMs,
       req.id,
       signal,

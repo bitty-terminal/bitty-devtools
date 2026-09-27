@@ -131,7 +131,8 @@ describe("offline platform contract", () => {
 
   test("protocol ownership is split at the CTX-0080 boundary", () => {
     const boundary = repositoryFile("src/protocol-boundary.ts");
-    expect(boundary).toContain("CTX-0079 owns src/protocol.ts");
+    expect(boundary).toContain("src/protocol.ts owns debug-protocol");
+    expect(boundary).toContain("src/json-guard.ts");
     expect(boundary).toContain("CTX-0080");
     expect(boundary).toContain("validateLiveRequest");
   });

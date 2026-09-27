@@ -25,6 +25,7 @@
 
 import { DIR_MODE } from "./auth.js";
 import { truncateToBytes } from "./bounds.js";
+import { assertUniqueJsonObjectKeys } from "./json-guard.js";
 import { redactSensitiveText, sanitizeTerminalOutput } from "./redaction.js";
 
 function isAbsoluteSocketPath(socketPath: string): boolean {
@@ -377,78 +378,6 @@ export function validateEnvelopeShape(value: unknown): string[] {
   return [...new Set(problems)].slice(0, 8).map(safeReportText);
 }
 
-/**
- * Reject a ctl stdout envelope that repeats an object key. `JSON.parse` keeps
- * the last occurrence, so a duplicate key lets a hostile target show one value
- * to the operator and hand a different one to every later consumer.
- * Single-line JSONL only: `parseCtlEnvelopeShape` rejects embedded newlines
- * before this runs.
- */
-function assertCtlEnvelopeUniqueKeys(raw: string): void {
-  const stack: Array<
-    { kind: "object"; keys: Set<string> } | { kind: "array" }
-  > = [];
-  for (let index = 0; index < raw.length; index += 1) {
-    const character = raw[index];
-    if (character === "{") {
-      stack.push({ kind: "object", keys: new Set<string>() });
-      continue;
-    }
-    if (character === "[") {
-      stack.push({ kind: "array" });
-      continue;
-    }
-    if (character === "}" || character === "]") {
-      const expected = character === "}" ? "object" : "array";
-      const current = stack.pop();
-      if (current?.kind !== expected) {
-        throw new SyntaxError("JSON contains mismatched structure");
-      }
-      continue;
-    }
-    if (character !== '"') continue;
-    let end = index + 1;
-    let escaped = false;
-    for (; end < raw.length; end += 1) {
-      const code = raw.charCodeAt(end);
-      if (escaped) {
-        escaped = false;
-        continue;
-      }
-      if (raw[end] === "\\") {
-        escaped = true;
-        continue;
-      }
-      if (raw[end] === '"') break;
-      if (code < 0x20) {
-        throw new SyntaxError("JSON string contains a control character");
-      }
-    }
-    if (end >= raw.length) {
-      throw new SyntaxError("JSON contains an unterminated string");
-    }
-    const current = stack.at(-1);
-    if (current?.kind === "object") {
-      let next = end + 1;
-      while (next < raw.length && /\s/u.test(raw[next] ?? "")) next += 1;
-      if (raw[next] === ":") {
-        const parsedKey: unknown = JSON.parse(raw.slice(index, end + 1));
-        if (typeof parsedKey !== "string") {
-          throw new SyntaxError("JSON object key is not a string");
-        }
-        if (current.keys.has(parsedKey)) {
-          throw new SyntaxError("JSON contains a duplicate object key");
-        }
-        current.keys.add(parsedKey);
-      }
-    }
-    index = end;
-  }
-  if (stack.length > 0) {
-    throw new SyntaxError("JSON contains unclosed structure");
-  }
-}
-
 function parseCtlEnvelopeShape(stdout: string): CtlEnvelope {
   if (utf8Bytes(stdout) > MAX_CAMPAIGN_OUTPUT_BYTES) {
     throw new CampaignError(
@@ -470,7 +399,7 @@ function parseCtlEnvelopeShape(stdout: string): CtlEnvelope {
   }
   let parsed: unknown;
   try {
-    assertCtlEnvelopeUniqueKeys(line);
+    assertUniqueJsonObjectKeys(line);
     parsed = JSON.parse(line);
   } catch {
     throw new CampaignError("InvalidJson", "ctl stdout is not valid JSON");
