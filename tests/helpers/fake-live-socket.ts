@@ -146,6 +146,8 @@ export type ScratchLoopback = {
   socketPath: string;
   runtimeUid: number;
   timeoutMs: number;
+  /** Number of accepted connections; proves whether a dial reached the server. */
+  connections: () => number;
   stop: () => void;
 };
 
@@ -180,11 +182,13 @@ export function createScratchLoopback(options: {
   const wire = new Uint8Array(4 + options.responsePayload.length);
   new DataView(wire.buffer).setUint32(0, options.responsePayload.length, false);
   wire.set(options.responsePayload, 4);
+  let acceptedConnections = 0;
   const server = (
     Bun as unknown as {
       listen(options: {
         unix: string;
         socket: {
+          open(sock: { write(data: Uint8Array): void }): void;
           data(sock: { write(data: Uint8Array): void }, data: Uint8Array): void;
           error(): void;
         };
@@ -193,6 +197,9 @@ export function createScratchLoopback(options: {
   ).listen({
     unix: socketPath,
     socket: {
+      open() {
+        acceptedConnections += 1;
+      },
       data(sock) {
         sock.write(wire);
       },
@@ -205,6 +212,7 @@ export function createScratchLoopback(options: {
     socketPath,
     runtimeUid,
     timeoutMs,
+    connections: () => acceptedConnections,
     stop: () => {
       try {
         server.stop(true);

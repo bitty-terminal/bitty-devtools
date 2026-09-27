@@ -1,6 +1,6 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { DevtoolsClient } from "../src/client.js";
-import { IpcTransport } from "../src/transport.js";
+import { IpcTransport, TransportError } from "../src/transport.js";
 import { peerCredentials } from "../src/auth.js";
 import { createScratchLoopback } from "./helpers/fake-live-socket.js";
 import { isLiveSocketSupported } from "../src/ipc-socket.js";
@@ -209,6 +209,88 @@ describe("DevtoolsClient inspection live IPC wiring", () => {
 
         c.disconnect();
       } finally {
+        loopback.stop();
+      }
+    });
+
+    test("oversized live request fails closed before any socket write", async () => {
+      if (!isLiveSocketSupported()) return;
+      const responsePayload = new TextEncoder().encode(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          result: { plugins: [] },
+          version: "1.0",
+        }),
+      );
+      const loopback = createScratchLoopback({
+        prefix: "bitty-devtools-client-ctx0082",
+        responsePayload,
+        timeoutMs: 1000,
+      });
+      type WriteSocket = { write(data: Uint8Array): number };
+      const runtime = Bun as unknown as {
+        connect(options: {
+          socket: { open?: (socket: WriteSocket) => void };
+        }): Promise<unknown>;
+      };
+      const writes: number[] = [];
+      const realConnect = runtime.connect.bind(runtime);
+      const connectSpy = spyOn(runtime, "connect").mockImplementation(
+        (options) => {
+          const originalOpen = options.socket.open;
+          options.socket.open = (socket: WriteSocket) => {
+            const realWrite = socket.write.bind(socket);
+            socket.write = (data: Uint8Array) => {
+              writes.push(data.length);
+              return realWrite(data);
+            };
+            originalOpen?.(socket);
+          };
+          return realConnect(options);
+        },
+      );
+      try {
+        const c = new DevtoolsClient();
+        await c.connectLiveSocket(
+          loopback.runtimeUid,
+          peerCredentials(loopback.runtimeUid, loopback.runtimeUid, 1),
+          undefined,
+          undefined,
+          loopback.socketPath,
+        );
+        c.grantScope("debug.inspect");
+        await c.requestLive(
+          {
+            id: 1,
+            method: "bitty.debug/listPlugins",
+            params: {},
+            version: "1.0",
+          },
+          0,
+        );
+        expect(writes.length).toBe(1);
+        let caught: unknown = null;
+        try {
+          await c.requestLive(
+            {
+              id: 2,
+              method: "bitty.debug/listPlugins",
+              params: { x: "a".repeat(600 * 1024) },
+              version: "1.0",
+            },
+            0,
+          );
+        } catch (error) {
+          caught = error;
+        }
+        expect(caught).toBeInstanceOf(TransportError);
+        expect((caught as TransportError).code).toBe("FrameTooLarge");
+        expect((caught as Error).message).toContain("continuation contract");
+        expect(writes.length).toBe(1);
+        c.disconnect();
+      } finally {
+        connectSpy.mockRestore();
         loopback.stop();
       }
     });

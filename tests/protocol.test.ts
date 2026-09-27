@@ -48,6 +48,165 @@ describe("protocol versioned framing", () => {
     expect(() => decodeResponse("not json")).toThrow("not valid JSON");
   });
 
+  test("closed decoder requires exactly one non-empty JSONL line", () => {
+    const one = JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      result: {},
+      version: "1.0",
+    });
+    expect(() => decodeResponse(`${one}\n${one}`)).toThrow(
+      "exactly one non-empty JSONL line",
+    );
+    // Surrounding blank lines around one JSON line are valid JSONL framing.
+    expect(decodeResponse(`\n${one}\n`).id).toBe(1);
+    expect(decodeResponse(`${one}\n`).id).toBe(1);
+  });
+
+  test("closed decoder rejects extra top-level and error fields", () => {
+    const base = { jsonrpc: "2.0", id: 1, result: {}, version: "1.0" };
+    expect(() =>
+      decodeResponse(JSON.stringify({ ...base, injected: true })),
+    ).toThrow("field 'injected' is not allowed");
+    expect(() =>
+      decodeResponse(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          error: {
+            category: "usage",
+            code: "Bad",
+            message: "m",
+            injected: true,
+          },
+          version: "1.0",
+        }),
+      ),
+    ).toThrow("error field 'injected' is not allowed");
+  });
+
+  test("closed decoder enforces result xor error", () => {
+    const err = { category: "usage" as const, code: "Bad", message: "m" };
+    expect(() =>
+      decodeResponse(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          result: {},
+          error: err,
+          version: "1.0",
+        }),
+      ),
+    ).toThrow("exactly one of result or error");
+    expect(() =>
+      decodeResponse(JSON.stringify({ jsonrpc: "2.0", id: 1, version: "1.0" })),
+    ).toThrow("exactly one of result or error");
+    expect(
+      decodeResponse(
+        JSON.stringify({ jsonrpc: "2.0", id: 1, error: err, version: "1.0" }),
+      ).error,
+    ).toEqual(err);
+    expect(
+      decodeResponse(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          result: null,
+          version: "1.0",
+        }),
+      ).result,
+    ).toBeNull();
+  });
+
+  test("closed decoder validates error category, code, and message", () => {
+    const wrap = (error: unknown): string =>
+      JSON.stringify({ jsonrpc: "2.0", id: 1, error, version: "1.0" });
+    expect(() =>
+      decodeResponse(wrap({ category: "made-up", code: "Bad", message: "m" })),
+    ).toThrow("category is not a known category");
+    expect(() =>
+      decodeResponse(wrap({ category: "usage", code: "", message: "m" })),
+    ).toThrow("error code must be a string");
+    expect(() =>
+      decodeResponse(
+        wrap({ category: "usage", code: "C".repeat(129), message: "m" }),
+      ),
+    ).toThrow("error code must be a string");
+    expect(() =>
+      decodeResponse(wrap({ category: "usage", code: "Bad", message: 7 })),
+    ).toThrow("error message must be a string");
+    const long = decodeResponse(
+      wrap({ category: "usage", code: "Bad", message: "x".repeat(600) }),
+    );
+    expect(long.error?.message.length).toBe(512);
+    // Every supported category round-trips.
+    for (const category of [
+      "usage",
+      "capability",
+      "scope",
+      "budget",
+      "generation",
+      "transport",
+    ] as const) {
+      expect(
+        decodeResponse(wrap({ category, code: "Bad", message: "m" })).error
+          ?.category,
+      ).toBe(category);
+    }
+  });
+
+  test("closed decoder rejects duplicate object keys", () => {
+    // JSON.parse is last-wins, so a repeated key can mask one value behind
+    // another; the decoder must refuse it before parsing.
+    expect(() =>
+      decodeResponse(
+        '{"jsonrpc":"2.0","id":1,"result":{},"result":null,"version":"1.0"}',
+      ),
+    ).toThrow("repeats field 'result'");
+    expect(() =>
+      decodeResponse(
+        '{"jsonrpc":"2.0","id":1,"error":{"category":"usage","code":"Bad","message":"a","message":"b"},"version":"1.0"}',
+      ),
+    ).toThrow("repeats field 'message'");
+    expect(() =>
+      decodeResponse(
+        '{"jsonrpc":"2.0","id":1,"result":{"a":1,"a":2},"version":"1.0"}',
+      ),
+    ).toThrow("repeats field 'a'");
+  });
+
+  test("closed decoder bounds error details to 4 KiB", () => {
+    const withDetails = (details: unknown): string =>
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        error: { category: "usage", code: "Bad", message: "m", details },
+        version: "1.0",
+      });
+    const atBound = decodeResponse(withDetails({ note: "x".repeat(4085) }));
+    expect(atBound.error?.details).toEqual({ note: "x".repeat(4085) });
+    expect(() =>
+      decodeResponse(withDetails({ note: "x".repeat(4086) })),
+    ).toThrow("details must serialize within 4096 bytes");
+  });
+
+  test("closed decoder rejects non-object JSON without throwing TypeError", () => {
+    expect(() => decodeResponse("null")).toThrow("must be a JSON object");
+    expect(() => decodeResponse("[]")).toThrow("must be a JSON object");
+    expect(() => decodeResponse('"str"')).toThrow("must be a JSON object");
+    expect(() => decodeResponse("42")).toThrow("must be a JSON object");
+  });
+
+  test("closed decoder requires a nonnegative safe-integer id", () => {
+    const wrap = (id: unknown): string =>
+      JSON.stringify({ jsonrpc: "2.0", id, result: {}, version: "1.0" });
+    for (const id of [undefined, "1", 1.5, -1, Number.MAX_SAFE_INTEGER + 1]) {
+      expect(() => decodeResponse(wrap(id))).toThrow(
+        "id must be a nonnegative safe integer",
+      );
+    }
+  });
+
   test("scope matrix", () => {
     expect(
       isValidMethodForScope("bitty.debug/listPlugins", "debug.inspect"),

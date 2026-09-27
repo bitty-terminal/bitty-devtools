@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { resolve } from "node:path";
 import {
   CliConfigError,
   CliUsageError,
@@ -34,6 +35,8 @@ import {
 import { TracingError } from "../src/tracing.js";
 import { BoundError } from "../src/bounds.js";
 import { DevtoolsClient } from "../src/client.js";
+import { isLiveSocketSupported } from "../src/ipc-socket.js";
+import { createScratchLoopback } from "./helpers/fake-live-socket.js";
 
 type Harness = {
   out: string[];
@@ -517,6 +520,67 @@ describe("runCliLive over a loopback socket (CTX-0036)", () => {
     expect(code).toBe(EXIT_PERM);
     expect(harness.out).toEqual([]);
     expect(harness.err.join("")).toContain("Unauthenticated");
+  });
+});
+
+describe("installed bin/bitty-devtools.ts subprocess over a loopback socket (CTX-0082)", () => {
+  test("inspect dials the socket; --help and malformed args never dial", async () => {
+    if (!isLiveSocketSupported()) return;
+    const responsePayload = new TextEncoder().encode(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        result: { plugins: [pluginPayload()] },
+        version: "1.0",
+      }),
+    );
+    const loopback = createScratchLoopback({
+      prefix: "bitty-devtools-cli-ctx0082-bin",
+      responsePayload,
+      timeoutMs: 1000,
+    });
+    const binPath = resolve(import.meta.dir, "..", "bin", "bitty-devtools.ts");
+    const run = async (
+      args: string[],
+    ): Promise<{
+      exitCode: number;
+      stdout: string;
+      stderr: string;
+      connections: number;
+    }> => {
+      const proc = Bun.spawn([process.execPath, binPath, ...args], {
+        cwd: resolve(import.meta.dir, ".."),
+        env: { ...process.env, BITTY_SOCKET: loopback.socketPath },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [stdout, stderr, exitCode] = await Promise.all([
+        new Response(proc.stdout).text(),
+        new Response(proc.stderr).text(),
+        proc.exited,
+      ]);
+      return { exitCode, stdout, stderr, connections: loopback.connections() };
+    };
+    try {
+      const inspect = await run(["inspect", "--plugins"]);
+      expect(inspect.connections).toBe(1);
+      expect(inspect.exitCode).toBe(EXIT_OK);
+      expect(inspect.stderr).toBe("");
+      expect(inspect.stdout).toContain("plugin-a");
+      expect(inspect.stdout).toContain("Activated");
+
+      const help = await run(["--help"]);
+      expect(help.connections).toBe(1);
+      expect(help.exitCode).toBe(EXIT_OK);
+      expect(help.stdout).toContain("Usage:");
+
+      const malformed = await run(["inspect"]);
+      expect(malformed.connections).toBe(1);
+      expect(malformed.exitCode).toBe(EXIT_USAGE);
+      expect(malformed.stderr).toContain("Usage:");
+    } finally {
+      loopback.stop();
+    }
   });
 });
 

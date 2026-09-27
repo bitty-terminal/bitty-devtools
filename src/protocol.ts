@@ -11,11 +11,29 @@
  * Windows named pipe); this file owns only framing and schema validation.
  */
 
-import { BOUNDS, assertBounded, assertStringBounded } from "./bounds.js";
+import {
+  BOUNDS,
+  assertBounded,
+  assertStringBounded,
+  truncateToChars,
+} from "./bounds.js";
+import {
+  DuplicateJsonKeyError,
+  assertUniqueJsonObjectKeys,
+} from "./json-guard.js";
 
 export const PROTOCOL_VERSION = "1.0" as const;
 export const SUPPORTED_VERSIONS: readonly string[] = [
   PROTOCOL_VERSION,
+] as const;
+
+const ERROR_CATEGORIES: readonly ErrorCategory[] = [
+  "usage",
+  "capability",
+  "scope",
+  "budget",
+  "generation",
+  "transport",
 ] as const;
 
 export type DebugScope = "debug.inspect" | "debug.trace" | "debug.control";
@@ -100,10 +118,35 @@ export function encodeRequest(frame: RequestFrame): string {
 
 export function decodeResponse(raw: string): ResponseFrame {
   validateFrameBytes(raw);
-  const line = raw.trim().split("\n")[0] ?? "";
+  const lines = raw.split("\n").filter((line) => line.trim().length > 0);
+  if (lines.length !== 1) {
+    throw new ProtocolErrorImpl({
+      category: "usage",
+      code: "InvalidJson",
+      message: "response must be exactly one non-empty JSONL line",
+    });
+  }
+  // Reject a repeated object key before `JSON.parse`, which is last-wins and
+  // would otherwise let a hostile server mask one value behind another.
+  try {
+    assertUniqueJsonObjectKeys(lines[0] as string);
+  } catch (error) {
+    if (error instanceof DuplicateJsonKeyError) {
+      throw new ProtocolErrorImpl({
+        category: "usage",
+        code: "DuplicateField",
+        message: `response repeats field '${error.key}'`,
+      });
+    }
+    throw new ProtocolErrorImpl({
+      category: "usage",
+      code: "InvalidJson",
+      message: "response is not well-formed JSON",
+    });
+  }
   let parsed: unknown;
   try {
-    parsed = JSON.parse(line);
+    parsed = JSON.parse(lines[0] as string);
   } catch {
     throw new ProtocolErrorImpl({
       category: "usage",
@@ -111,7 +154,25 @@ export function decodeResponse(raw: string): ResponseFrame {
       message: "response is not valid JSON",
     });
   }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new ProtocolErrorImpl({
+      category: "usage",
+      code: "InvalidJson",
+      message: "response must be a JSON object",
+    });
+  }
   const obj = parsed as Record<string, unknown>;
+  const hasResult = Object.hasOwn(obj, "result");
+  const hasError = Object.hasOwn(obj, "error");
+  for (const key of Object.keys(obj)) {
+    if (!ALLOWED_RESPONSE_KEYS.has(key)) {
+      throw new ProtocolErrorImpl({
+        category: "usage",
+        code: "UnknownField",
+        message: `response field '${key}' is not allowed`,
+      });
+    }
+  }
   if (obj["jsonrpc"] !== "2.0") {
     throw new ProtocolErrorImpl({
       category: "usage",
@@ -119,11 +180,11 @@ export function decodeResponse(raw: string): ResponseFrame {
       message: "jsonrpc must be 2.0",
     });
   }
-  if (typeof obj["id"] !== "number") {
+  if (!Number.isSafeInteger(obj["id"]) || (obj["id"] as number) < 0) {
     throw new ProtocolErrorImpl({
       category: "usage",
-      code: "MissingId",
-      message: "response id must be number",
+      code: "InvalidId",
+      message: "response id must be a nonnegative safe integer",
     });
   }
   if (
@@ -136,22 +197,120 @@ export function decodeResponse(raw: string): ResponseFrame {
       message: "invalid or unsupported version",
     });
   }
-  if (obj["error"] !== undefined) {
-    const err = obj["error"] as ProtocolError;
-    if (typeof err.code !== "string" || typeof err.category !== "string") {
+  if (hasResult === hasError) {
+    throw new ProtocolErrorImpl({
+      category: "usage",
+      code: "InvalidResult",
+      message: "response must carry exactly one of result or error",
+    });
+  }
+  if (hasError) {
+    return {
+      jsonrpc: "2.0",
+      id: obj["id"] as number,
+      error: decodeErrorField(obj["error"]),
+      version: obj["version"] as string,
+    };
+  }
+  return {
+    jsonrpc: "2.0",
+    id: obj["id"] as number,
+    result: obj["result"],
+    version: obj["version"] as string,
+  };
+}
+
+const ALLOWED_RESPONSE_KEYS = new Set([
+  "jsonrpc",
+  "id",
+  "result",
+  "error",
+  "version",
+]);
+
+function decodeErrorField(value: unknown): ProtocolError {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new ProtocolErrorImpl({
+      category: "usage",
+      code: "InvalidErrorShape",
+      message: "error must be a JSON object",
+    });
+  }
+  const err = value as Record<string, unknown>;
+  for (const key of Object.keys(err)) {
+    if (!ALLOWED_ERROR_KEYS.has(key)) {
+      throw new ProtocolErrorImpl({
+        category: "usage",
+        code: "UnknownField",
+        message: `error field '${key}' is not allowed`,
+      });
+    }
+  }
+  const category = err["category"];
+  if (
+    typeof category !== "string" ||
+    !(ERROR_CATEGORIES as readonly string[]).includes(category)
+  ) {
+    throw new ProtocolErrorImpl({
+      category: "usage",
+      code: "InvalidErrorShape",
+      message: "error category is not a known category",
+    });
+  }
+  const code = err["code"];
+  if (
+    typeof code !== "string" ||
+    code.length === 0 ||
+    code.length > MAX_ERROR_CODE_CHARS
+  ) {
+    throw new ProtocolErrorImpl({
+      category: "usage",
+      code: "InvalidErrorShape",
+      message: `error code must be a string of 1..${MAX_ERROR_CODE_CHARS} chars`,
+    });
+  }
+  const message = err["message"];
+  if (typeof message !== "string") {
+    throw new ProtocolErrorImpl({
+      category: "usage",
+      code: "InvalidErrorShape",
+      message: "error message must be a string",
+    });
+  }
+  const error: ProtocolError = {
+    category: category as ErrorCategory,
+    code,
+    message: truncateToChars(message, MAX_ERROR_MESSAGE_CHARS).text,
+  };
+  if (err["details"] !== undefined) {
+    // The RFC forbids echoing unbounded untrusted bytes: reject rather than
+    // truncate opaque details so a hostile server can never smuggle a large
+    // payload (or an over-budget record) through the error channel.
+    let serialized: string | undefined;
+    try {
+      serialized = JSON.stringify(err["details"]);
+    } catch {
+      serialized = undefined;
+    }
+    if (
+      serialized === undefined ||
+      new TextEncoder().encode(serialized).length > MAX_ERROR_DETAILS_BYTES
+    ) {
       throw new ProtocolErrorImpl({
         category: "usage",
         code: "InvalidErrorShape",
-        message: "error shape invalid",
+        message: `error details must serialize within ${MAX_ERROR_DETAILS_BYTES} bytes`,
       });
     }
-    // Never echo unbounded bytes in error
-    if (err.message && err.message.length > 512) {
-      err.message = err.message.slice(0, 512);
-    }
+    error.details = err["details"];
   }
-  return parsed as ResponseFrame;
+  return error;
 }
+
+const ALLOWED_ERROR_KEYS = new Set(["category", "code", "message", "details"]);
+const MAX_ERROR_MESSAGE_CHARS = 512;
+const MAX_ERROR_CODE_CHARS = 128;
+const MAX_ERROR_DETAILS_BYTES = 4 * 1024;
 
 export function chunkText(
   text: string,
