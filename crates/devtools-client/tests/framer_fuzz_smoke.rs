@@ -1,8 +1,8 @@
 use bitty_devtools_client::protocol::chunk_text;
 use bitty_devtools_client::transport::{
-    Framer, IpcTransport, MAX_BUFFERED_BYTES, MAX_FRAME_BYTES, RC9_PAYLOAD_CAP_BYTES,
-    RC10_CHUNK_CEILING, StdioTransportStub, TransportError, check_payload_cap, decode_frame,
-    encode_frame,
+    CONTINUATION_HEADER_BYTES, CONTINUATION_MAGIC, Framer, IpcTransport, MAX_BUFFERED_BYTES,
+    MAX_FRAME_BYTES, RC9_PAYLOAD_CAP_BYTES, RC10_CHUNK_CEILING, StdioTransportStub, TransportError,
+    check_payload_cap, decode_frame, encode_frame,
 };
 use std::time::Instant;
 
@@ -341,8 +341,11 @@ fn t3_chunk_boundary_parity_with_oracle() {
 
 #[test]
 fn t4_chunk_counts_for_sized_requests() {
+    // Amendment A4 (bitty#1482): above one frame the stub carries
+    // continuation fragments; stripping each 16-byte header reproduces the
+    // request, and a 1 MiB request is five fragments.
     let start = Instant::now();
-    for (target, chunks) in [(262_144usize, 1), (262_145, 2), (1_048_576, 4)] {
+    for (target, chunks) in [(262_144usize, 1), (262_145, 2), (1_048_576, 5)] {
         let json = request_json_of_len(target);
         let mut transport = connected_transport();
         transport.send_request(&json, 0).unwrap();
@@ -351,7 +354,13 @@ fn t4_chunk_counts_for_sized_requests() {
         for _ in 0..chunks {
             let frame = transport.stub_mut().recv_outgoing().unwrap();
             assert!(frame.payload().len() <= MAX_FRAME_BYTES);
-            got.extend_from_slice(frame.payload());
+            let payload = if chunks == 1 {
+                frame.payload()
+            } else {
+                assert_eq!(frame.payload()[..4], CONTINUATION_MAGIC);
+                &frame.payload()[CONTINUATION_HEADER_BYTES..]
+            };
+            got.extend_from_slice(payload);
         }
         assert_eq!(got, json.as_bytes());
     }

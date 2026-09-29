@@ -1,8 +1,11 @@
 import { describe, expect, spyOn, test } from "bun:test";
 import {
+  CONTINUATION_HEADER_BYTES,
   MAX_FRAME_BYTES,
+  RC9_PAYLOAD_CAP_BYTES,
   TransportError,
   encodeFrame,
+  encodeRequestFrames,
 } from "../src/transport.js";
 import {
   attestLiveSocketEndpoint,
@@ -399,5 +402,125 @@ describe("live Unix IPC socket (CTX-0036)", () => {
       server.stop(true);
       nodeFs.rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Inbound request continuation (devtools-rfc Amendment A4, bitty#1482)
+// ---------------------------------------------------------------------------
+
+/** A JSON request with id `id` padded to exactly `length` bytes. */
+function paddedRequest(id: number, length: number): Uint8Array {
+  const head = `{"id":${id},"method":"bitty.debug/ping","version":"1.0"`;
+  const bytes = new Uint8Array(length);
+  bytes.fill(0x20);
+  bytes.set(new TextEncoder().encode(head), 0);
+  bytes[length - 1] = 0x7d; // "}"
+  return bytes;
+}
+
+function concat(parts: Uint8Array[]): Uint8Array {
+  const out = new Uint8Array(parts.reduce((sum, part) => sum + part.length, 0));
+  let offset = 0;
+  for (const part of parts) {
+    out.set(part, offset);
+    offset += part.length;
+  }
+  return out;
+}
+
+describe("live request continuation (Amendment A4, bitty#1482)", () => {
+  test("a request above one frame is written as continuation fragments", async () => {
+    const accepted: Uint8Array[] = [];
+    const request = paddedRequest(7, 600 * 1024);
+    await withMemoryConnection(
+      async (connection, receive) => {
+        const response = connection.requestResponse(request, 0);
+        const wire = concat(accepted);
+        expect(wire).toEqual(concat(encodeRequestFrames(request, 1)));
+        receive(encodeFrame(new TextEncoder().encode('{"id":7,"result":{}}')));
+        expect(new TextDecoder().decode(await response)).toContain('"id":7');
+      },
+      { capture: (bytes) => accepted.push(bytes) },
+    );
+  });
+
+  test("a partial write continues on drain in order", async () => {
+    const accepted: Uint8Array[] = [];
+    const request = paddedRequest(8, 300 * 1024);
+    const perWrite = 64 * 1024;
+    await withMemoryConnection(
+      async (connection, receive, _writes, _flushes, drain) => {
+        const response = connection.requestResponse(request, 0);
+        const expected = concat(encodeRequestFrames(request, 1));
+        let rounds = 0;
+        while (concat(accepted).length < expected.length) {
+          drain();
+          rounds += 1;
+          expect(rounds).toBeLessThan(64);
+        }
+        expect(concat(accepted)).toEqual(expected);
+        receive(encodeFrame(new TextEncoder().encode('{"id":8,"result":{}}')));
+        expect(new TextDecoder().decode(await response)).toContain('"id":8');
+      },
+      {
+        accept: (length) => Math.min(length, perWrite),
+        capture: (bytes) => accepted.push(bytes),
+      },
+    );
+  });
+
+  test("a continuation request needs an idle connection and blocks others", async () => {
+    await withMemoryConnection(async (connection, receive) => {
+      const plain = connection.requestResponse(firstPayload, 0);
+      await expect(
+        connection.requestResponse(paddedRequest(9, 300 * 1024), 0),
+      ).rejects.toMatchObject({ code: "TransportFull" });
+      receive(firstFrame);
+      expect(await plain).toEqual(firstPayload);
+
+      const large = connection.requestResponse(paddedRequest(9, 300 * 1024), 0);
+      await expect(
+        connection.requestResponse(secondPayload, 0),
+      ).rejects.toMatchObject({
+        code: "TransportFull",
+      });
+      receive(encodeFrame(new TextEncoder().encode('{"id":9,"result":{}}')));
+      expect(new TextDecoder().decode(await large)).toContain('"id":9');
+      // Settled: plain requests are accepted again.
+      const after = connection.requestResponse(secondPayload, 0);
+      receive(secondFrame);
+      expect(await after).toEqual(secondPayload);
+    });
+  });
+
+  test("a request above the inbound limit fails closed before any write", async () => {
+    await withMemoryConnection(async (connection, _receive, writes) => {
+      await expect(
+        connection.requestResponse(
+          paddedRequest(10, RC9_PAYLOAD_CAP_BYTES + 1),
+          0,
+        ),
+      ).rejects.toMatchObject({ code: "PayloadTooLarge" });
+      expect(writes.length).toBe(0);
+    });
+  });
+
+  test("the encoder writes the Amendment A4 header layout", () => {
+    const request = paddedRequest(11, MAX_FRAME_BYTES + 1);
+    const frames = encodeRequestFrames(request, 0x01020304);
+    expect(frames.length).toBe(2);
+    const header = [...frames[1]!.subarray(4, 4 + CONTINUATION_HEADER_BYTES)];
+    // magic, id, sequence 1, FINAL, reserved, total 262145 (0x00040001).
+    expect(header).toEqual([
+      0x00, 0x42, 0x43, 0x31, 0x01, 0x02, 0x03, 0x04, 0x00, 0x01, 0x01, 0x00,
+      0x00, 0x04, 0x00, 0x01,
+    ]);
+    expect(frames[0]!.length).toBe(4 + MAX_FRAME_BYTES);
+    expect(frames[0]![4 + 10]).toBe(0);
+    expect(() => encodeRequestFrames(request, 0)).toThrow(TransportError);
+    expect(
+      encodeRequestFrames(paddedRequest(12, MAX_FRAME_BYTES), 0).length,
+    ).toBe(1);
   });
 });

@@ -32,14 +32,25 @@ import {
 import {
   Framer,
   MAX_FRAME_BYTES,
+  RC9_PAYLOAD_CAP_BYTES,
   TransportError,
-  encodeFrame,
+  encodeRequestFrames,
+  nextContinuationId,
 } from "./transport.js";
 
 export const LIVE_SOCKET_TIMEOUT_MS = 5_000 as const;
 export const LIVE_SOCKET_MAX_TIMEOUT_MS = 60_000 as const;
 
 export const LIVE_SOCKET_MAX_PENDING_FRAMES = 64 as const;
+
+/**
+ * Bytes the live socket may hold while the kernel buffer is full: one
+ * maximal continuation request plus one maximal plain frame per pending
+ * slot. A request that would exceed it fails with `TransportFull`.
+ */
+export const LIVE_SOCKET_MAX_OUTBOUND_BYTES =
+  RC9_PAYLOAD_CAP_BYTES +
+  LIVE_SOCKET_MAX_PENDING_FRAMES * (4 + MAX_FRAME_BYTES);
 
 export const LIVE_SOCKET_SUPPORTED_PLATFORM = "linux" as const;
 
@@ -69,6 +80,7 @@ export type LiveSocketConfig = {
 };
 
 type BunSocketHandle = {
+  /** Bytes accepted now; the rest must be written again on `drain`. */
   write(data: Uint8Array): number;
   flush(): void;
   end(): void;
@@ -83,6 +95,7 @@ type BunRuntime = {
       error(socket: BunSocketHandle, error: Error): void;
       open(socket: BunSocketHandle): void;
       close(socket: BunSocketHandle): void;
+      drain(socket: BunSocketHandle): void;
     };
   }): Promise<BunSocketHandle>;
   file(path: string): { stat(): Promise<UnixStat | null> };
@@ -321,8 +334,13 @@ export type LiveSocketConnection = {
   /** True once the OS socket is open. */
   isOpen(): boolean;
   /**
-   * Write one framed request and resolve with the response carrying the same
+   * Write one request and resolve with the response carrying the same
    * request id. The optional id is used when the payload cannot be inspected.
+   *
+   * A request above one 256 KiB frame, up to the 1 MiB inbound limit, is
+   * sent as Amendment A4 continuation fragments (bitty#1482). It needs an
+   * idle connection, and no other request is accepted until it settles,
+   * because the server rejects any frame that interleaves a reassembly.
    */
   requestResponse(
     requestJson: Uint8Array,
@@ -470,16 +488,58 @@ export async function connectLiveSocket(
   let open = false;
   let terminalError: TransportError | null = null;
   let nextFallbackId = 0;
+  let continuationId = 1;
+  /** Request id of the in-flight continuation request, if any. */
+  let continuationPending: number | null = null;
+  /** Bytes the kernel has not accepted yet, flushed on `drain`. */
+  const outbound: Uint8Array[] = [];
+  let outboundBytes = 0;
   const removePending = (id: number): void => {
     pending.delete(id);
     const index = pendingOrder.indexOf(id);
     if (index >= 0) pendingOrder.splice(index, 1);
+    if (continuationPending === id) continuationPending = null;
+  };
+  /** Write what the kernel accepts; queue the rest for `drain`, in order. */
+  const writeOrQueue = (handle: BunSocketHandle, bytes: Uint8Array): void => {
+    if (outbound.length === 0) {
+      const written = handle.write(bytes);
+      const accepted = Math.max(0, Math.min(written, bytes.length));
+      if (accepted === bytes.length) return;
+      bytes = bytes.subarray(accepted);
+    }
+    outbound.push(bytes);
+    outboundBytes += bytes.length;
+  };
+  const onDrain = (handle: BunSocketHandle): void => {
+    try {
+      while (outbound.length > 0) {
+        const head = outbound[0]!;
+        const written = handle.write(head);
+        const accepted = Math.max(0, Math.min(written, head.length));
+        outboundBytes -= accepted;
+        if (accepted < head.length) {
+          outbound[0] = head.subarray(accepted);
+          return;
+        }
+        outbound.shift();
+      }
+      handle.flush();
+    } catch {
+      failConnection(
+        new TransportError("TransportClosed", "socket write failed"),
+        true,
+      );
+    }
   };
   const failConnection = (error: TransportError, remember = false): void => {
     if (remember) terminalError = error;
     if (!open && pending.size === 0 && retained.length === 0) return;
     open = false;
     inbound.clear();
+    outbound.length = 0;
+    outboundBytes = 0;
+    continuationPending = null;
     const waiters = [...pending.values()];
     pending.clear();
     pendingOrder.length = 0;
@@ -577,6 +637,7 @@ export async function connectLiveSocket(
         error: onError,
         open: onOpen,
         close: onClose,
+        drain: onDrain,
       },
     });
     void connecting.catch((error: unknown) => {
@@ -617,16 +678,31 @@ export async function connectLiveSocket(
       signal?: AbortSignal,
     ) => {
       let id: number;
+      let wire: Uint8Array;
+      let wireLength = 0;
       try {
         void nowMs;
         if (terminalError !== null) throw terminalError;
         if (!open || socket === null) {
           throw new TransportError("TransportClosed", "live socket is closed");
         }
-        if (requestJson.length > MAX_FRAME_BYTES) {
+        if (requestJson.length > RC9_PAYLOAD_CAP_BYTES) {
           throw new TransportError(
-            "FrameTooLarge",
-            `request ${requestJson.length} > ${MAX_FRAME_BYTES}`,
+            "PayloadTooLarge",
+            `request ${requestJson.length} > ${RC9_PAYLOAD_CAP_BYTES}`,
+          );
+        }
+        if (continuationPending !== null) {
+          throw new TransportError(
+            "TransportFull",
+            `continuation request ${continuationPending} is in flight`,
+          );
+        }
+        const fragmented = requestJson.length > MAX_FRAME_BYTES;
+        if (fragmented && pending.size > 0) {
+          throw new TransportError(
+            "TransportFull",
+            "a continuation request needs an idle connection",
           );
         }
         if (requestId !== undefined) {
@@ -661,6 +737,24 @@ export async function connectLiveSocket(
             "TransportFull",
             `pending requests exceed ${LIVE_SOCKET_MAX_PENDING_FRAMES}`,
           );
+        }
+        const frames = encodeRequestFrames(requestJson, continuationId);
+        wireLength = frames.reduce((sum, frame) => sum + frame.length, 0);
+        if (outboundBytes + wireLength > LIVE_SOCKET_MAX_OUTBOUND_BYTES) {
+          throw new TransportError(
+            "TransportFull",
+            `outbound bytes exceed ${LIVE_SOCKET_MAX_OUTBOUND_BYTES}`,
+          );
+        }
+        wire = new Uint8Array(wireLength);
+        let offset = 0;
+        for (const frame of frames) {
+          wire.set(frame, offset);
+          offset += frame.length;
+        }
+        if (fragmented) {
+          continuationId = nextContinuationId(continuationId);
+          continuationPending = id;
         }
       } catch (error) {
         return Promise.reject(error);
@@ -718,15 +812,17 @@ export async function connectLiveSocket(
         const queued =
           retainedIndex >= 0 ? retained.splice(retainedIndex, 1)[0] : undefined;
         try {
-          const wire = encodeFrame(requestJson);
-          const written = socket?.write(wire);
-          if (written !== wire.length) {
+          if (socket === null) {
             throw new TransportError(
               "TransportClosed",
-              "socket write was partial",
+              "live socket is closed",
             );
           }
-          socket?.flush();
+          // Fragments of one request are queued back to back in one buffer,
+          // so nothing can interleave them; a partial write continues on
+          // `drain` instead of failing the connection.
+          writeOrQueue(socket, wire);
+          socket.flush();
           if (queued !== undefined) {
             const waiter = pending.get(id);
             waiter?.resolve(queued.payload);

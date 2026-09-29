@@ -9,6 +9,21 @@ and this project adheres to no released version yet.
 
 ### Added
 
+- **Inbound request continuation (CTX-0084, bitty#1482)**: live and headless
+  requests above one `256 KiB` frame, up to the `1 MiB` inbound limit, are sent
+  as devtools-rfc Amendment A4 continuation fragments. Each fragment carries a
+  16-byte `\0BC1` header with a nonzero continuation id, a sequence, a FINAL
+  flag, and the declared total. Every non-final fragment is a full frame, so a
+  request is at most five fragments. The core reassembles them into one
+  exchange with one admission. This replaces the headerless split and the live
+  `FrameTooLarge` fail-closed. The TypeScript live socket now continues a
+  partial write on `drain` within a bounded outbound queue, instead of failing
+  the connection. A fragmented request needs an idle connection and blocks
+  other requests until it settles, because the server rejects any frame that
+  interleaves a reassembly. The Rust `devtools-client` sends the same fragments
+  with byte-identical headers. Requests above `1 MiB` still fail closed before
+  any write.
+
 - **Test-automation drivers (CTX-0024, candidate)**: typed, fail-closed client
   bindings in `src/automation.ts` for `bitty.debug/synthesizeInput`,
   `bitty.debug/captureFrame`, and `bitty.debug/frameHash` — the headless

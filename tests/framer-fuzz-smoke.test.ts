@@ -2,6 +2,9 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
+  CONTINUATION_FLAG_FINAL,
+  CONTINUATION_HEADER_BYTES,
+  CONTINUATION_MAGIC,
   Framer,
   IpcTransport,
   StdioTransportStub,
@@ -468,9 +471,46 @@ describe("T4 chunking and inbound framing model", () => {
     expect(frame.payload.length).toBe(target);
   });
 
-  test("Q02 256KiB+1 request splits into two bounded chunks", () => {
+  /**
+   * Check every Amendment A4 fragment header, then return the concatenated
+   * chunks: shared id, sequence from 0, FINAL only on the last fragment,
+   * the declared total in every header, and full non-final frames.
+   */
+  function reassembleFragments(
+    chunks: Uint8Array[],
+    total: number,
+  ): Uint8Array {
+    const parts: Uint8Array[] = [];
+    let id: number | null = null;
+    chunks.forEach((chunk, sequence) => {
+      const { frame, consumed } = decodeFrame(chunk);
+      expect(consumed).toBe(chunk.length);
+      const payload = frame.payload;
+      const view = new DataView(
+        payload.buffer,
+        payload.byteOffset,
+        payload.byteLength,
+      );
+      expect([...payload.subarray(0, 4)]).toEqual([...CONTINUATION_MAGIC]);
+      const fragmentId = view.getUint32(4, false);
+      expect(fragmentId).toBeGreaterThan(0);
+      id ??= fragmentId;
+      expect(fragmentId).toBe(id);
+      expect(view.getUint16(8, false)).toBe(sequence);
+      const last = sequence === chunks.length - 1;
+      expect(payload[10]).toBe(last ? CONTINUATION_FLAG_FINAL : 0);
+      expect(payload[11]).toBe(0);
+      expect(view.getUint32(12, false)).toBe(total);
+      if (!last) expect(payload.length).toBe(MAX_FRAME_BYTES);
+      parts.push(payload.subarray(CONTINUATION_HEADER_BYTES));
+    });
+    return concatBytes(...parts);
+  }
+
+  test("Q02 256KiB+1 request becomes two continuation fragments", () => {
     const oracle = loadOracle();
-    const target = vectorById(oracle, "Q02").build!["jsonLen"]!;
+    const vector = vectorById(oracle, "Q02");
+    const target = vector.build!["jsonLen"]!;
     const transport = new IpcTransport({
       runtimeUid: 1000,
       socketPath: "/tmp/ctx-0074-fuzz-smoke-fixture.sock",
@@ -478,18 +518,12 @@ describe("T4 chunking and inbound framing model", () => {
     const req = requestOfJsonLen(target);
     expect(requestJsonBytes(req).length).toBe(target);
     const chunks = transport.encodeRequest(req);
-    expect(chunks.length).toBe(2);
-    const parts: Uint8Array[] = [];
-    for (const chunk of chunks) {
-      const { frame } = decodeFrame(chunk);
-      expect(frame.payload.length).toBeLessThanOrEqual(MAX_FRAME_BYTES);
-      parts.push(frame.payload);
-    }
-    expect(concatBytes(...parts)).toEqual(requestJsonBytes(req));
+    expect(chunks.length).toBe(vector.expect["chunks"] as number);
+    expect(reassembleFragments(chunks, target)).toEqual(requestJsonBytes(req));
   });
 
   test(
-    "Q03 1MiB exact request splits into four bounded chunks",
+    "Q03 1MiB exact request becomes five continuation fragments",
     () => {
       const oracle = loadOracle();
       const target = vectorById(oracle, "Q03").build!["jsonLen"]!;
@@ -500,14 +534,12 @@ describe("T4 chunking and inbound framing model", () => {
       const req = requestOfJsonLen(target);
       expect(requestJsonBytes(req).length).toBe(target);
       const chunks = transport.encodeRequest(req);
-      expect(chunks.length).toBe(4);
-      const parts: Uint8Array[] = [];
-      for (const chunk of chunks) {
-        const { frame } = decodeFrame(chunk);
-        expect(frame.payload.length).toBeLessThanOrEqual(MAX_FRAME_BYTES);
-        parts.push(frame.payload);
-      }
-      expect(concatBytes(...parts)).toEqual(requestJsonBytes(req));
+      expect(chunks.length).toBe(
+        vectorById(oracle, "Q03").expect["chunks"] as number,
+      );
+      expect(reassembleFragments(chunks, target)).toEqual(
+        requestJsonBytes(req),
+      );
     },
     LOCAL_TARGET_BUDGET_MS,
   );

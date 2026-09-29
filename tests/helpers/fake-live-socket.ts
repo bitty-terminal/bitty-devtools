@@ -28,11 +28,16 @@ export type MemorySocket = {
 export type MemoryHandlers = {
   data(socket: MemorySocket, data: Uint8Array): void;
   open(socket: MemorySocket): void;
+  drain?(socket: MemorySocket): void;
 };
 
 export type MemoryTransmission = {
   write?: () => void;
   flush?: (count: number) => void;
+  /** Bytes the fake kernel accepts from one write (default: all). */
+  accept?: (length: number) => number;
+  /** Receives exactly the bytes each write accepted. */
+  capture?: (accepted: Uint8Array) => void;
 };
 
 export type MemoryRun = (
@@ -40,6 +45,7 @@ export type MemoryRun = (
   receive: (bytes: Uint8Array) => void,
   writes: number[],
   flushes: number[],
+  drain: () => void,
 ) => Promise<void>;
 
 export function localUid(): number {
@@ -94,7 +100,12 @@ export async function withMemoryConnection(
     write: (data) => {
       writes.push(data.length);
       transmission.write?.();
-      return data.length;
+      const accepted = Math.min(
+        data.length,
+        transmission.accept?.(data.length) ?? data.length,
+      );
+      transmission.capture?.(data.slice(0, accepted));
+      return accepted;
     },
     flush() {
       flushes.push(writes.length);
@@ -130,6 +141,7 @@ export async function withMemoryConnection(
         (bytes) => handlers!.data(socket, bytes),
         writes,
         flushes,
+        () => handlers!.drain?.(socket),
       );
     } finally {
       connection.close();
