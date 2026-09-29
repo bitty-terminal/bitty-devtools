@@ -715,6 +715,13 @@ export class IpcTransport {
     this.verifyPeerForPrivilegedAction();
     this.limiter.check(nowMs);
     const frames = this.encodeRequest(req);
+    // A fragmented request is queued whole or not at all: a partial
+    // enqueue would leave the peer an unfinished reassembly that the next
+    // request would interleave (Amendment A4, bitty#1482).
+    const capacity = this.stub.getCapacity();
+    if (this.stub.outgoingLen() + frames.length > capacity) {
+      throw new TransportError("TransportFull", `capacity ${capacity}`);
+    }
     for (const f of frames) {
       const payload = f.slice(4);
       this.stub.trySendPayload(payload);

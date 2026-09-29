@@ -111,3 +111,29 @@ fn continuation_ids_skip_zero_on_wrap() {
     assert_eq!(next_continuation_id(1), 2);
     assert_eq!(next_continuation_id(u32::MAX), 1);
 }
+
+#[test]
+fn a_fragmented_request_is_queued_whole_or_not_at_all() {
+    use bitty_devtools_client::transport::IpcTransport;
+    // Capacity 2 with one slot taken: a two-fragment request must be
+    // refused without enqueueing its first fragment (CodeRabbit on #149).
+    let mut transport = IpcTransport::new(
+        1000,
+        "/tmp/ctx-0084-continuation-fixture.sock".to_owned(),
+        None,
+        0o700,
+        0o600,
+        1000,
+        1000,
+        2,
+    );
+    transport.connect().unwrap();
+    transport.send_request(r#"{"id":1}"#, 0).unwrap();
+    assert_eq!(transport.outgoing_len(), 1);
+    let big = String::from_utf8(request_of(MAX_FRAME_BYTES + 1)).unwrap();
+    assert!(matches!(
+        transport.send_request(&big, 0),
+        Err(TransportError::TransportFull { capacity: 2 })
+    ));
+    assert_eq!(transport.outgoing_len(), 1, "no partial reassembly queued");
+}

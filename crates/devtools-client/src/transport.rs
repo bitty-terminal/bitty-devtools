@@ -758,6 +758,13 @@ impl IpcTransport {
         // Amendment A4 (bitty#1482): above one frame the stub carries the
         // continuation fragment payloads, never a headerless split.
         let frames = encode_request_frames(bytes, self.continuation_id)?;
+        // A fragmented request is queued whole or not at all: a partial
+        // enqueue would leave the peer an unfinished reassembly that the next
+        // request would interleave.
+        let capacity = self.stub.capacity();
+        if self.stub.outgoing_len() + frames.len() > capacity {
+            return Err(TransportError::TransportFull { capacity });
+        }
         if frames.len() > 1 {
             self.continuation_id = next_continuation_id(self.continuation_id);
         }

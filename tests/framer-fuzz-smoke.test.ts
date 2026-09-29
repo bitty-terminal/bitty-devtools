@@ -544,6 +544,25 @@ describe("T4 chunking and inbound framing model", () => {
     LOCAL_TARGET_BUDGET_MS,
   );
 
+  test("a fragmented request is queued whole or not at all", () => {
+    // Capacity 2 with one slot taken: a two-fragment request is refused
+    // without enqueueing its first fragment (CodeRabbit on #149).
+    const transport = new IpcTransport({
+      runtimeUid: 1000,
+      socketPath: "/tmp/ctx-0084-continuation-fixture.sock",
+      capacity: 2,
+    });
+    transport.connect();
+    transport.sendRequest(requestOfJsonLen(256), 0);
+    expect(transport.outgoingLen()).toBe(1);
+    expect(
+      codeOf(() =>
+        transport.sendRequest(requestOfJsonLen(MAX_FRAME_BYTES + 1), 0),
+      ),
+    ).toBe("TransportFull");
+    expect(transport.outgoingLen()).toBe(1);
+  });
+
   test("Q04 1MiB+1 request is refused with PayloadTooLarge", () => {
     const oracle = loadOracle();
     const target = vectorById(oracle, "Q04").build!["jsonLen"]!;
