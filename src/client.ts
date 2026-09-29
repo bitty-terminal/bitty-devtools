@@ -621,13 +621,10 @@ export class DevtoolsClient {
       throw new TransportError("TransportClosed", "request cancelled");
     }
     transport.getRateLimiter().check(nowMs);
-    const frame = transport.encodeSingleLiveRequest(req);
-    const raw = await live.requestResponse(
-      frame.slice(4),
-      nowMs,
-      req.id,
-      signal,
-    );
+    // The live socket frames the request itself: one plain frame, or
+    // Amendment A4 continuation fragments above 256 KiB (bitty#1482).
+    const requestJson = transport.encodeRequestJson(req);
+    const raw = await live.requestResponse(requestJson, nowMs, req.id, signal);
     return decodeLiveResponse(raw, req.id);
   }
 

@@ -26,7 +26,9 @@ use crate::auth::{AuthError, MAX_SOCKET_PATH_BYTES, resolve_socket_path};
 use crate::auth::{DIR_MODE, SOCKET_MODE};
 use crate::transport::TransportError;
 #[cfg(target_os = "linux")]
-use crate::transport::{MAX_FRAME_BYTES, decode_frame, encode_frame};
+use crate::transport::{
+    MAX_FRAME_BYTES, decode_frame, encode_request_frames, next_continuation_id,
+};
 
 /// Per-dial and per-response timeout (matches the TS seam).
 pub const LIVE_SOCKET_TIMEOUT_SECS: u64 = 5;
@@ -232,6 +234,8 @@ pub struct LiveSocketConnection {
     stream: std::os::unix::net::UnixStream,
     socket_path: String,
     identity: LiveSocketIdentity,
+    /// Next Amendment A4 continuation id (nonzero; wraps to 1).
+    continuation_id: u32,
 }
 
 #[cfg(target_os = "linux")]
@@ -247,10 +251,12 @@ impl LiveSocketConnection {
         self.identity
     }
 
-    /// Write one framed request and read the next framed response payload
-    /// (raw bytes, still to be JSON-decoded by the caller). Bounded at one
-    /// 256 KiB frame each way, matching the `bitty-ipc` framing. Times out
-    /// instead of blocking forever.
+    /// Write one request and read the next framed response payload (raw
+    /// bytes, still to be JSON-decoded by the caller). A request above one
+    /// 256 KiB frame, up to the 1 MiB inbound limit, is written as
+    /// Amendment A4 continuation fragments (bitty#1482); the round trip is
+    /// synchronous, so no other request can interleave them. The response
+    /// stays bounded at one frame. Times out instead of blocking forever.
     pub fn request_response(
         &mut self,
         request_json: &[u8],
@@ -259,11 +265,9 @@ impl LiveSocketConnection {
         use std::io::{Read, Write};
         use std::time::Duration;
 
-        if request_json.len() > MAX_FRAME_BYTES {
-            return Err(TransportError::FrameTooLarge {
-                actual: request_json.len(),
-                limit: MAX_FRAME_BYTES,
-            });
+        let frames = encode_request_frames(request_json, self.continuation_id)?;
+        if frames.len() > 1 {
+            self.continuation_id = next_continuation_id(self.continuation_id);
         }
         self.stream
             .set_read_timeout(Some(Duration::from_secs(LIVE_SOCKET_TIMEOUT_SECS)))
@@ -271,10 +275,12 @@ impl LiveSocketConnection {
         self.stream
             .set_write_timeout(Some(Duration::from_secs(LIVE_SOCKET_TIMEOUT_SECS)))
             .map_err(|_| TransportError::TransportClosed)?;
-        let wire = encode_frame(request_json)?;
-        self.stream
-            .write_all(&wire)
-            .map_err(|_| TransportError::TransportClosed)?;
+        // `write_all` retries partial writes; fragments go out back to back.
+        for frame in &frames {
+            self.stream
+                .write_all(frame)
+                .map_err(|_| TransportError::TransportClosed)?;
+        }
         self.stream
             .flush()
             .map_err(|_| TransportError::TransportClosed)?;
@@ -326,6 +332,7 @@ pub fn connect_live_socket(
         .map_err(|_| TransportError::TransportClosed)?;
     Ok(LiveSocketConnection {
         stream,
+        continuation_id: 1,
         socket_path: endpoint.socket_path.clone(),
         identity: LiveSocketIdentity {
             runtime_uid: endpoint.runtime_uid,

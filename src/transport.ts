@@ -97,6 +97,81 @@ export function encodeFrame(payload: Uint8Array): Uint8Array {
   return out;
 }
 
+// ---------------------------------------------------------------------------
+// Inbound request continuation (devtools-rfc Amendment A4, bitty#1482)
+// ---------------------------------------------------------------------------
+
+/** Magic prefix of every continuation fragment payload (`\0BC1`). */
+export const CONTINUATION_MAGIC = Uint8Array.of(0x00, 0x42, 0x43, 0x31);
+/** Fragment header bytes before each chunk. */
+export const CONTINUATION_HEADER_BYTES = 16;
+/** Chunk bytes in every non-final fragment (one full physical frame). */
+export const CONTINUATION_CHUNK_BYTES =
+  MAX_FRAME_BYTES - CONTINUATION_HEADER_BYTES;
+/** `flags` bit of the fragment that completes the logical request. */
+export const CONTINUATION_FLAG_FINAL = 0b0000_0001;
+/** Largest continuation id; ids are nonzero unsigned 32-bit values. */
+export const MAX_CONTINUATION_ID = 0xffff_ffff;
+
+/**
+ * Encode one logical request as wire frames (length prefix included).
+ *
+ * A request of at most {@link MAX_FRAME_BYTES} stays one plain frame. A
+ * larger one, up to the 1 MiB inbound limit, becomes canonical Amendment A4
+ * fragments tagged `continuationId`: every non-final fragment is a full
+ * frame and the final one carries the remainder, so a request is at most
+ * five fragments. Nothing is produced on error.
+ */
+export function encodeRequestFrames(
+  request: Uint8Array,
+  continuationId: number,
+): Uint8Array[] {
+  if (request.length > RC9_PAYLOAD_CAP_BYTES) {
+    throw new TransportError(
+      "PayloadTooLarge",
+      `request ${request.length} > ${RC9_PAYLOAD_CAP_BYTES}`,
+    );
+  }
+  if (request.length <= MAX_FRAME_BYTES) {
+    return [encodeFrame(request)];
+  }
+  if (
+    !Number.isInteger(continuationId) ||
+    continuationId < 1 ||
+    continuationId > MAX_CONTINUATION_ID
+  ) {
+    throw new TransportError(
+      "InvalidFrame",
+      `continuation id must be in 1..${MAX_CONTINUATION_ID}`,
+    );
+  }
+  const frames: Uint8Array[] = [];
+  for (
+    let offset = 0, sequence = 0;
+    offset < request.length;
+    offset += CONTINUATION_CHUNK_BYTES, sequence += 1
+  ) {
+    const chunk = request.subarray(offset, offset + CONTINUATION_CHUNK_BYTES);
+    const last = offset + chunk.length >= request.length;
+    const payload = new Uint8Array(CONTINUATION_HEADER_BYTES + chunk.length);
+    const view = new DataView(payload.buffer);
+    payload.set(CONTINUATION_MAGIC, 0);
+    view.setUint32(4, continuationId, false);
+    view.setUint16(8, sequence, false);
+    payload[10] = last ? CONTINUATION_FLAG_FINAL : 0;
+    payload[11] = 0;
+    view.setUint32(12, request.length, false);
+    payload.set(chunk, CONTINUATION_HEADER_BYTES);
+    frames.push(encodeFrame(payload));
+  }
+  return frames;
+}
+
+/** The continuation id after `id` (wraps to 1; 0 is never used). */
+export function nextContinuationId(id: number): number {
+  return id >= MAX_CONTINUATION_ID ? 1 : id + 1;
+}
+
 export function decodeFrame(buf: Uint8Array): {
   frame: Frame;
   consumed: number;
@@ -471,6 +546,7 @@ export class IpcTransport {
   private readonly limiter: RateLimiter;
   private activeConnections = 0;
   private requests = 0;
+  private continuationId = 1;
   private readonly peer: PeerCredentials | null;
   private readonly config: Required<
     Omit<IpcTransportConfig, "peer" | "windowsPeerSid" | "windowsRuntimeSid">
@@ -603,43 +679,30 @@ export class IpcTransport {
     }
   }
 
-  encodeRequest(req: IpcRequest): Uint8Array[] {
+  /** Validated UTF-8 JSON bytes of `req` (bounded by the 1 MiB inbound cap). */
+  encodeRequestJson(req: IpcRequest): Uint8Array {
     const json = JSON.stringify(req);
-    assertStringBounded("devtools request", json, MAX_DEVTOOLS_FRAME_BYTES);
-    checkPayloadCap(new TextEncoder().encode(json).length);
     const bytes = new TextEncoder().encode(json);
-    if (bytes.length <= MAX_FRAME_BYTES) {
-      return [encodeFrame(bytes)];
-    }
-    const chunks: Uint8Array[] = [];
-    for (let off = 0; off < bytes.length; off += MAX_FRAME_BYTES) {
-      const slice = bytes.slice(off, off + MAX_FRAME_BYTES);
-      chunks.push(encodeFrame(slice));
-    }
-    return chunks;
+    checkPayloadCap(bytes.length);
+    assertStringBounded("devtools request", json, MAX_DEVTOOLS_FRAME_BYTES);
+    return bytes;
   }
 
   /**
-   * Encode exactly one physical frame for a live request, or fail closed.
-   *
-   * `encodeRequest` splits an oversized logical request into RC-10 chunks for
-   * the headless streaming transport. The live path must never use that split:
-   * `bitty` reads one complete frame per exchange and defines no inbound
-   * request continuation identity, so a fragmented request would become
-   * several independent exchanges with partial side effects. Until the server
-   * continuation contract lands in `bitty`, a request above
-   * {@link MAX_FRAME_BYTES} is rejected with `FrameTooLarge` before any byte
-   * reaches the socket.
+   * Encode `req` as wire frames: one plain frame up to
+   * {@link MAX_FRAME_BYTES}, otherwise Amendment A4 continuation fragments
+   * under a fresh per-transport continuation id (bitty#1482). The server
+   * reassembles the fragments into one exchange with one admission.
    */
-  encodeSingleLiveRequest(req: IpcRequest): Uint8Array {
-    const frames = this.encodeRequest(req);
-    if (frames.length !== 1) {
-      throw new TransportError(
-        "FrameTooLarge",
-        "live request requires a server continuation contract",
-      );
+  encodeRequest(req: IpcRequest): Uint8Array[] {
+    const bytes = this.encodeRequestJson(req);
+    if (bytes.length <= MAX_FRAME_BYTES) {
+      return [encodeFrame(bytes)];
     }
-    return frames[0]!;
+    const id = this.continuationId;
+    const frames = encodeRequestFrames(bytes, id);
+    this.continuationId = nextContinuationId(id);
+    return frames;
   }
 
   sendRequest(req: IpcRequest, nowMs: number): void {
@@ -652,6 +715,13 @@ export class IpcTransport {
     this.verifyPeerForPrivilegedAction();
     this.limiter.check(nowMs);
     const frames = this.encodeRequest(req);
+    // A fragmented request is queued whole or not at all: a partial
+    // enqueue would leave the peer an unfinished reassembly that the next
+    // request would interleave (Amendment A4, bitty#1482).
+    const capacity = this.stub.getCapacity();
+    if (this.stub.outgoingLen() + frames.length > capacity) {
+      throw new TransportError("TransportFull", `capacity ${capacity}`);
+    }
     for (const f of frames) {
       const payload = f.slice(4);
       this.stub.trySendPayload(payload);

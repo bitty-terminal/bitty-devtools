@@ -114,6 +114,77 @@ pub fn encode_frame(payload: &[u8]) -> Result<Vec<u8>, TransportError> {
     Ok(out)
 }
 
+// ── inbound request continuation (devtools-rfc Amendment A4, bitty#1482) ──
+
+/// Magic prefix of every continuation fragment payload (`\0BC1`).
+pub const CONTINUATION_MAGIC: [u8; 4] = [0x00, b'B', b'C', b'1'];
+/// Fragment header bytes before each chunk.
+pub const CONTINUATION_HEADER_BYTES: usize = 16;
+/// Chunk bytes in every non-final fragment (one full physical frame).
+pub const CONTINUATION_CHUNK_BYTES: usize = MAX_FRAME_BYTES - CONTINUATION_HEADER_BYTES;
+/// `flags` bit of the fragment that completes the logical request.
+pub const CONTINUATION_FLAG_FINAL: u8 = 0b0000_0001;
+
+/// Encode one logical request as wire frames (length prefix included).
+///
+/// A request of at most [`MAX_FRAME_BYTES`] stays one plain frame. A larger
+/// one, up to the 1 MiB inbound limit, becomes canonical Amendment A4
+/// fragments tagged `continuation_id`: every non-final fragment is a full
+/// frame and the final one carries the remainder (at most five fragments).
+///
+/// # Errors
+///
+/// `PayloadTooLarge` above [`RC9_PAYLOAD_CAP_BYTES`] and `InvalidFrame` for
+/// a zero `continuation_id` when fragmentation is needed. No frame is
+/// produced on error.
+pub fn encode_request_frames(
+    request: &[u8],
+    continuation_id: u32,
+) -> Result<Vec<Vec<u8>>, TransportError> {
+    check_payload_cap(request.len())?;
+    if request.len() <= MAX_FRAME_BYTES {
+        return Ok(vec![encode_frame(request)?]);
+    }
+    if continuation_id == 0 {
+        return Err(TransportError::InvalidFrame(
+            "continuation id must be nonzero".into(),
+        ));
+    }
+    // The payload cap above keeps the total within u32 (1 MiB).
+    let total = u32::try_from(request.len()).map_err(|_| TransportError::PayloadTooLarge {
+        field: "request".into(),
+        limit: RC9_PAYLOAD_CAP_BYTES,
+        actual: request.len(),
+    })?;
+    let chunks: Vec<&[u8]> = request.chunks(CONTINUATION_CHUNK_BYTES).collect();
+    let last = chunks.len() - 1;
+    let mut frames = Vec::with_capacity(chunks.len());
+    for (index, chunk) in chunks.into_iter().enumerate() {
+        let sequence = u16::try_from(index)
+            .map_err(|_| TransportError::InvalidFrame("continuation sequence overflow".into()))?;
+        let mut payload = Vec::with_capacity(CONTINUATION_HEADER_BYTES + chunk.len());
+        payload.extend_from_slice(&CONTINUATION_MAGIC);
+        payload.extend_from_slice(&continuation_id.to_be_bytes());
+        payload.extend_from_slice(&sequence.to_be_bytes());
+        payload.push(if index == last {
+            CONTINUATION_FLAG_FINAL
+        } else {
+            0
+        });
+        payload.push(0);
+        payload.extend_from_slice(&total.to_be_bytes());
+        payload.extend_from_slice(chunk);
+        frames.push(encode_frame(&payload)?);
+    }
+    Ok(frames)
+}
+
+/// The continuation id after `id` (wraps to 1; 0 is never used).
+#[must_use]
+pub fn next_continuation_id(id: u32) -> u32 {
+    id.checked_add(1).unwrap_or(1)
+}
+
 pub fn decode_frame(buf: &[u8]) -> Result<(Frame, usize), TransportError> {
     if buf.len() < 4 {
         return Err(TransportError::FrameTruncated {
@@ -482,6 +553,8 @@ pub struct IpcTransport {
     limiter: RateLimiter,
     active_connections: usize,
     requests: usize,
+    /// Next Amendment A4 continuation id (nonzero; wraps to 1).
+    continuation_id: u32,
     peer: Option<PeerCredentials>,
     runtime_uid: u32,
     socket_path: String,
@@ -514,6 +587,7 @@ impl IpcTransport {
             limiter: RateLimiter::rc9_default(),
             active_connections: 0,
             requests: 0,
+            continuation_id: 1,
             peer,
             runtime_uid,
             socket_path,
@@ -681,12 +755,21 @@ impl IpcTransport {
         self.limiter.check(now_ms)?;
         let bytes = json.as_bytes();
         check_payload_cap(bytes.len())?;
-        if bytes.len() <= MAX_FRAME_BYTES {
-            self.stub.try_send_payload(bytes)?;
-        } else {
-            for chunk in bytes.chunks(MAX_FRAME_BYTES) {
-                self.stub.try_send_payload(chunk)?;
-            }
+        // Amendment A4 (bitty#1482): above one frame the stub carries the
+        // continuation fragment payloads, never a headerless split.
+        let frames = encode_request_frames(bytes, self.continuation_id)?;
+        // A fragmented request is queued whole or not at all: a partial
+        // enqueue would leave the peer an unfinished reassembly that the next
+        // request would interleave.
+        let capacity = self.stub.capacity();
+        if self.stub.outgoing_len() + frames.len() > capacity {
+            return Err(TransportError::TransportFull { capacity });
+        }
+        if frames.len() > 1 {
+            self.continuation_id = next_continuation_id(self.continuation_id);
+        }
+        for frame in &frames {
+            self.stub.try_send_payload(&frame[4..])?;
         }
         self.requests += 1;
         Ok(())
